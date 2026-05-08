@@ -63,6 +63,16 @@ DEFAULT_INSTALL_GUIDES_DIR = "install-guides"
 DEFAULT_PIPELINE_REPORTS_DIR = "pipeline-reports"
 DEFAULT_ANALYSIS_DIR = "analysis"
 
+RUN_DIR_DEFAULTS = {
+    "results_dir": (DEFAULT_RESULTS_DIR, "classification_results"),
+    "summaries_dir": (DEFAULT_SUMMARIES_DIR, "summaries"),
+    "dockerfiles_dir": (DEFAULT_DOCKERFILES_DIR, "dockerfiles"),
+    "reports_dir": (DEFAULT_REPORTS_DIR, "repair-reports"),
+    "install_guides_dir": (DEFAULT_INSTALL_GUIDES_DIR, "install-guides"),
+    "pipeline_reports_dir": (DEFAULT_PIPELINE_REPORTS_DIR, "pipeline-reports"),
+    "analysis_dir": (DEFAULT_ANALYSIS_DIR, "analysis"),
+}
+
 
 set_trace_enabled(args.trace)
 
@@ -96,6 +106,14 @@ def append_repo_selection_args(command: list[str]) -> list[str]:
     command.extend(["--input-file", args.input_file])
     for repo_url in args.repo_url:
         command.extend(["--repo-url", repo_url])
+    return command
+
+
+def build_agent_command(python_executable: str, script_path: Path, *, include_model_args: bool = True) -> list[str]:
+    command = [python_executable, str(script_path)]
+    append_repo_selection_args(command)
+    if include_model_args:
+        append_shared_model_args(command)
     return command
 
 
@@ -164,9 +182,7 @@ def run_step(name: str, command: list[str], log_path: Path) -> dict:
 
 
 def build_classify_command(python_executable: str, script_path: Path) -> list[str]:
-    command = [python_executable, str(script_path)]
-    append_repo_selection_args(command)
-    append_shared_model_args(command)
+    command = build_agent_command(python_executable, script_path)
     if args.force:
         command.append("--force")
     if args.learn:
@@ -185,9 +201,7 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
 
 
 def build_dockerfile_command(python_executable: str, script_path: Path) -> list[str]:
-    command = [python_executable, str(script_path)]
-    append_repo_selection_args(command)
-    append_shared_model_args(command)
+    command = build_agent_command(python_executable, script_path)
     if args.force:
         command.append("--force")
     command.extend([
@@ -200,9 +214,7 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
 
 
 def build_repair_command(python_executable: str, script_path: Path) -> list[str]:
-    command = [python_executable, str(script_path)]
-    append_repo_selection_args(command)
-    append_shared_model_args(command)
+    command = build_agent_command(python_executable, script_path)
     command.extend([
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
@@ -223,19 +235,17 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
 
 
 def build_analysis_command(python_executable: str, script_path: Path) -> list[str]:
-    return [
-        python_executable,
-        str(script_path),
+    command = build_agent_command(python_executable, script_path, include_model_args=False)
+    command.extend([
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
         "--analysis-dir", args.analysis_dir,
-    ]
+    ])
+    return command
 
 
 def build_install_guide_command(python_executable: str, script_path: Path) -> list[str]:
-    command = [python_executable, str(script_path)]
-    append_repo_selection_args(command)
-    append_shared_model_args(command)
+    command = build_agent_command(python_executable, script_path)
     if args.force:
         command.append("--force")
     command.extend([
@@ -285,13 +295,12 @@ def main() -> int:
     workspace_root = Path(args.input_file).parent
     run_dir = workspace_root / "runs" / f"run-{run_id}"
 
-    args.results_dir = str(resolve_output_dir(workspace_root, run_dir, args.results_dir, DEFAULT_RESULTS_DIR, "classification_results"))
-    args.summaries_dir = str(resolve_output_dir(workspace_root, run_dir, args.summaries_dir, DEFAULT_SUMMARIES_DIR, "summaries"))
-    args.dockerfiles_dir = str(resolve_output_dir(workspace_root, run_dir, args.dockerfiles_dir, DEFAULT_DOCKERFILES_DIR, "dockerfiles"))
-    args.reports_dir = str(resolve_output_dir(workspace_root, run_dir, args.reports_dir, DEFAULT_REPORTS_DIR, "repair-reports"))
-    args.install_guides_dir = str(resolve_output_dir(workspace_root, run_dir, args.install_guides_dir, DEFAULT_INSTALL_GUIDES_DIR, "install-guides"))
-    args.pipeline_reports_dir = str(resolve_output_dir(workspace_root, run_dir, args.pipeline_reports_dir, DEFAULT_PIPELINE_REPORTS_DIR, "pipeline-reports"))
-    args.analysis_dir = str(resolve_output_dir(workspace_root, run_dir, args.analysis_dir, DEFAULT_ANALYSIS_DIR, "analysis"))
+    for attr_name, (default_value, run_subdir) in RUN_DIR_DEFAULTS.items():
+        setattr(
+            args,
+            attr_name,
+            str(resolve_output_dir(workspace_root, run_dir, getattr(args, attr_name), default_value, run_subdir)),
+        )
 
     python_executable = sys.executable
     reports_dir = Path(args.pipeline_reports_dir)

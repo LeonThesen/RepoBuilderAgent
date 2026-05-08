@@ -1,4 +1,4 @@
-from flask import json
+import json
 from openai import AsyncOpenAI, APITimeoutError, APIError
 import tiktoken
 import argparse
@@ -273,8 +273,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 raw_selection = selection_response.choices[0].message.content.strip()
                 log_trace(f"Received step1-selection response for {repo_name}")
                 if selection_response.usage:
-                    import json as _json
-                    log_info(f"[TOKENS] {_json.dumps({'phase': 'classify-step1', 'repo': repo_url, 'prompt_tokens': selection_response.usage.prompt_tokens, 'completion_tokens': selection_response.usage.completion_tokens, 'total_tokens': selection_response.usage.total_tokens})}")
+                    log_info(f"[TOKENS] {json.dumps({'phase': 'classify-step1', 'repo': repo_url, 'prompt_tokens': selection_response.usage.prompt_tokens, 'completion_tokens': selection_response.usage.completion_tokens, 'total_tokens': selection_response.usage.total_tokens})}")
                 parsed_selection = extract_selected_files(raw_selection)
                 if parsed_selection:
                     selected_files = parsed_selection
@@ -375,8 +374,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 raw = response.choices[0].message.content.strip()
                 log_trace(f"Received step2-classification response for {repo_name}")
                 if response.usage:
-                    import json as _json
-                    log_info(f"[TOKENS] {_json.dumps({'phase': 'classify-step2', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
+                    log_info(f"[TOKENS] {json.dumps({'phase': 'classify-step2', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
                 if args.trace:
                     print(raw)
 

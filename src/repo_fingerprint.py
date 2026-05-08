@@ -7,8 +7,6 @@ for LLM-based analysis (build tools, runtime, language, CI, etc.)
 """
 
 import os
-import json
-import argparse
 import fnmatch
 import yaml
 from pathlib import Path
@@ -132,10 +130,34 @@ def match_glob_patterns(root: Path) -> list[tuple[str, str]]:
     return results
 
 
+def _append_file_result(
+    results: list[tuple[str, str]],
+    seen: set[str],
+    rel: str,
+    file_path: Path,
+    max_bytes: Optional[int] = None,
+) -> None:
+    if rel in seen:
+        return
+    seen.add(rel)
+    results.append((rel, read_file_safe(file_path, max_bytes)))
+
+
+def _iter_selected_file_matches(root: Path, pattern: str):
+    for file_path in root.rglob("*"):
+        if not file_path.is_file():
+            continue
+        file_rel = str(file_path.relative_to(root).as_posix())
+        if fnmatch.fnmatch(file_rel, pattern):
+            yield file_rel, file_path
+
+
 def collect_manifest_files(root: Path) -> list[tuple[str, str]]:
     """Walk repo and collect full-read manifest files (non-pattern)."""
-    results = []
-    seen = set()
+    results: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    wildcard_patterns = [pattern for pattern in FULL_READ_FILES if "*" in pattern]
 
     def _walk(path: Path):
         try:
@@ -147,23 +169,12 @@ def collect_manifest_files(root: Path) -> list[tuple[str, str]]:
                     rel = str(entry.relative_to(root))
                     if rel in seen:
                         continue
-                    # exact filename match
                     if entry.name in FULL_READ_FILES:
-                        seen.add(rel)
-                        results.append((rel, read_file_safe(entry)))
-                    # glob-style wildcard (e.g. *.csproj)
-                    elif any(
-                        entry.match(pat)
-                        for pat in FULL_READ_FILES
-                        if "*" in pat
-                    ):
-                        seen.add(rel)
-                        results.append((rel, read_file_safe(entry)))
-                    # partial-read files
+                        _append_file_result(results, seen, rel, entry)
+                    elif any(entry.match(pattern) for pattern in wildcard_patterns):
+                        _append_file_result(results, seen, rel, entry)
                     elif entry.name in PARTIAL_READ:
-                        if rel not in seen:
-                            seen.add(rel)
-                            results.append((rel, read_file_safe(entry, PARTIAL_READ[entry.name])))
+                        _append_file_result(results, seen, rel, entry, PARTIAL_READ[entry.name])
         except PermissionError:
             pass
 
@@ -262,13 +273,8 @@ def collect_selected_files(root: Path, selected_files: list[str]) -> list[tuple[
 
         # Allow wildcard patterns from model output, e.g. .github/workflows/*.yml
         if "*" in rel or "?" in rel or "[" in rel:
-            for file_path in root.rglob("*"):
-                if not file_path.is_file():
-                    continue
-                file_rel = str(file_path.relative_to(root).as_posix())
-                if fnmatch.fnmatch(file_rel, rel) and file_rel not in seen:
-                    seen.add(file_rel)
-                    results.append((file_rel, read_file_safe(file_path)))
+            for file_rel, file_path in _iter_selected_file_matches(root, rel):
+                _append_file_result(results, seen, file_rel, file_path)
             continue
 
         file_path = (root / rel).resolve()
@@ -278,8 +284,7 @@ def collect_selected_files(root: Path, selected_files: list[str]) -> list[tuple[
             continue
 
         if file_path.is_file():
-            seen.add(rel)
-            results.append((rel, read_file_safe(file_path)))
+            _append_file_result(results, seen, rel, file_path)
 
     return sorted(results, key=lambda x: x[0])
 

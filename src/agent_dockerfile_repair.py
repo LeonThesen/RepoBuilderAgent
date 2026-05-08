@@ -6,19 +6,24 @@ import os
 import re
 import shutil
 import ssl
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
 import httpx
-import yaml
 from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
 from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
 from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-from repo_fingerprint import fingerprint
+from common import (
+    ensure_repo_checkout,
+    load_repo_urls,
+    load_summary,
+    read_yaml_file,
+    render_yaml,
+    repo_name_from_url,
+    should_use_progress,
+    update_progress,
+)
 
 
 def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | None = None) -> str:
@@ -179,61 +184,6 @@ def delete_docs_build_context(repo_path: Path, repo_name: str) -> None:
     )
 
 
-def should_use_progress(total_repos: int) -> bool:
-    return total_repos > 1 and sys.stderr.isatty() and not args.trace
-
-
-def repo_name_from_url(repo_url: str) -> str:
-    return repo_url.rstrip("/").split("/")[-1].replace(".git", "")
-
-
-def load_repo_urls() -> list[str]:
-    if args.repo_url:
-        repos = [url.strip() for url in args.repo_url if url and url.strip()]
-        return list(dict.fromkeys(repos))
-
-    with open(args.input_file, "r", encoding="utf-8") as input_file:
-        return [item["url"] for item in json.load(input_file)]
-
-
-def read_yaml_file(path: Path) -> dict | None:
-    if not path.exists():
-        return None
-
-    with open(path, "r", encoding="utf-8") as yaml_file:
-        return yaml.safe_load(yaml_file)
-
-
-def load_summary(repo_name: str, repo_path: Path, summaries_dir: Path) -> str:
-    reduced_summary_path = summaries_dir / f"{repo_name}.md"
-    if reduced_summary_path.exists():
-        with open(reduced_summary_path, "r", encoding="utf-8") as summary_file:
-            return summary_file.read()
-
-    selected_files_path = summaries_dir / f"{repo_name}.selected-files.yaml"
-    selected_files_config = read_yaml_file(selected_files_path) or {}
-    selected_files = selected_files_config.get("selected_files")
-    if isinstance(selected_files, list) and selected_files:
-        return fingerprint(
-            format="md",
-            repo_path=repo_path,
-            selected_files=selected_files,
-            include_tree=False,
-            context="dockerfile-repair-selected",
-        )
-
-    return fingerprint(
-        format="md",
-        repo_path=repo_path,
-        selected_files=None,
-        include_tree=True,
-        context="dockerfile-repair-baseline",
-    )
-
-
-def render_yaml(data: dict) -> str:
-    return yaml.dump(data, sort_keys=False, allow_unicode=True)
-
 
 def extract_dockerfile(raw: str) -> str:
     match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
@@ -279,24 +229,26 @@ def normalize_verify_command(command: str) -> str:
     )
 
 
-async def update_progress(progress_state: dict, repo_name: str) -> None:
-    if progress_state["bar"] is None:
-        return
-    async with progress_state["lock"]:
-        progress_state["bar"].set_postfix_str(repo_name)
-        progress_state["bar"].update(1)
-
-
-async def ensure_repo_checkout(repo_url: str, repo_path: Path) -> bool:
-    if repo_path.exists():
-        return True
-
-    log_info(f"Cloning {repo_url} -> {repo_path}")
-    result = await asyncio.to_thread(subprocess.run, ["git", "clone", repo_url, str(repo_path)], check=False)
-    if result.returncode != 0:
-        log_warn(f"Failed to clone {repo_url}; skipping Dockerfile repair.")
-        return False
-    return True
+def _apply_repair(
+    repo_url: str,
+    repo_name: str,
+    current: str,
+    repaired: str,
+    dockerfile_path: Path,
+    report_dir: Path,
+    attempt: int,
+) -> tuple[str | None, bool]:
+    """Validate and write a repaired Dockerfile. Returns (updated_content, should_stop)."""
+    if not repaired.strip():
+        log_warn(f"Repair model returned an empty Dockerfile for {repo_url}; stopping retries.")
+        return None, True
+    if repaired.strip() == current.strip():
+        log_warn(f"Repair model returned an unchanged Dockerfile for {repo_url}; stopping retries.")
+        return None, True
+    write_text(dockerfile_path, repaired)
+    write_text(report_dir / f"attempt-{attempt}.repaired.Dockerfile", repaired)
+    log_trace(f"Updated Dockerfile for {repo_name} after attempt {attempt}")
+    return repaired, False
 
 
 async def run_build(command: list[str], repo_name: str, attempt: int) -> tuple[int, str]:
@@ -387,8 +339,7 @@ async def request_repair(
         messages=[{"role": "user", "content": prompt}],
     )
     if response.usage:
-        import json as _json
-        log_info(f"[TOKENS] {_json.dumps({'phase': 'repair', 'repo': repo_url, 'attempt': attempt_number, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
+        log_info(f"[TOKENS] {json.dumps({'phase': 'repair', 'repo': repo_url, 'attempt': attempt_number, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
     return extract_dockerfile(response.choices[0].message.content.strip())
 
 
@@ -438,7 +389,7 @@ async def repair_repository(
                     return
 
             repo_path = repos_dir / repo_name
-            if not await ensure_repo_checkout(repo_url, repo_path):
+            if not await ensure_repo_checkout(repo_url, repo_path, "skipping Dockerfile repair"):
                 return
 
             if not args.skip_delete_docs:
@@ -550,20 +501,12 @@ async def repair_repository(
                         dockerfile_content=current_dockerfile,
                         build_log=build_log,
                     )
-
-                    if not repaired_dockerfile.strip():
-                        log_warn(f"Repair model returned an empty Dockerfile for {repo_url}; stopping retries.")
+                    current_dockerfile, stop = _apply_repair(
+                        repo_url, repo_name, current_dockerfile, repaired_dockerfile,
+                        dockerfile_path, report_dir, attempt,
+                    )
+                    if stop:
                         break
-
-                    if repaired_dockerfile.strip() == current_dockerfile.strip():
-                        log_warn(f"Repair model returned an unchanged Dockerfile for {repo_url}; stopping retries.")
-                        break
-
-                    current_dockerfile = repaired_dockerfile
-                    write_text(dockerfile_path, current_dockerfile)
-                    write_text(report_dir / f"attempt-{attempt}.repaired.Dockerfile", current_dockerfile)
-                    log_trace(f"Updated Dockerfile for {repo_name} after attempt {attempt}")
-                    continue
 
                 log_warn(
                     f"Build attempt {attempt} failed for {repo_url} with exit code {exit_code}; build log: {build_log_path}"
@@ -582,19 +525,12 @@ async def repair_repository(
                     dockerfile_content=current_dockerfile,
                     build_log=build_log,
                 )
-
-                if not repaired_dockerfile.strip():
-                    log_warn(f"Repair model returned an empty Dockerfile for {repo_url}; stopping retries.")
+                current_dockerfile, stop = _apply_repair(
+                    repo_url, repo_name, current_dockerfile, repaired_dockerfile,
+                    dockerfile_path, report_dir, attempt,
+                )
+                if stop:
                     break
-
-                if repaired_dockerfile.strip() == current_dockerfile.strip():
-                    log_warn(f"Repair model returned an unchanged Dockerfile for {repo_url}; stopping retries.")
-                    break
-
-                current_dockerfile = repaired_dockerfile
-                write_text(dockerfile_path, current_dockerfile)
-                write_text(report_dir / f"attempt-{attempt}.repaired.Dockerfile", current_dockerfile)
-                log_trace(f"Updated Dockerfile for {repo_name} after attempt {attempt}")
 
             write_text(report_path, render_yaml(report))
             log_info(f"Repair report written to {report_path}")
@@ -616,7 +552,7 @@ async def repair_repository(
 
 
 async def main() -> None:
-    repos = load_repo_urls()
+    repos = load_repo_urls(args.input_file, args.repo_url)
     if not repos:
         log_error("No repositories to process. Provide --repo-url or a non-empty --input-file.")
         return
@@ -630,7 +566,7 @@ async def main() -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     progress_bar = None
-    if should_use_progress(len(repos)):
+    if should_use_progress(len(repos), args.trace):
         progress_bar = tqdm(total=len(repos), desc="Repairing Dockerfiles", unit="repo", dynamic_ncols=True)
 
     progress_state = {
