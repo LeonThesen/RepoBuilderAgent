@@ -1,0 +1,407 @@
+import argparse
+from datetime import datetime, timezone
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+from log_utils import log_error, log_info, set_trace_enabled
+import yaml
+
+
+parser = argparse.ArgumentParser(
+    description="Run the full repository pipeline: classify, generate Dockerfiles, and repair failing Docker builds."
+)
+parser.add_argument("--input-file", default="repos.json", help="Path to input file containing repository URLs")
+parser.add_argument(
+    "--repo-url",
+    action="append",
+    default=[],
+    help="Run the pipeline for a specific repository URL (can be passed multiple times). Overrides --input-file when provided.",
+)
+parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
+parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
+parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
+parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for model calls")
+parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
+parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
+parser.add_argument("--force", action="store_true", help="Overwrite existing generated artifacts where supported")
+parser.add_argument("--learn", action="store_true", help="Enable learning of new manifest file patterns during classification")
+parser.add_argument("--preprocess", action="store_true", help="Enable repository preprocessing during classification")
+parser.add_argument("--deletion-patterns", default="config/deletion-patterns.yaml", help="Path to YAML file with deletion patterns for preprocessing")
+parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
+parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
+parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
+parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory containing generated Dockerfiles")
+parser.add_argument("--reports-dir", default="repair-reports", help="Directory where repair logs and reports are written")
+parser.add_argument("--install-guides-dir", default="install-guides", help="Directory where generated INSTALL.md guides are written")
+parser.add_argument("--analysis-dir", default="analysis", help="Directory where analysis outputs are written when --run-analysis is enabled")
+parser.add_argument("--container-cli", default="docker", help="Container CLI to use for repair builds")
+parser.add_argument("--max-attempts", type=int, default=3, help="Maximum number of repair attempts per repository")
+parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum number of build log characters to send to the repair model")
+parser.add_argument("--skip-delete-docs", action="store_true", help="Skip deleting documentation and CI/CD files from the build context before building")
+parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside built images to verify the build produced working software")
+parser.add_argument("--verify-timeout", type=int, default=30, help="Timeout in seconds for build verification container execution")
+parser.add_argument("--skip-classify", action="store_true", help="Skip the classification phase")
+parser.add_argument("--skip-dockerfile", action="store_true", help="Skip the Dockerfile generation phase")
+parser.add_argument("--skip-repair", action="store_true", help="Skip the Dockerfile repair phase")
+parser.add_argument("--skip-install-guide", action="store_true", help="Skip the INSTALL.md generation phase")
+parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
+parser.add_argument("--pipeline-reports-dir", default="pipeline-reports", help="Directory where pipeline logs and summary are written")
+parser.add_argument("--pipeline-summary-path", default="", help="Optional explicit path for the pipeline summary YAML")
+parser.add_argument("--print-summary", action="store_true", help="Print planned pipeline summary and exit without running phases")
+args = parser.parse_args()
+
+
+DEFAULT_RESULTS_DIR = "classification_results"
+DEFAULT_SUMMARIES_DIR = "summaries"
+DEFAULT_DOCKERFILES_DIR = "dockerfiles"
+DEFAULT_REPORTS_DIR = "repair-reports"
+DEFAULT_INSTALL_GUIDES_DIR = "install-guides"
+DEFAULT_PIPELINE_REPORTS_DIR = "pipeline-reports"
+DEFAULT_ANALYSIS_DIR = "analysis"
+
+
+set_trace_enabled(args.trace)
+
+
+def sanitize_command(command: list[str]) -> list[str]:
+    sanitized = command.copy()
+    for index, part in enumerate(sanitized[:-1]):
+        if part == "--api-key":
+            sanitized[index + 1] = "***REDACTED***"
+    return sanitized
+
+
+def render_command(command: list[str]) -> str:
+    return " ".join(sanitize_command(command))
+
+
+def append_shared_model_args(command: list[str]) -> list[str]:
+    command.extend([
+        "--endpoint", args.endpoint,
+        "--model", args.model,
+        "--api-key", args.api_key,
+        "--temperature", str(args.temperature),
+        "--timeout", str(args.timeout),
+    ])
+    if args.trace:
+        command.append("--trace")
+    return command
+
+
+def append_repo_selection_args(command: list[str]) -> list[str]:
+    command.extend(["--input-file", args.input_file])
+    for repo_url in args.repo_url:
+        command.extend(["--repo-url", repo_url])
+    return command
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_summary_path(workspace_root: Path, run_id: str) -> Path:
+    if args.pipeline_summary_path:
+        candidate = Path(args.pipeline_summary_path)
+        if not candidate.is_absolute():
+            candidate = workspace_root / candidate
+        return candidate
+    return Path(args.pipeline_reports_dir) / f"pipeline-summary-{run_id}.yaml"
+
+
+def resolve_output_dir(workspace_root: Path, run_dir: Path, value: str, default_value: str, run_subdir: str) -> Path:
+    if value == default_value:
+        return run_dir / run_subdir
+
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = workspace_root / candidate
+    return candidate
+
+
+def run_step(name: str, command: list[str], log_path: Path) -> dict:
+    started_at = utc_now()
+    started_ts = time.perf_counter()
+    rendered_command = render_command(command)
+    log_info(f"Running {name}: {rendered_command}")
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as step_log:
+        step_log.write(f"$ {rendered_command}\n\n")
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            step_log.write(line)
+
+        return_code = process.wait()
+
+    duration_seconds = round(time.perf_counter() - started_ts, 3)
+    step_result = {
+        "name": name,
+        "status": "success" if return_code == 0 else "failed",
+        "started_at": started_at,
+        "ended_at": utc_now(),
+        "duration_seconds": duration_seconds,
+        "exit_code": return_code,
+        "command": sanitize_command(command),
+        "log_path": str(log_path),
+    }
+
+    if return_code != 0:
+        raise RuntimeError(f"{name} failed with exit code {return_code}")
+    return step_result
+
+
+def build_classify_command(python_executable: str, script_path: Path) -> list[str]:
+    command = [python_executable, str(script_path)]
+    append_repo_selection_args(command)
+    append_shared_model_args(command)
+    if args.force:
+        command.append("--force")
+    if args.learn:
+        command.append("--learn")
+    if args.preprocess:
+        command.append("--preprocess")
+    command.extend([
+        "--deletion-patterns", args.deletion_patterns,
+        "--results-dir", args.results_dir,
+        "--summaries-dir", args.summaries_dir,
+        "--repos-dir", args.repos_dir,
+        "--analysis-dir", args.analysis_dir,
+    ])
+    command.append("--no-analysis")
+    return command
+
+
+def build_dockerfile_command(python_executable: str, script_path: Path) -> list[str]:
+    command = [python_executable, str(script_path)]
+    append_repo_selection_args(command)
+    append_shared_model_args(command)
+    if args.force:
+        command.append("--force")
+    command.extend([
+        "--results-dir", args.results_dir,
+        "--summaries-dir", args.summaries_dir,
+        "--repos-dir", args.repos_dir,
+        "--output-dir", args.dockerfiles_dir,
+    ])
+    return command
+
+
+def build_repair_command(python_executable: str, script_path: Path) -> list[str]:
+    command = [python_executable, str(script_path)]
+    append_repo_selection_args(command)
+    append_shared_model_args(command)
+    command.extend([
+        "--results-dir", args.results_dir,
+        "--summaries-dir", args.summaries_dir,
+        "--repos-dir", args.repos_dir,
+        "--dockerfiles-dir", args.dockerfiles_dir,
+        "--reports-dir", args.reports_dir,
+        "--container-cli", args.container_cli,
+        "--max-attempts", str(args.max_attempts),
+        "--max-log-chars", str(args.max_log_chars),
+    ])
+    if args.skip_delete_docs:
+        command.append("--skip-delete-docs")
+    command.extend([
+        "--verify-command", args.verify_command,
+        "--verify-timeout", str(args.verify_timeout),
+    ])
+    return command
+
+
+def build_analysis_command(python_executable: str, script_path: Path) -> list[str]:
+    return [
+        python_executable,
+        str(script_path),
+        "--results-dir", args.results_dir,
+        "--summaries-dir", args.summaries_dir,
+        "--analysis-dir", args.analysis_dir,
+    ]
+
+
+def build_install_guide_command(python_executable: str, script_path: Path) -> list[str]:
+    command = [python_executable, str(script_path)]
+    append_repo_selection_args(command)
+    append_shared_model_args(command)
+    if args.force:
+        command.append("--force")
+    command.extend([
+        "--results-dir", args.results_dir,
+        "--summaries-dir", args.summaries_dir,
+        "--repos-dir", args.repos_dir,
+        "--dockerfiles-dir", args.dockerfiles_dir,
+        "--output-dir", args.install_guides_dir,
+    ])
+    return command
+
+
+def write_summary(path: Path, summary: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as summary_file:
+        yaml.dump(summary, summary_file, sort_keys=False, allow_unicode=True)
+
+
+def print_planned_summary() -> None:
+    summary_text = (
+        "Agentic flow: infer -> generate -> build -> diagnose -> repair -> verify -> document -> report.\n\n"
+        "1. Input selection\n"
+        "The pipeline picks which repos to process (from list or direct URL).\n\n"
+        "2. Classification phase\n"
+        "It inspects each repo and infers install/build facts (language, build tool, system deps, runtime hints, etc.).\n\n"
+        "3. Optional analysis phase\n"
+        "It can aggregate/parse classification artifacts into summary analysis outputs.\n\n"
+        "4. Dockerfile generation\n"
+        "It generates an initial Dockerfile from the classification + repository summary.\n\n"
+        "5. Repair loop\n"
+        "It tries to build the Dockerfile, captures full failure logs, asks the model to fix the Dockerfile, and retries up to N attempts.\n\n"
+        "6. Build verification\n"
+        "After a successful build, it runs an in-container verification command to confirm the built artifact is actually usable (not just \"image built\").\n\n"
+        "7. INSTALL guide generation\n"
+        "It generates a human-readable INSTALL.md from the final Dockerfile and verification command so a developer can reproduce the build outside the container.\n\n"
+        "8. Reporting\n"
+        "It writes per-attempt logs plus a pipeline summary with phase status, timings, commands, and artifact paths.\n\n"
+    )
+    print(summary_text, end="")
+
+
+def main() -> int:
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    pipeline_started_ts = time.perf_counter()
+    pipeline_started_at = utc_now()
+    src_dir = Path(__file__).resolve().parent
+    workspace_root = Path(args.input_file).parent
+    run_dir = workspace_root / "runs" / f"run-{run_id}"
+
+    args.results_dir = str(resolve_output_dir(workspace_root, run_dir, args.results_dir, DEFAULT_RESULTS_DIR, "classification_results"))
+    args.summaries_dir = str(resolve_output_dir(workspace_root, run_dir, args.summaries_dir, DEFAULT_SUMMARIES_DIR, "summaries"))
+    args.dockerfiles_dir = str(resolve_output_dir(workspace_root, run_dir, args.dockerfiles_dir, DEFAULT_DOCKERFILES_DIR, "dockerfiles"))
+    args.reports_dir = str(resolve_output_dir(workspace_root, run_dir, args.reports_dir, DEFAULT_REPORTS_DIR, "repair-reports"))
+    args.install_guides_dir = str(resolve_output_dir(workspace_root, run_dir, args.install_guides_dir, DEFAULT_INSTALL_GUIDES_DIR, "install-guides"))
+    args.pipeline_reports_dir = str(resolve_output_dir(workspace_root, run_dir, args.pipeline_reports_dir, DEFAULT_PIPELINE_REPORTS_DIR, "pipeline-reports"))
+    args.analysis_dir = str(resolve_output_dir(workspace_root, run_dir, args.analysis_dir, DEFAULT_ANALYSIS_DIR, "analysis"))
+
+    python_executable = sys.executable
+    reports_dir = Path(args.pipeline_reports_dir)
+    run_logs_dir = reports_dir / run_id
+    summary_path = resolve_summary_path(workspace_root, run_id)
+
+    classify_script = src_dir / "agent_classify.py"
+    dockerfile_script = src_dir / "agent_dockerfile.py"
+    repair_script = src_dir / "agent_dockerfile_repair.py"
+    install_guide_script = src_dir / "agent_install_guide.py"
+    analysis_script = src_dir / "parse_results.py"
+
+    if args.print_summary:
+        print_planned_summary()
+        return 0
+
+    phases_selected = not (args.skip_classify and args.skip_dockerfile and args.skip_repair and args.skip_install_guide)
+    if not phases_selected and not args.run_analysis:
+        log_error("Nothing to do. All pipeline phases were skipped and --run-analysis was not set.")
+        return 1
+
+    summary: dict = {
+        "run_id": run_id,
+        "started_at": pipeline_started_at,
+        "ended_at": None,
+        "duration_seconds": None,
+        "status": "failed",
+        "trace": {
+            "enabled": args.trace,
+            "forwarded_to_child_agents": args.trace,
+        },
+        "paths": {
+            "run_dir": str(run_dir),
+            "reports_dir": str(reports_dir),
+            "run_logs_dir": str(run_logs_dir),
+            "summary_path": str(summary_path),
+            "results_dir": args.results_dir,
+            "summaries_dir": args.summaries_dir,
+            "dockerfiles_dir": args.dockerfiles_dir,
+            "repair_reports_dir": args.reports_dir,
+            "install_guides_dir": args.install_guides_dir,
+            "analysis_dir": args.analysis_dir,
+        },
+        "phases": [],
+        "error": None,
+    }
+
+    try:
+        if not args.skip_classify:
+            summary["phases"].append(
+                run_step(
+                    "classification",
+                    build_classify_command(python_executable, classify_script),
+                    run_logs_dir / "classification.log",
+                )
+            )
+
+        if args.run_analysis:
+            summary["phases"].append(
+                run_step(
+                    "analysis",
+                    build_analysis_command(python_executable, analysis_script),
+                    run_logs_dir / "analysis.log",
+                )
+            )
+
+        if not args.skip_dockerfile:
+            summary["phases"].append(
+                run_step(
+                    "dockerfile generation",
+                    build_dockerfile_command(python_executable, dockerfile_script),
+                    run_logs_dir / "dockerfile-generation.log",
+                )
+            )
+
+        if not args.skip_repair:
+            summary["phases"].append(
+                run_step(
+                    "dockerfile repair",
+                    build_repair_command(python_executable, repair_script),
+                    run_logs_dir / "dockerfile-repair.log",
+                )
+            )
+
+        if not args.skip_install_guide:
+            summary["phases"].append(
+                run_step(
+                    "install guide generation",
+                    build_install_guide_command(python_executable, install_guide_script),
+                    run_logs_dir / "install-guide-generation.log",
+                )
+            )
+
+        summary["status"] = "success"
+
+    except RuntimeError as error:
+        summary["error"] = str(error)
+        log_error(str(error))
+    finally:
+        summary["ended_at"] = utc_now()
+        summary["duration_seconds"] = round(time.perf_counter() - pipeline_started_ts, 3)
+        write_summary(summary_path, summary)
+        log_info(f"Pipeline summary written to {summary_path}")
+
+    if summary["status"] != "success":
+        return 1
+
+    log_info("Pipeline process completed (note: this indicates the pipeline ran without errors, not that builds were successful).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
