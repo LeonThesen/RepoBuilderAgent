@@ -1,0 +1,42 @@
+# Base Dockerfile for TypeScript/Node.js projects
+# Includes: Debian, CA bootstrap, Node.js from Debian repos (NOT NodeSource), npm/pnpm, build-essential
+
+FROM debian:trixie-slim
+
+# Install CA certificates and corporate CA if provided
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Decode and install corporate CA if present
+RUN if [ -n "$MANUALREPOS_CA_CERT_B64" ]; then \
+      echo "$MANUALREPOS_CA_CERT_B64" | base64 -d > /usr/local/share/ca-certificates/corporate-ca.crt && \
+      update-ca-certificates; \
+    fi
+
+# Install Node.js from Debian repos (NOT NodeSource to avoid extra TLS bootstrap)
+# Debian 13+ provides recent Node.js versions; use npm caching to speed builds
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nodejs \
+    npm \
+    build-essential \
+    git \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash manualrepos
+WORKDIR /home/manualrepos/repo
+
+# Copy repository from build context (already checked out on host)
+COPY . .
+RUN chown -R manualrepos:manualrepos /home/manualrepos/repo
+
+# Install npm dependencies (may use pnpm or yarn if lock files indicate)
+# [PLACEHOLDER: npm ci --omit=optional or equivalent based on lockfile]
+
+# Build instructions
+# [PLACEHOLDER: Repo-specific build commands (npm run build, tsc, webpack, vite, etc.)]
+
+# Final CMD or ENTRYPOINT
+# [PLACEHOLDER: Entry point or binary path]
