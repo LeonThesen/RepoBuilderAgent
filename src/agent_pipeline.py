@@ -258,10 +258,68 @@ def build_install_guide_command(python_executable: str, script_path: Path) -> li
     return command
 
 
+def resolve_python_executable(workspace_root: Path) -> str:
+    """Prefer workspace venv Python for child agent invocations."""
+    venv_root = workspace_root / ".venv"
+    venv_python = workspace_root / ".venv" / "bin" / "python"
+    current_prefix = Path(sys.prefix).resolve()
+    if venv_python.exists() and current_prefix != venv_root.resolve():
+        log_info(f"Using workspace venv interpreter for child agents: {venv_python}")
+        return str(venv_python)
+    return sys.executable
+
+
 def write_summary(path: Path, summary: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as summary_file:
         yaml.dump(summary, summary_file, sort_keys=False, allow_unicode=True)
+
+
+def collect_repair_outcomes(reports_dir: Path) -> dict:
+    """Aggregate build/verification outcomes from per-repo repair reports."""
+    outcome = {
+        "total_reports": 0,
+        "build_success": 0,
+        "build_failed": 0,
+        "verify_passed": 0,
+        "verify_failed": 0,
+        "verify_missing": 0,
+    }
+
+    if not reports_dir.exists():
+        return outcome
+
+    for report_path in reports_dir.glob("*/report.yaml"):
+        try:
+            with open(report_path, "r", encoding="utf-8") as report_file:
+                report = yaml.safe_load(report_file) or {}
+        except Exception:
+            continue
+
+        outcome["total_reports"] += 1
+
+        build_ok = bool(report.get("success", False))
+        if build_ok:
+            outcome["build_success"] += 1
+        else:
+            outcome["build_failed"] += 1
+
+        attempts = report.get("attempts", []) or []
+        verification = None
+        for attempt in reversed(attempts):
+            build_verification = attempt.get("build_verification")
+            if build_verification:
+                verification = build_verification
+                break
+
+        if verification is None:
+            outcome["verify_missing"] += 1
+        elif verification.get("exit_code") == 0:
+            outcome["verify_passed"] += 1
+        else:
+            outcome["verify_failed"] += 1
+
+    return outcome
 
 
 def print_planned_summary() -> None:
@@ -302,7 +360,7 @@ def main() -> int:
             str(resolve_output_dir(workspace_root, run_dir, getattr(args, attr_name), default_value, run_subdir)),
         )
 
-    python_executable = sys.executable
+    python_executable = resolve_python_executable(workspace_root)
     reports_dir = Path(args.pipeline_reports_dir)
     run_logs_dir = reports_dir / run_id
     summary_path = resolve_summary_path(workspace_root, run_id)
@@ -407,6 +465,14 @@ def main() -> int:
 
     if summary["status"] != "success":
         return 1
+
+    if not args.skip_repair:
+        repair_outcomes = collect_repair_outcomes(Path(args.reports_dir))
+        log_info(
+            f"Build outcomes ({repair_outcomes['total_reports']} reports)"
+            f"  |  build ok={repair_outcomes['build_success']} failed={repair_outcomes['build_failed']}"
+            f"  |  verify ok={repair_outcomes['verify_passed']} failed={repair_outcomes['verify_failed']} missing={repair_outcomes['verify_missing']}"
+        )
 
     log_info("Pipeline process completed (note: this indicates the pipeline ran without errors, not that builds were successful).")
     return 0
