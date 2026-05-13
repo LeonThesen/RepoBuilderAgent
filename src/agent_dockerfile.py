@@ -44,6 +44,7 @@ parser.add_argument("--temperature", type=float, default=0.0, help="Temperature 
 parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated Dockerfiles")
+parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
@@ -116,6 +117,74 @@ def get_base_template(classification: dict) -> str:
     return ""
 
 
+def render_failed_lint_attempts(failed_attempts: list[dict[str, str]]) -> str:
+    if not failed_attempts:
+        return ""
+
+    recent_attempts = failed_attempts[-3:]
+    skipped_count = len(failed_attempts) - len(recent_attempts)
+    sections = [
+        "\n\nPrevious Dockerfile generations failed Hadolint validation.",
+        "\nDo not repeat these mistakes. Return only a valid Dockerfile.",
+    ]
+    if skipped_count > 0:
+        sections.append(f"\n{skipped_count} earlier failed lint attempts are omitted for brevity.")
+    for index, failed_attempt in enumerate(recent_attempts, start=len(failed_attempts) - len(recent_attempts) + 1):
+        sections.append(
+            "\n\n"
+            f"Attempt {index} failed Hadolint with:\n"
+            "```text\n"
+            f"{failed_attempt['error']}\n"
+            "```\n"
+            "Generated Dockerfile was:\n"
+            "```dockerfile\n"
+            f"{failed_attempt['dockerfile'][:1200]}"
+            "```"
+        )
+    return "".join(sections)
+
+
+def render_repeated_lint_guardrail(failed_attempts: list[dict[str, str]]) -> str:
+    if len(failed_attempts) < 3:
+        return ""
+
+    recent_attempts = failed_attempts[-3:]
+    recent_errors = [attempt["error"] for attempt in recent_attempts]
+    if len(set(recent_errors)) != 1:
+        return ""
+
+    match = re.search(r":(\d+):(\d+)\s+(.*)", recent_attempts[-1]["error"])
+    if not match:
+        return (
+            "\n\nHadolint has produced the same syntax error three times in a row. "
+            "Change your structure substantially and return only valid Dockerfile instructions."
+        )
+
+    line_number = int(match.group(1))
+    error_summary = match.group(3).strip()
+    dockerfile_lines = recent_attempts[-1]["dockerfile"].splitlines()
+    offending_line = ""
+    if 1 <= line_number <= len(dockerfile_lines):
+        offending_line = dockerfile_lines[line_number - 1].strip()
+
+    sections = [
+        "\n\nHadolint has produced the same syntax error three times in a row.",
+        f"\nThe current parser failure is at line {line_number}: {error_summary}",
+    ]
+    if offending_line:
+        sections.append(
+            "\nThe line currently at that position is:\n"
+            "```text\n"
+            f"{offending_line}\n"
+            "```"
+        )
+    sections.append(
+        "\nRewrite that part of the Dockerfile so every line is a valid Dockerfile instruction. "
+        "Do not emit bullet points, prose, or raw certificate text. Return only the Dockerfile."
+    )
+    return "".join(sections)
+
+
 
 async def generate_dockerfile(
     repo_url: str,
@@ -148,25 +217,26 @@ async def generate_dockerfile(
 
             summary = load_summary(repo_name, repo_path, summaries_dir)
             base_template = get_base_template(classification)
-            
-            # Generation loop with hadolint validation
-            max_lint_attempts = 3
+
+            # Regenerate until Hadolint accepts the Dockerfile. These retries do not
+            # count as build attempts because no project build has run yet.
             dockerfile_content = None
-            lint_errors = ""
-            
-            for lint_attempt in range(1, max_lint_attempts + 1):
+            failed_lint_attempts: list[dict[str, str]] = []
+            lint_attempt = 1
+
+            while True:
                 prompt = (
                     PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
                     .replace("{{BASE_TEMPLATE_CONTENT}}", base_template)
                     .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
                     .replace("{{SUMMARY_CONTENT}}", summary)
                 )
-                
-                # Add hadolint error feedback if this is a retry
-                if lint_errors:
-                    prompt += f"\n\n**Previous hadolint validation failed with:**\n```\n{lint_errors}\n```\n\nPlease fix the Dockerfile syntax errors above."
-                
-                log_info(f"Generating Dockerfile for {repo_url} (lint attempt {lint_attempt}/{max_lint_attempts})...")
+
+                if failed_lint_attempts:
+                    prompt += render_failed_lint_attempts(failed_lint_attempts)
+                    prompt += render_repeated_lint_guardrail(failed_lint_attempts)
+
+                log_info(f"Generating Dockerfile for {repo_url} (lint attempt {lint_attempt})...")
                 response = await client.chat.completions.create(
                     model=args.model,
                     temperature=args.temperature,
@@ -182,28 +252,36 @@ async def generate_dockerfile(
                     return
 
                 dockerfile_content = inject_ca_cert_into_dockerfile(dockerfile_content)
-                
+
                 # Validate Dockerfile syntax with hadolint
                 if not args.skip_hadolint:
                     # Write temporary file for hadolint check
                     temp_dockerfile = output_dir / f".{repo_name}.Dockerfile.tmp"
                     with open(temp_dockerfile, "w", encoding="utf-8") as tmp_file:
                         tmp_file.write(dockerfile_content)
-                    
-                    is_valid, validation_error = await validate_dockerfile_syntax(temp_dockerfile, repo_name)
-                    temp_dockerfile.unlink()  # Clean up temp file
-                    
+
+                    try:
+                        is_valid, validation_error = await validate_dockerfile_syntax(temp_dockerfile, repo_name)
+                    finally:
+                        if temp_dockerfile.exists():
+                            temp_dockerfile.unlink()
+
                     if is_valid:
                         log_info(f"[hadolint {repo_name}] Dockerfile syntax OK on attempt {lint_attempt}")
                         break
-                    else:
-                        lint_errors = validation_error[:1000]
-                        log_warn(f"[hadolint {repo_name}] Dockerfile syntax error on attempt {lint_attempt}: {lint_errors[:200]}")
-                        if lint_attempt < max_lint_attempts:
-                            continue
-                        else:
-                            log_warn(f"[hadolint {repo_name}] Max lint attempts reached; skipping repo")
-                            return
+
+                    failed_lint_attempts.append(
+                        {
+                            "error": validation_error[:1500],
+                            "dockerfile": dockerfile_content,
+                        }
+                    )
+                    log_warn(
+                        f"[hadolint {repo_name}] Dockerfile syntax error on attempt {lint_attempt}: "
+                        f"{validation_error[:200]}"
+                    )
+                    lint_attempt += 1
+                    continue
                 else:
                     # skip_hadolint mode: just use first generation
                     log_info(f"[hadolint {repo_name}] Skipping validation (--skip-hadolint set)")

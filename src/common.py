@@ -32,19 +32,11 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
     if not ca_cert_b64:
         return dockerfile_content
 
-    try:
-        ca_cert_pem = base64.b64decode(ca_cert_b64).decode("utf-8")
-    except Exception as e:
-        log_warn(f"Failed to decode MANUALREPOS_CA_CERT_B64: {e}")
-        return dockerfile_content
-
     ca_cert_path = "/usr/local/share/ca-certificates/custom-ca.crt"
     ca_setup_commands = f"""
 RUN apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates curl default-jre-headless 2>/dev/null || true
 RUN mkdir -p /usr/local/share/ca-certificates
-RUN cat > {ca_cert_path} << 'EOF'
-{ca_cert_pem}
-EOF
+RUN printf '%s' '{ca_cert_b64}' | base64 -d > {ca_cert_path}
 RUN update-ca-certificates
 RUN if command -v keytool >/dev/null 2>&1; then keytool -import -alias custom-ca -file {ca_cert_path} -keystore /etc/ssl/certs/java/cacerts -storepass changeit -noprompt 2>/dev/null || true; fi
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -168,11 +160,18 @@ async def validate_dockerfile_syntax(dockerfile_path: Path, repo_name: str = "")
     if not hadolint_path.exists():
         log_warn(f"[hadolint {repo_name}] hadolint not found at {hadolint_path}; skipping validation")
         return True, ""
-    
+
+    repo_root = Path(__file__).resolve().parents[2]
+    hadolint_config = repo_root / ".hadolint.yaml"
+    command = [str(hadolint_path)]
+    if hadolint_config.exists():
+        command.extend(["--config", str(hadolint_config)])
+    command.append(str(dockerfile_path))
+
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            [str(hadolint_path), str(dockerfile_path)],
+            command,
             capture_output=True,
             text=True,
             timeout=10
