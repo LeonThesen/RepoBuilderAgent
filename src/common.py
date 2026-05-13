@@ -70,6 +70,14 @@ def render_yaml(data: dict) -> str:
     return yaml.dump(data, sort_keys=False, allow_unicode=True)
 
 
+def prompts_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "prompts"
+
+
+def prompt_path(name: str) -> Path:
+    return prompts_dir() / name
+
+
 def should_use_progress(total_repos: int, trace: bool) -> bool:
     return total_repos > 1 and sys.stderr.isatty() and not trace
 
