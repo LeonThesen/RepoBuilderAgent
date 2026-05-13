@@ -470,28 +470,23 @@ async def repair_repository(
                 original_dockerfile_content = dockerfile_path.read_text(encoding="utf-8")
                 write_text(dockerfile_path, dockerfile_for_build)
 
-                # Validate Dockerfile syntax before attempting docker build (unless skipped)
+                # Check Dockerfile syntax with hadolint (if not skipped)
+                # Hadolint errors are prepended to build log for LLM feedback, but build still attempts
+                hadolint_error = ""
                 if not args.skip_hadolint:
                     is_valid, validation_error = await validate_dockerfile_syntax(dockerfile_path, repo_name)
                     if not is_valid:
-                        log_warn(f"[hadolint {repo_name}] Dockerfile syntax validation failed; skipping build attempt {attempt}")
-                        # Restore original dockerfile
-                        write_text(dockerfile_path, original_dockerfile_content)
-                        report["attempts"].append(
-                            {
-                                "attempt": attempt,
-                                "exit_code": 1,
-                                "image_tag": image_tag,
-                                "dockerfile_validation_failed": True,
-                                "validation_error": validation_error[:500],
-                            }
-                        )
-                        continue
+                        hadolint_error = validation_error[:1000]
+                        log_warn(f"[hadolint {repo_name}] Dockerfile syntax warning: {hadolint_error[:200]}")
 
                 log_info(f"Build attempt {attempt}/{args.max_attempts} for {repo_url}...")
                 log_info(f"Streaming build output; full log will be written to {build_log_path}")
                 exit_code, streamed_output = await run_build(build_command, repo_name, attempt)
                 build_log = combine_build_output(build_command, exit_code, streamed_output)
+                
+                # Prepend hadolint errors to build log for repair LLM
+                if hadolint_error:
+                    build_log = f"[HADOLINT VALIDATION WARNING]\n{hadolint_error}\n\n[DOCKER BUILD OUTPUT]\n{build_log}"
 
                 # Restore original dockerfile for repair prompt
                 write_text(dockerfile_path, original_dockerfile_content)

@@ -23,6 +23,7 @@ from common import (
     repo_name_from_url,
     should_use_progress,
     update_progress,
+    validate_dockerfile_syntax,
 )
 
 
@@ -147,30 +148,68 @@ async def generate_dockerfile(
 
             summary = load_summary(repo_name, repo_path, summaries_dir)
             base_template = get_base_template(classification)
-            prompt = (
-                PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
-                .replace("{{BASE_TEMPLATE_CONTENT}}", base_template)
-                .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
-                .replace("{{SUMMARY_CONTENT}}", summary)
-            )
+            
+            # Generation loop with hadolint validation
+            max_lint_attempts = 3
+            dockerfile_content = None
+            lint_errors = ""
+            
+            for lint_attempt in range(1, max_lint_attempts + 1):
+                prompt = (
+                    PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
+                    .replace("{{BASE_TEMPLATE_CONTENT}}", base_template)
+                    .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
+                    .replace("{{SUMMARY_CONTENT}}", summary)
+                )
+                
+                # Add hadolint error feedback if this is a retry
+                if lint_errors:
+                    prompt += f"\n\n**Previous hadolint validation failed with:**\n```\n{lint_errors}\n```\n\nPlease fix the Dockerfile syntax errors above."
+                
+                log_info(f"Generating Dockerfile for {repo_url} (lint attempt {lint_attempt}/{max_lint_attempts})...")
+                response = await client.chat.completions.create(
+                    model=args.model,
+                    temperature=args.temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = response.choices[0].message.content.strip()
+                dockerfile_content = extract_dockerfile(raw)
+                if response.usage:
+                    log_info(f"[TOKENS] {json.dumps({'phase': 'dockerfile', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
 
-            log_info(f"Generating Dockerfile for {repo_url}...")
-            response = await client.chat.completions.create(
-                model=args.model,
-                temperature=args.temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = response.choices[0].message.content.strip()
-            dockerfile_content = extract_dockerfile(raw)
-            if response.usage:
-                log_info(f"[TOKENS] {json.dumps({'phase': 'dockerfile', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
+                if not dockerfile_content.strip():
+                    log_warn(f"Empty Dockerfile output for {repo_url}; skipping write.")
+                    return
 
-            if not dockerfile_content.strip():
-                log_warn(f"Empty Dockerfile output for {repo_url}; skipping write.")
-                return
+                dockerfile_content = inject_ca_cert_into_dockerfile(dockerfile_content)
+                
+                # Validate Dockerfile syntax with hadolint
+                if not args.skip_hadolint:
+                    # Write temporary file for hadolint check
+                    temp_dockerfile = output_dir / f".{repo_name}.Dockerfile.tmp"
+                    with open(temp_dockerfile, "w", encoding="utf-8") as tmp_file:
+                        tmp_file.write(dockerfile_content)
+                    
+                    is_valid, validation_error = await validate_dockerfile_syntax(temp_dockerfile, repo_name)
+                    temp_dockerfile.unlink()  # Clean up temp file
+                    
+                    if is_valid:
+                        log_info(f"[hadolint {repo_name}] Dockerfile syntax OK on attempt {lint_attempt}")
+                        break
+                    else:
+                        lint_errors = validation_error[:1000]
+                        log_warn(f"[hadolint {repo_name}] Dockerfile syntax error on attempt {lint_attempt}: {lint_errors[:200]}")
+                        if lint_attempt < max_lint_attempts:
+                            continue
+                        else:
+                            log_warn(f"[hadolint {repo_name}] Max lint attempts reached; skipping repo")
+                            return
+                else:
+                    # skip_hadolint mode: just use first generation
+                    log_info(f"[hadolint {repo_name}] Skipping validation (--skip-hadolint set)")
+                    break
 
-            dockerfile_content = inject_ca_cert_into_dockerfile(dockerfile_content)
-
+            # Write Dockerfile
             with open(output_path, "w", encoding="utf-8") as output_file:
                 output_file.write(dockerfile_content)
 
