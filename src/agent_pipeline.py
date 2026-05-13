@@ -42,6 +42,7 @@ parser.add_argument("--container-cli", default="docker", help="Container CLI to 
 parser.add_argument("--max-attempts", type=int, default=3, help="Maximum number of repair attempts per repository")
 parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum number of build log characters to send to the repair model")
 parser.add_argument("--skip-delete-docs", action="store_true", help="Skip deleting documentation and CI/CD files from the build context before building")
+parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint before docker build")
 parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside built images to verify the build produced working software")
 parser.add_argument("--verify-timeout", type=int, default=30, help="Timeout in seconds for build verification container execution")
 parser.add_argument("--skip-classify", action="store_true", help="Skip the classification phase")
@@ -227,6 +228,8 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
     ])
     if args.skip_delete_docs:
         command.append("--skip-delete-docs")
+    if args.skip_hadolint:
+        command.append("--skip-hadolint")
     command.extend([
         "--verify-command", args.verify_command,
         "--verify-timeout", str(args.verify_timeout),

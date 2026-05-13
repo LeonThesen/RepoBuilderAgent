@@ -24,6 +24,7 @@ from common import (
     repo_name_from_url,
     should_use_progress,
     update_progress,
+    validate_dockerfile_syntax,
 )
 
 
@@ -52,6 +53,7 @@ parser.add_argument("--container-cli", default="docker", help="Container CLI to 
 parser.add_argument("--max-attempts", type=int, default=3, help="Maximum number of build and repair attempts per repository")
 parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum number of build log characters to send to the model")
 parser.add_argument("--skip-delete-docs", action="store_true", help="Skip deleting documentation and CI/CD files from the build context before building")
+parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint before docker build")
 parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside the built image to verify the build produced working software")
 parser.add_argument("--verify-timeout", type=int, default=30, help="Timeout in seconds for build verification container execution")
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
@@ -414,6 +416,19 @@ async def repair_repository(
             if not await ensure_repo_checkout(repo_url, repo_path, "skipping Dockerfile repair"):
                 return
 
+            # Reset repo to clean state for reproducibility
+            try:
+                result = await asyncio.create_subprocess_exec("git", "-C", str(repo_path), "reset", "--hard", "HEAD", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                returncode = await result.wait()
+                if returncode == 0:
+                    log_info(f"[git-reset {repo_name}] git reset --hard HEAD successful")
+                result = await asyncio.create_subprocess_exec("git", "-C", str(repo_path), "clean", "-fdx", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                returncode = await result.wait()
+                if returncode == 0:
+                    log_info(f"[git-clean {repo_name}] git clean -fdx successful")
+            except Exception as e:
+                log_warn(f"[git-reset {repo_name}] Failed to reset/clean repo: {e}")
+
             if not args.skip_delete_docs:
                 await asyncio.to_thread(delete_docs_build_context, repo_path, repo_name)
             else:
@@ -454,6 +469,24 @@ async def repair_repository(
                 # Temporarily replace dockerfile with injected version for build
                 original_dockerfile_content = dockerfile_path.read_text(encoding="utf-8")
                 write_text(dockerfile_path, dockerfile_for_build)
+
+                # Validate Dockerfile syntax before attempting docker build (unless skipped)
+                if not args.skip_hadolint:
+                    is_valid, validation_error = await validate_dockerfile_syntax(dockerfile_path, repo_name)
+                    if not is_valid:
+                        log_warn(f"[hadolint {repo_name}] Dockerfile syntax validation failed; skipping build attempt {attempt}")
+                        # Restore original dockerfile
+                        write_text(dockerfile_path, original_dockerfile_content)
+                        report["attempts"].append(
+                            {
+                                "attempt": attempt,
+                                "exit_code": 1,
+                                "image_tag": image_tag,
+                                "dockerfile_validation_failed": True,
+                                "validation_error": validation_error[:500],
+                            }
+                        )
+                        continue
 
                 log_info(f"Build attempt {attempt}/{args.max_attempts} for {repo_url}...")
                 log_info(f"Streaming build output; full log will be written to {build_log_path}")

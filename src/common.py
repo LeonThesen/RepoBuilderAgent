@@ -157,3 +157,37 @@ async def ensure_repo_checkout(repo_url: str, repo_path: Path, skip_reason: str 
         log_warn(f"Failed to clone {repo_url}; {skip_reason}.")
         return False
     return True
+
+
+async def validate_dockerfile_syntax(dockerfile_path: Path, repo_name: str = "") -> tuple[bool, str]:
+    """
+    Validate Dockerfile syntax using hadolint.
+    Returns (is_valid, error_message).
+    """
+    hadolint_path = Path("/usr/local/bin/hadolint")
+    if not hadolint_path.exists():
+        log_warn(f"[hadolint {repo_name}] hadolint not found at {hadolint_path}; skipping validation")
+        return True, ""
+    
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [str(hadolint_path), str(dockerfile_path)],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            log_info(f"[hadolint {repo_name}] Dockerfile syntax OK")
+            return True, ""
+        else:
+            error_msg = result.stdout + result.stderr
+            log_warn(f"[hadolint {repo_name}] Dockerfile syntax error: {error_msg[:500]}")
+            return False, error_msg
+    except subprocess.TimeoutExpired:
+        error_msg = f"hadolint timeout after 10s"
+        log_warn(f"[hadolint {repo_name}] {error_msg}")
+        return False, error_msg
+    except Exception as e:
+        log_warn(f"[hadolint {repo_name}] Validation failed: {e}")
+        return False, str(e)
