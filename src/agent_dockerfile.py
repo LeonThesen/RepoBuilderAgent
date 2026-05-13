@@ -14,6 +14,7 @@ from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
 from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
 from common import (
     ensure_repo_checkout,
+    inject_ca_cert_into_dockerfile,
     load_repo_urls,
     load_summary,
     prompt_path,
@@ -167,6 +168,8 @@ async def generate_dockerfile(
             if not dockerfile_content.strip():
                 log_warn(f"Empty Dockerfile output for {repo_url}; skipping write.")
                 return
+
+            dockerfile_content = inject_ca_cert_into_dockerfile(dockerfile_content)
 
             with open(output_path, "w", encoding="utf-8") as output_file:
                 output_file.write(dockerfile_content)

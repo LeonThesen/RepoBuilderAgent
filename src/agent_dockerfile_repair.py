@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import base64
 import json
 import os
 import re
@@ -16,6 +15,7 @@ from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
 from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
 from common import (
     ensure_repo_checkout,
+    inject_ca_cert_into_dockerfile,
     load_repo_urls,
     load_summary,
     prompt_path,
@@ -25,61 +25,6 @@ from common import (
     should_use_progress,
     update_progress,
 )
-
-
-def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | None = None) -> str:
-    """
-    Inject CA certificate setup into the Dockerfile if MANUALREPOS_CA_CERT_B64 is present.
-    This ensures curl/git/wget/npm/pip/maven/rust can reach package registries behind TLS interception.
-    
-    Sets up:
-    - System CA trust store (apt, curl, git, wget)
-    - Environment variables for Python (pip), Node.js (npm/pnpm), Java (maven)
-    - Java keystore import for Maven/Gradle
-    - Rust CA configuration
-    """
-    if not ca_cert_b64:
-        ca_cert_b64 = os.getenv("MANUALREPOS_CA_CERT_B64")
-    if not ca_cert_b64:
-        return dockerfile_content
-
-    try:
-        ca_cert_pem = base64.b64decode(ca_cert_b64).decode("utf-8")
-    except Exception as e:
-        log_warn(f"Failed to decode MANUALREPOS_CA_CERT_B64: {e}")
-        return dockerfile_content
-
-    ca_cert_path = "/usr/local/share/ca-certificates/custom-ca.crt"
-    ca_setup_commands = f"""
-RUN apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates curl default-jre-headless 2>/dev/null || true
-RUN mkdir -p /usr/local/share/ca-certificates
-RUN cat > {ca_cert_path} << 'EOF'
-{ca_cert_pem}
-EOF
-RUN update-ca-certificates
-RUN if command -v keytool >/dev/null 2>&1; then keytool -import -alias custom-ca -file {ca_cert_path} -into /etc/ssl/certs/java/cacerts -storepass changeit -noprompt 2>/dev/null || true; fi
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-ENV NODE_TLS_REJECT_UNAUTHORIZED=0
-ENV NODE_OPTIONS=--use-openssl-ca
-ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
-ENV RUSTFLAGS=-Ctarget-feature=+crt-static
-"""
-
-    lines = dockerfile_content.split("\n")
-    injected_lines = []
-    inserted = False
-
-    for i, line in enumerate(lines):
-        injected_lines.append(line)
-        # Insert CA setup after first FROM line
-        if not inserted and line.strip().upper().startswith("FROM"):
-            injected_lines.append("USER root")
-            injected_lines.append(ca_setup_commands.strip())
-            inserted = True
-
-    return "\n".join(injected_lines)
 
 
 parser = argparse.ArgumentParser(
