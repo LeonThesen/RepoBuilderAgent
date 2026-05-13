@@ -18,6 +18,7 @@ from common import (
     ensure_repo_checkout,
     load_repo_urls,
     load_summary,
+    prompt_path,
     read_yaml_file,
     render_yaml,
     repo_name_from_url,
@@ -112,16 +113,23 @@ parser.add_argument("--force", action="store_true", help="Re-run repair even if 
 args = parser.parse_args()
 
 
-os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
+# httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
+# Use ssl.create_default_context() to pull in the OS trust store instead.
+_ssl_context = ssl.create_default_context()
+_http_client = httpx.AsyncClient(verify=_ssl_context)
 
 client = AsyncOpenAI(
     base_url=args.endpoint,
     api_key=args.api_key,
     timeout=args.timeout,
+    http_client=_http_client,
 )
 
-with open(Path("prompts/PROMPT_DOCKERFILE_REPAIR.md"), "r", encoding="utf-8") as prompt_file:
+with open(prompt_path("PROMPT_DOCKERFILE_REPAIR.md"), "r", encoding="utf-8") as prompt_file:
     PROMPT_TEMPLATE = prompt_file.read()
+
+with open(prompt_path("PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as prompt_file:
+    VERIFY_PROMPT_TEMPLATE = prompt_file.read()
 
 sem = asyncio.Semaphore(1)
 
@@ -189,6 +197,41 @@ def extract_dockerfile(raw: str) -> str:
     match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     content = match.group(1) if match else raw
     return content.strip() + "\n"
+
+
+def get_base_template(classification: dict) -> str:
+    """Select and load the appropriate base template based on programming language."""
+    subrepo_templates_dir = Path(__file__).resolve().parent.parent / "templates"
+
+    languages = classification.get("categories", {}).get("programming_language", {}).get("value", [])
+    if not languages:
+        log_warn("No programming language detected in classification; defaulting to C template")
+        template_name = "Dockerfile.base-c"
+    else:
+        lang = languages[0].lower()
+        if "python" in lang:
+            template_name = "Dockerfile.base-python"
+        elif "c++" in lang or "cpp" in lang:
+            template_name = "Dockerfile.base-cpp"
+        elif "c" in lang and "c++" not in lang:
+            template_name = "Dockerfile.base-c"
+        elif "typescript" in lang or "javascript" in lang:
+            template_name = "Dockerfile.base-typescript"
+        elif "rust" in lang:
+            template_name = "Dockerfile.base-rust"
+        elif "java" in lang:
+            template_name = "Dockerfile.base-java"
+        else:
+            log_warn(f"Unknown language {lang}; defaulting to C template")
+            template_name = "Dockerfile.base-c"
+
+    template_path = subrepo_templates_dir / template_name
+    if template_path.exists():
+        with open(template_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    log_error(f"Base template not found at {template_path}")
+    return ""
 
 
 def sanitize_image_tag(value: str) -> str:
@@ -324,9 +367,11 @@ async def request_repair(
     dockerfile_content: str,
     build_log: str,
 ) -> str:
+    base_template = get_base_template(classification)
     prompt = (
         PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
         .replace("{{ATTEMPT_NUMBER}}", str(attempt_number))
+        .replace("{{BASE_TEMPLATE_CONTENT}}", base_template)
         .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
         .replace("{{SUMMARY_CONTENT}}", summary)
         .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
@@ -341,6 +386,38 @@ async def request_repair(
     if response.usage:
         log_info(f"[TOKENS] {json.dumps({'phase': 'repair', 'repo': repo_url, 'attempt': attempt_number, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
     return extract_dockerfile(response.choices[0].message.content.strip())
+
+
+async def request_verification_command_repair(
+    repo_url: str,
+    classification: dict,
+    dockerfile_content: str,
+    current_verify_command: str,
+    verify_log: str,
+) -> str:
+    prompt = (
+        VERIFY_PROMPT_TEMPLATE
+        .replace("{{REPO_URL}}", repo_url)
+        .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
+        .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
+    )
+    prompt += (
+        "\n\nThe previous verification command failed."
+        "\nReturn a replacement command that addresses the failure evidence below."
+        "\nDo not require a background daemon unless the Dockerfile clearly starts it within the same one-liner."
+        "\nPreserve the same verification intent, but prefer offline, foreground, deterministic checks."
+        f"\n\nPrevious command:\n{current_verify_command}"
+        f"\n\nFailure log:\n{trim_log(verify_log)}\n"
+    )
+
+    response = await client.chat.completions.create(
+        model=args.model,
+        temperature=args.temperature,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    if response.usage:
+        log_info(f"[TOKENS] {json.dumps({'phase': 'verify-repair', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
+    return response.choices[0].message.content.strip().strip("`")
 
 
 async def repair_repository(
@@ -486,13 +563,65 @@ async def repair_repository(
                         f"Build verification failed for {repo_url} on attempt {attempt} with exit code {verify_exit_code}; verify log: {verify_log_path}"
                     )
 
-                    build_log = build_log + "\n\nBUILD_VERIFICATION_LOG:\n" + verify_log
+                    log_info(f"Diagnosing failed build verification for {repo_url} and rewriting the verification command...")
+                    repaired_verify_command = normalize_verify_command(
+                        await request_verification_command_repair(
+                            repo_url=repo_url,
+                            classification=classification,
+                            dockerfile_content=current_dockerfile,
+                            current_verify_command=verify_command_to_use,
+                            verify_log=verify_log,
+                        )
+                    )
+
+                    if repaired_verify_command == verify_command_to_use:
+                        log_warn(
+                            f"Verification command repair produced no change for {repo_url}; preserving Dockerfile and stopping verification retries"
+                        )
+                        if attempt == args.max_attempts:
+                            log_warn(f"Build verification still failing for {repo_url} after {args.max_attempts} attempts")
+                        break
+
+                    verify_command_to_use = repaired_verify_command
+                    write_text(verify_command_path, verify_command_to_use + "\n")
+                    log_info(
+                        f"Retrying build verification for {repo_url} using updated command: {verify_command_to_use}"
+                    )
+                    retry_verify_log_path = report_dir / f"attempt-{attempt}.verify-retry.log"
+                    retry_exit_code, retry_output, retry_cmd_list, retry_timed_out = await run_build_verification(
+                        image_tag,
+                        repo_name,
+                        attempt,
+                        verify_command_to_use,
+                    )
+                    retry_verify_log = combine_build_output(retry_cmd_list, retry_exit_code, retry_output)
+                    write_text(retry_verify_log_path, retry_verify_log)
+                    report["attempts"][-1]["build_verification_retry"] = {
+                        "exit_code": retry_exit_code,
+                        "timed_out": retry_timed_out,
+                        "command": retry_cmd_list,
+                        "log": str(retry_verify_log_path),
+                    }
+
+                    if retry_exit_code == 0:
+                        report["success"] = True
+                        report["successful_attempt"] = attempt
+                        log_info(
+                            f"Build and verification succeeded for {repo_url} on attempt {attempt} after updating the verification command; image tag: {image_tag}; build log: {build_log_path}; verify log: {retry_verify_log_path}"
+                        )
+                        break
+
+                    log_warn(
+                        f"Updated build verification still failing for {repo_url} on attempt {attempt} with exit code {retry_exit_code}; verify log: {retry_verify_log_path}"
+                    )
+
+                    build_log = build_log + "\n\nBUILD_VERIFICATION_LOG:\n" + verify_log + "\n\nBUILD_VERIFICATION_RETRY_LOG:\n" + retry_verify_log
 
                     if attempt == args.max_attempts:
                         log_warn(f"Build verification still failing for {repo_url} after {args.max_attempts} attempts")
                         break
 
-                    log_info(f"Diagnosing failed build verification for {repo_url} and rewriting Dockerfile...")
+                    log_info(f"Verification repair was insufficient for {repo_url}; rewriting Dockerfile as a fallback...")
                     repaired_dockerfile = await request_repair(
                         repo_url=repo_url,
                         attempt_number=attempt,

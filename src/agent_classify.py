@@ -16,6 +16,7 @@ import glob
 import shutil
 
 from config import *
+from common import prompt_path
 from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
 from log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 
@@ -45,17 +46,20 @@ parser.add_argument("--analysis-dir", default="analysis", help="Directory contai
 parser.add_argument("--no-analysis", action="store_true", help="Skip running the analysis script after completion")
 args = parser.parse_args()
 
-# Ensure Python/OpenSSL clients use the Linux system CA bundle by default.
-os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
+# httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
+# Use ssl.create_default_context() to pull in the OS trust store instead.
+_ssl_context = ssl.create_default_context()
+_http_client = httpx.AsyncClient(verify=_ssl_context)
 
 client = AsyncOpenAI(
     base_url=args.endpoint,
     api_key=args.api_key,
     timeout=args.timeout,
+    http_client=_http_client,
 )
 
-# Load the prompt template from a file
-with open(Path("prompts/PROMPT.md"), "r") as f:
+# Load the prompt template from the agent subrepo.
+with open(prompt_path("PROMPT.md"), "r") as f:
     PROMPT_TEMPLATE = f.read()
 
 sem = asyncio.Semaphore(4)
@@ -251,7 +255,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             with open(structure_summary_path, "w") as f:
                 f.write(structure_summary)
 
-            with open(Path("prompts/PROMPT_SELECT_FILES.md"), "r") as f:
+            with open(prompt_path("PROMPT_SELECT_FILES.md"), "r") as f:
                 SELECT_FILES_PROMPT_TEMPLATE = f.read()
 
             selection_prompt = (

@@ -16,6 +16,7 @@ from common import (
     ensure_repo_checkout,
     load_repo_urls,
     load_summary,
+    prompt_path,
     read_yaml_file,
     render_yaml,
     repo_name_from_url,
@@ -49,15 +50,19 @@ parser.add_argument("--output-dir", default="install-guides", help="Directory wh
 args = parser.parse_args()
 
 
-os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
+# httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
+# Use ssl.create_default_context() to pull in the OS trust store instead.
+_ssl_context = ssl.create_default_context()
+_http_client = httpx.AsyncClient(verify=_ssl_context)
 
 client = AsyncOpenAI(
     base_url=args.endpoint,
     api_key=args.api_key,
     timeout=args.timeout,
+    http_client=_http_client,
 )
 
-with open(Path("prompts/PROMPT_INSTALL_GUIDE.md"), "r", encoding="utf-8") as prompt_file:
+with open(prompt_path("PROMPT_INSTALL_GUIDE.md"), "r", encoding="utf-8") as prompt_file:
     PROMPT_TEMPLATE = prompt_file.read()
 
 sem = asyncio.Semaphore(4)

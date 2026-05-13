@@ -16,6 +16,7 @@ from common import (
     ensure_repo_checkout,
     load_repo_urls,
     load_summary,
+    prompt_path,
     read_yaml_file,
     render_yaml,
     repo_name_from_url,
@@ -48,18 +49,22 @@ parser.add_argument("--output-dir", default="dockerfiles", help="Directory where
 args = parser.parse_args()
 
 
-os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
+# httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
+# Use ssl.create_default_context() to pull in the OS trust store instead.
+_ssl_context = ssl.create_default_context()
+_http_client = httpx.AsyncClient(verify=_ssl_context)
 
 client = AsyncOpenAI(
     base_url=args.endpoint,
     api_key=args.api_key,
     timeout=args.timeout,
+    http_client=_http_client,
 )
 
-with open(Path("prompts/PROMPT_DOCKERFILE.md"), "r", encoding="utf-8") as prompt_file:
+with open(prompt_path("PROMPT_DOCKERFILE.md"), "r", encoding="utf-8") as prompt_file:
     PROMPT_TEMPLATE = prompt_file.read()
 
-with open(Path("prompts/PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as prompt_file:
+with open(prompt_path("PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as prompt_file:
     BUILD_VERIFY_PROMPT_TEMPLATE = prompt_file.read()
 
 sem = asyncio.Semaphore(4)
@@ -72,6 +77,41 @@ def extract_dockerfile(raw: str) -> str:
     match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     content = match.group(1) if match else raw
     return content.strip() + "\n"
+
+
+def get_base_template(classification: dict) -> str:
+    """Select and load the appropriate base template based on programming language."""
+    subrepo_templates_dir = Path(__file__).resolve().parent.parent / "templates"
+
+    languages = classification.get("categories", {}).get("programming_language", {}).get("value", [])
+    if not languages:
+        log_warn("No programming language detected in classification; defaulting to C template")
+        template_name = "Dockerfile.base-c"
+    else:
+        lang = languages[0].lower()
+        if "python" in lang:
+            template_name = "Dockerfile.base-python"
+        elif "c++" in lang or "cpp" in lang:
+            template_name = "Dockerfile.base-cpp"
+        elif "c" in lang and "c++" not in lang:
+            template_name = "Dockerfile.base-c"
+        elif "typescript" in lang or "javascript" in lang:
+            template_name = "Dockerfile.base-typescript"
+        elif "rust" in lang:
+            template_name = "Dockerfile.base-rust"
+        elif "java" in lang:
+            template_name = "Dockerfile.base-java"
+        else:
+            log_warn(f"Unknown language {lang}; defaulting to C template")
+            template_name = "Dockerfile.base-c"
+
+    template_path = subrepo_templates_dir / template_name
+    if template_path.exists():
+        with open(template_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    log_error(f"Base template not found at {template_path}")
+    return ""
 
 
 
@@ -105,8 +145,10 @@ async def generate_dockerfile(
                 return
 
             summary = load_summary(repo_name, repo_path, summaries_dir)
+            base_template = get_base_template(classification)
             prompt = (
                 PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
+                .replace("{{BASE_TEMPLATE_CONTENT}}", base_template)
                 .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
                 .replace("{{SUMMARY_CONTENT}}", summary)
             )
