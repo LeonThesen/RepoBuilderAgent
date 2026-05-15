@@ -23,6 +23,8 @@ Your task is to:
      - Never bake secrets into the image; use comments for unclear values.
      - Prefer multi-stage builds for large artifact reduction (C++, Rust, Node, Java).
      - Keep layers cache-friendly by copying dependency manifests before source trees.
+      - Prefer multicore/parallel build execution when supported (e.g., `make -j$(nproc)`, `cmake --build . --parallel $(nproc)`, `cargo build -j $(nproc)`, `mvn -T 1C`, `gradle --parallel`) while keeping builds deterministic.
+      - Prefer build commands that skip documentation generation/build (e.g., avoid `javadoc`, `dokka`, `antora`, site/docs aggregate tasks) unless docs are explicitly required for the main artifact.
      - If the startup command is unclear, leave a comment and omit/comment out the CMD.
      - If the repo is a library, it is acceptable to omit CMD/ENTRYPOINT.
      - Keep comments short and focused on uncertainty.

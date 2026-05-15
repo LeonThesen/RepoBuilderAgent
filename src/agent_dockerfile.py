@@ -102,7 +102,7 @@ def get_base_template(classification: dict) -> str:
             template_name = "Dockerfile.base-typescript"
         elif "rust" in lang:
             template_name = "Dockerfile.base-rust"
-        elif "java" in lang:
+        elif "java" in lang or "kotlin" in lang:
             template_name = "Dockerfile.base-java"
         else:
             log_warn(f"Unknown language {lang}; defaulting to C template")

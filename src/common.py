@@ -24,7 +24,7 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
     Sets up:
     - System CA trust store (apt, curl, git, wget)
     - Environment variables for Python (pip), Node.js (npm/pnpm), Java (maven)
-    - Java keystore import for Maven/Gradle
+    - Java keystore import into the DEFAULT OpenJDK keystore (preserves public root CAs)
     - Rust/cargo CA configuration
     """
     if not ca_cert_b64:
@@ -32,32 +32,99 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
     if not ca_cert_b64:
         return dockerfile_content
 
+    decoded_bundle = base64.b64decode(ca_cert_b64).decode("utf-8")
+    cert_blocks = []
+    for block in decoded_bundle.split("-----END CERTIFICATE-----"):
+        block = block.strip()
+        if "-----BEGIN CERTIFICATE-----" not in block:
+            continue
+        cert_blocks.append(f"{block}\n-----END CERTIFICATE-----\n")
+    if not cert_blocks:
+        cert_blocks = [decoded_bundle]
+
     ca_cert_path = "/usr/local/share/ca-certificates/custom-ca.crt"
+    corporate_ca_cert_path = "/usr/local/share/ca-certificates/corporate-ca.crt"
+    split_cert_paths = [f"/usr/local/share/ca-certificates/manualrepos-ca-{index}.crt" for index, _ in enumerate(cert_blocks, start=1)]
+    split_cert_commands = " ".join(
+        f"printf '%s' '{base64.b64encode(cert.encode('utf-8')).decode('ascii')}' | base64 -d > {path};"
+        for cert, path in zip(cert_blocks, split_cert_paths, strict=True)
+    )
+    split_cert_loop = " ".join(split_cert_paths)
+    ca_refresh_script_path = "/usr/local/bin/manualrepos-refresh-ca-certificates"
+    ca_refresh_script = f"""#!/bin/sh
+set -eu
+update-ca-certificates
+if command -v keytool >/dev/null 2>&1; then
+    for CERT_PATH in {split_cert_loop}; do
+        if [ -f \"$CERT_PATH\" ]; then
+            CERT_ALIAS=$(basename \"$CERT_PATH\" .crt)
+            for JAVA_KEYSTORE in $(find /usr/lib/jvm -name cacerts -path '*/security/*' 2>/dev/null) /etc/ssl/certs/java/cacerts; do
+                if [ -f \"$JAVA_KEYSTORE\" ]; then
+                    if ! keytool -list -keystore \"$JAVA_KEYSTORE\" -storepass changeit -alias \"$CERT_ALIAS\" >/dev/null 2>&1; then
+                        keytool -importcert -trustcacerts -alias \"$CERT_ALIAS\" -file \"$CERT_PATH\" -keystore \"$JAVA_KEYSTORE\" -storepass changeit -noprompt
+                    fi
+                fi
+            done
+        fi
+    done
+    for JAVA_KEYSTORE in $(find /usr/lib/jvm -name cacerts -path '*/security/*' 2>/dev/null) /etc/ssl/certs/java/cacerts; do
+        if [ -f \"$JAVA_KEYSTORE\" ]; then
+            for CA_ALIAS in custom-ca corporate-ca; do
+                if ! keytool -list -keystore \"$JAVA_KEYSTORE\" -storepass changeit -alias \"$CA_ALIAS\" >/dev/null 2>&1; then
+                    keytool -importcert -trustcacerts -alias \"$CA_ALIAS\" -file {ca_cert_path} -keystore \"$JAVA_KEYSTORE\" -storepass changeit -noprompt
+                fi
+            done
+        fi
+    done
+fi
+"""
+    ca_refresh_script_b64 = base64.b64encode(ca_refresh_script.encode("utf-8")).decode("ascii")
     ca_setup_commands = f"""
-RUN apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates curl default-jre-headless 2>/dev/null || true
-RUN mkdir -p /usr/local/share/ca-certificates
-RUN printf '%s' '{ca_cert_b64}' | base64 -d > {ca_cert_path}
-RUN update-ca-certificates
-RUN if command -v keytool >/dev/null 2>&1; then keytool -import -alias custom-ca -file {ca_cert_path} -keystore /etc/ssl/certs/java/cacerts -storepass changeit -noprompt 2>/dev/null || true; fi
+RUN apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates curl default-jre-headless 2>/dev/null || true; \
+    mkdir -p /usr/local/share/ca-certificates; \
+    printf '%s' '{ca_cert_b64}' | base64 -d > {ca_cert_path}; \
+    cp {ca_cert_path} {corporate_ca_cert_path}; \
+    {split_cert_commands} \
+    printf '%s' '{ca_refresh_script_b64}' | base64 -d > {ca_refresh_script_path}; \
+    chmod +x {ca_refresh_script_path}; \
+    {ca_refresh_script_path}
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_DIR=/etc/ssl/certs
+ENV JAVA_TOOL_OPTIONS="-Dcom.sun.jndi.ldap.connect.pool=false -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStorePassword=changeit"
+ENV GRADLE_OPTS="-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStorePassword=changeit"
+ENV MAVEN_OPTS="-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStorePassword=changeit"
 """
 
     lines = dockerfile_content.split("\n")
     injected_lines = []
     inserted = False
+    current_user_is_root = True
 
     for line in lines:
+        stripped_line = line.strip()
+        lower_line = stripped_line.lower()
+        if inserted and (
+            (stripped_line.upper().startswith("USER") and lower_line != "user root")
+            or (
+                stripped_line.upper().startswith("RUN")
+                and current_user_is_root
+                and ca_refresh_script_path not in lower_line
+                and any(token in lower_line for token in ("gradle", "gradlew", "mvn", "maven", " java"))
+            )
+        ):
+            injected_lines.append(f"RUN {ca_refresh_script_path}")
         injected_lines.append(line)
         # Insert CA setup after first FROM line
         if not inserted and line.strip().upper().startswith("FROM"):
             injected_lines.append("USER root")
             injected_lines.append(ca_setup_commands.strip())
             inserted = True
+        if stripped_line.upper().startswith("USER"):
+            current_user_is_root = lower_line == "user root"
 
     return "\n".join(injected_lines)
 

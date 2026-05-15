@@ -86,8 +86,20 @@ set_trace_enabled(args.trace)
 # Files/directories to remove from the repo before docker build so the build
 # context is free of documentation and CI/CD configuration that can't affect
 # an installation and may only inflate the context or mislead the build.
-_DELETE_DOCS_EXTENSIONS: tuple[str, ...] = (".md", ".rst", ".pdf", ".doc", ".docx")
+# Intentionally exhaustive: agents must not be able to read pre-existing docs
+# or build instructions from the repo context.
+_DELETE_DOCS_EXTENSIONS: tuple[str, ...] = (
+    # Markup documentation
+    ".md", ".rst", ".adoc", ".asciidoc", ".textile", ".wiki",
+    # Office / print documents
+    ".pdf", ".doc", ".docx", ".odt", ".rtf",
+    # Other doc formats
+    ".tex", ".pod", ".man", ".1", ".2", ".3", ".4", ".5", ".6", ".7", ".8",
+    # Notebook / presentation
+    ".ipynb", ".pptx", ".ppt",
+)
 _DELETE_DOCS_FILE_NAMES: frozenset[str] = frozenset({
+    # CI/CD pipeline files
     "Jenkinsfile",
     ".travis.yml", ".travis.yaml",
     ".gitlab-ci.yml", ".gitlab-ci.yaml",
@@ -96,10 +108,31 @@ _DELETE_DOCS_FILE_NAMES: frozenset[str] = frozenset({
     ".drone.yml", ".drone.yaml",
     "bitbucket-pipelines.yml", "bitbucket-pipelines.yaml",
     "CODEOWNERS",
+    # Plain-text documentation files (no extension)
+    "README", "INSTALL", "INSTALL.txt",
+    "CHANGELOG", "CHANGELOG.txt", "CHANGES", "CHANGES.txt",
+    "HISTORY", "HISTORY.txt", "NEWS", "NEWS.txt",
+    "AUTHORS", "AUTHORS.txt", "CONTRIBUTORS", "CONTRIBUTORS.txt",
+    "CONTRIBUTING",
+    "NOTICE", "NOTICE.txt",
+    "HACKING", "HACKING.txt",
+    "TODO", "TODO.txt",
+    "ROADMAP", "ROADMAP.txt",
+    "BUGS", "FAQ", "THANKS", "THANKS.txt",
+    # Common plain-text docs with extension
+    "readme.txt", "install.txt", "changelog.txt",
 })
 _DELETE_DOCS_DIR_NAMES: frozenset[str] = frozenset({
+    # CI/CD directories
     ".github", ".gitlab", ".circleci", ".buildkite", ".drone",
     ".woodpecker", ".jenkins", ".azure-pipelines",
+    # Documentation directories
+    "docs", "doc", "documentation",
+    "website", "site", "gh-pages",
+    "wiki",
+    "javadoc", "apidoc", "apidocs",
+    "man", "manpages",
+    "sphinx", "docsrc",
 })
 
 
@@ -166,7 +199,7 @@ def get_base_template(classification: dict) -> str:
             template_name = "Dockerfile.base-typescript"
         elif "rust" in lang:
             template_name = "Dockerfile.base-rust"
-        elif "java" in lang:
+        elif "java" in lang or "kotlin" in lang:
             template_name = "Dockerfile.base-java"
         else:
             log_warn(f"Unknown language {lang}; defaulting to C template")
