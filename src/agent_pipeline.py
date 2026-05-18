@@ -155,6 +155,24 @@ def _synchronize_llm_environment() -> None:
         os.environ["OPENAI_API_KEY"] = args.api_key
 
 
+def _resolve_workspace_root(src_dir: Path) -> Path:
+    repo_root = src_dir.parent.parent
+    input_path = Path(args.input_file).expanduser()
+
+    candidates: list[Path] = []
+    if input_path.is_absolute():
+        candidates.append(input_path)
+    else:
+        candidates.append((Path.cwd() / input_path).resolve())
+        candidates.append((repo_root / input_path).resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.parent if candidate.is_file() else candidate
+
+    return repo_root
+
+
 def sanitize_command(command: list[str]) -> list[str]:
     sanitized = command.copy()
     for index, part in enumerate(sanitized[:-1]):
@@ -554,7 +572,7 @@ def main() -> int:
     pipeline_started_ts = time.perf_counter()
     pipeline_started_at = utc_now()
     src_dir = Path(__file__).resolve().parent
-    workspace_root = src_dir.parent.parent
+    workspace_root = _resolve_workspace_root(src_dir)
     _resolve_llm_arg_defaults(workspace_root)
     _synchronize_llm_environment()
     run_dir = workspace_root / "runs" / f"run-{run_id}"

@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import ssl
 from pathlib import Path
@@ -311,12 +312,14 @@ def build_deterministic_verify_fallback(repo_name: str, verify_command: str) -> 
         "exit 0; "
         "fi; "
         "done; "
-        "if find /home/manualrepos/repo -maxdepth 6 -type f "
+        "for base in \"$PWD\" /home/manualrepos/repo /workspace /work /app /src /repo /home/manualrepos; do "
+        "if [ -d \"$base\" ] && find \"$base\" -maxdepth 6 -type f "
         "\\( -path '*/target/release/*' -o -path '*/build/*' -o -name '*.so*' -o -name '*.a' -o -name '*.jar' -o -name '*.whl' \\) "
         "| head -n 1 | grep -q .; then "
         "echo 'fallback: found build artifact in repository'; "
         "exit 0; "
         "fi; "
+        "done; "
         "exit 127"
     )
 
@@ -392,27 +395,30 @@ async def get_image_runtime_context(image_tag: str) -> tuple[str, str]:
     return user.strip(), workdir.strip()
 
 
-async def run_build_verification(image_tag: str, repo_name: str, attempt: int, smoke_command: str) -> tuple[int, str, list[str], bool]:
-    user, workdir = await get_image_runtime_context(image_tag)
-    command = [
-        args.container_cli,
-        "run",
-        "--rm",
-    ]
+def _extract_direct_exec_command(smoke_command: str) -> list[str] | None:
+    command = smoke_command.strip()
+    if command.startswith("export PATH=") and ";" in command:
+        command = command.split(";", 1)[1].strip()
 
-    if user:
-        command.extend(["--user", user])
-    if workdir:
-        command.extend(["--workdir", workdir])
+    # Direct exec fallback only works for plain argv commands (no shell operators).
+    if re.search(r"[;&|<>`$()]", command):
+        return None
 
-    command.extend([
-        "--entrypoint",
-        "/bin/sh",
-        image_tag,
-        "-lc",
-        smoke_command,
-    ])
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    return argv or None
 
+
+def _is_missing_shell(shell_path: str, output: str) -> bool:
+    lowered = output.lower()
+    return shell_path.lower() in lowered and (
+        "no such file or directory" in lowered or "executable file not found" in lowered
+    )
+
+
+async def _run_container_command(command: list[str], repo_name: str, attempt: int) -> tuple[int, str, bool]:
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
@@ -440,7 +446,50 @@ async def run_build_verification(image_tag: str, repo_name: str, attempt: int, s
         await process.wait()
         returncode = 124
 
-    return returncode, "".join(output_chunks), command, timed_out
+    return returncode, "".join(output_chunks), timed_out
+
+
+async def run_build_verification(image_tag: str, repo_name: str, attempt: int, smoke_command: str) -> tuple[int, str, list[str], bool]:
+    user, workdir = await get_image_runtime_context(image_tag)
+    base_command = [
+        args.container_cli,
+        "run",
+        "--rm",
+    ]
+
+    if user:
+        base_command.extend(["--user", user])
+    if workdir:
+        base_command.extend(["--workdir", workdir])
+
+    for shell_path in ["/bin/sh", "/busybox/sh", "/bin/bash"]:
+        command = base_command + [
+            "--entrypoint",
+            shell_path,
+            image_tag,
+            "-lc",
+            smoke_command,
+        ]
+        exit_code, output, timed_out = await _run_container_command(command, repo_name, attempt)
+        if timed_out:
+            return exit_code, output, command, timed_out
+        if not _is_missing_shell(shell_path, output):
+            return exit_code, output, command, timed_out
+
+    direct_argv = _extract_direct_exec_command(smoke_command)
+    if direct_argv:
+        command = base_command + [
+            "--entrypoint",
+            direct_argv[0],
+            image_tag,
+            *direct_argv[1:],
+        ]
+        exit_code, output, timed_out = await _run_container_command(command, repo_name, attempt)
+        return exit_code, output, command, timed_out
+
+    command = base_command + ["--entrypoint", "/bin/sh", image_tag, "-lc", smoke_command]
+    output = "No usable shell found in image for verification command and command could not be executed directly."
+    return 127, output, command, False
 
 
 async def request_repair(
