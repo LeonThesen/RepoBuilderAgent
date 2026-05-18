@@ -421,9 +421,13 @@ def compute_repo_metrics(
 
         verify_passed = False
         for attempt in reversed(attempts):
-            # Check if verification (first or retry) passed in this attempt
+            # Check if verification (first, retry, or deterministic fallback) passed in this attempt
             bv_retry = attempt.get("build_verification_retry")
             if bv_retry and bv_retry.get("exit_code") == 0:
+                verify_passed = True
+                break
+            bv_fallback = attempt.get("build_verification_fallback")
+            if bv_fallback and bv_fallback.get("exit_code") == 0:
                 verify_passed = True
                 break
             bv = attempt.get("build_verification")

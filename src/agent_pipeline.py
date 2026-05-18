@@ -6,8 +6,17 @@ import sys
 import time
 from pathlib import Path
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-from log_utils import log_error, log_info, set_trace_enabled
+try:
+    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.log_utils import log_error, log_info, set_trace_enabled
+except ImportError:
+    # Fallback for direct script execution from RepoBuilderAgent/src
+    import config as _config
+    from log_utils import log_error, log_info, set_trace_enabled
+
+    OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
+    OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 import yaml
 
 
@@ -26,6 +35,15 @@ parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), hel
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for model calls")
 parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--selection-timeout", type=int, default=120, help="Timeout for classify step1 file-selection calls in seconds")
+parser.add_argument("--classification-timeout", type=int, default=240, help="Timeout for classify step2 classification calls in seconds")
+parser.add_argument("--dockerfile-timeout", type=int, default=240, help="Timeout for Dockerfile generation calls in seconds")
+parser.add_argument("--verify-cmd-timeout", type=int, default=180, help="Timeout for Dockerfile verification-command generation calls in seconds")
+parser.add_argument("--repair-timeout", type=int, default=240, help="Timeout for Dockerfile repair calls in seconds")
+parser.add_argument("--verify-repair-timeout", type=int, default=180, help="Timeout for verification-command repair calls in seconds")
+parser.add_argument("--install-guide-timeout", type=int, default=240, help="Timeout for install-guide generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated artifacts where supported")
 parser.add_argument("--learn", action="store_true", help="Enable learning of new manifest file patterns during classification")
@@ -78,6 +96,65 @@ RUN_DIR_DEFAULTS = {
 set_trace_enabled(args.trace)
 
 
+def _load_dotenv_fallback(dotenv_path: Path) -> dict[str, str]:
+    loaded: dict[str, str] = {}
+    if not dotenv_path.exists():
+        return loaded
+    for raw_line in dotenv_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            loaded[key] = value
+    return loaded
+
+
+def _resolve_llm_arg_defaults(workspace_root: Path) -> None:
+    dotenv = _load_dotenv_fallback(workspace_root / ".env")
+
+    if not args.endpoint:
+        args.endpoint = (
+            os.getenv("LLM_ENDPOINT")
+            or os.getenv("OPENAI_BASE_URL")
+            or dotenv.get("LLM_ENDPOINT")
+            or dotenv.get("OPENAI_BASE_URL")
+            or ""
+        )
+
+    if not args.model:
+        args.model = (
+            os.getenv("LLM_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or dotenv.get("LLM_MODEL")
+            or dotenv.get("OPENAI_MODEL")
+            or ""
+        )
+
+    if not args.api_key:
+        args.api_key = (
+            os.getenv("LLM_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or dotenv.get("LLM_API_KEY")
+            or dotenv.get("OPENAI_API_KEY")
+            or ""
+        )
+
+
+def _synchronize_llm_environment() -> None:
+    if args.endpoint:
+        os.environ["LLM_ENDPOINT"] = args.endpoint
+        os.environ["OPENAI_BASE_URL"] = args.endpoint
+    if args.model:
+        os.environ["LLM_MODEL"] = args.model
+        os.environ["OPENAI_MODEL"] = args.model
+    if args.api_key:
+        os.environ["LLM_API_KEY"] = args.api_key
+        os.environ["OPENAI_API_KEY"] = args.api_key
+
+
 def sanitize_command(command: list[str]) -> list[str]:
     sanitized = command.copy()
     for index, part in enumerate(sanitized[:-1]):
@@ -91,12 +168,17 @@ def render_command(command: list[str]) -> str:
 
 
 def append_shared_model_args(command: list[str]) -> list[str]:
+    if args.endpoint:
+        command.extend(["--endpoint", args.endpoint])
+    if args.model:
+        command.extend(["--model", args.model])
+    if args.api_key:
+        command.extend(["--api-key", args.api_key])
     command.extend([
-        "--endpoint", args.endpoint,
-        "--model", args.model,
-        "--api-key", args.api_key,
         "--temperature", str(args.temperature),
         "--timeout", str(args.timeout),
+        "--llm-max-retries", str(args.llm_max_retries),
+        "--llm-retry-backoff-seconds", str(args.llm_retry_backoff_seconds),
     ])
     if args.trace:
         command.append("--trace")
@@ -192,6 +274,8 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         command.append("--preprocess")
     command.extend([
         "--deletion-patterns", args.deletion_patterns,
+        "--selection-timeout", str(args.selection_timeout),
+        "--classification-timeout", str(args.classification_timeout),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
@@ -206,6 +290,8 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
     if args.force:
         command.append("--force")
     command.extend([
+        "--dockerfile-timeout", str(args.dockerfile_timeout),
+        "--verify-cmd-timeout", str(args.verify_cmd_timeout),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
@@ -217,6 +303,8 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
 def build_repair_command(python_executable: str, script_path: Path) -> list[str]:
     command = build_agent_command(python_executable, script_path)
     command.extend([
+        "--repair-timeout", str(args.repair_timeout),
+        "--verify-repair-timeout", str(args.verify_repair_timeout),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
@@ -252,6 +340,7 @@ def build_install_guide_command(python_executable: str, script_path: Path) -> li
     if args.force:
         command.append("--force")
     command.extend([
+        "--install-guide-timeout", str(args.install_guide_timeout),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
@@ -325,6 +414,118 @@ def collect_repair_outcomes(reports_dir: Path) -> dict:
     return outcome
 
 
+def _update_phase_totals(target: dict, phase_data: dict) -> None:
+    for key in (
+        "calls",
+        "success",
+        "timeout",
+        "connection_error",
+        "api_error",
+        "http_error",
+        "ssl_error",
+        "other_error",
+        "retries",
+    ):
+        target[key] = target.get(key, 0) + int(phase_data.get(key, 0) or 0)
+
+    latencies = phase_data.get("latencies_seconds", []) or []
+    latency_count = len(latencies)
+    if latency_count:
+        latency_sum = float(sum(latencies))
+        target["latency_count"] = target.get("latency_count", 0) + latency_count
+        target["latency_sum"] = target.get("latency_sum", 0.0) + latency_sum
+        target["latency_min"] = min(target.get("latency_min", float("inf")), min(latencies))
+        target["latency_max"] = max(target.get("latency_max", 0.0), max(latencies))
+
+
+def _finalize_phase_totals(phase_totals: dict) -> None:
+    latency_count = phase_totals.pop("latency_count", 0)
+    latency_sum = phase_totals.pop("latency_sum", 0.0)
+    latency_min = phase_totals.pop("latency_min", None)
+    latency_max = phase_totals.pop("latency_max", None)
+
+    if latency_count:
+        phase_totals["latency_summary_seconds"] = {
+            "min": round(float(latency_min), 3),
+            "avg": round(float(latency_sum) / latency_count, 3),
+            "max": round(float(latency_max), 3),
+            "samples": latency_count,
+        }
+
+
+def aggregate_llm_metrics(results_dir: Path, dockerfiles_dir: Path, repair_reports_dir: Path, install_guides_dir: Path) -> dict:
+    stage_globs = {
+        "classification": (results_dir, "*.llm-metrics.yaml"),
+        "dockerfile": (dockerfiles_dir, "*.llm-metrics.yaml"),
+        "repair": (repair_reports_dir, "*/llm-metrics.yaml"),
+        "install_guide": (install_guides_dir, "*/llm-metrics.yaml"),
+    }
+
+    summary: dict = {
+        "stages": {},
+        "overall": {
+            "files": 0,
+            "repos": 0,
+            "phase_totals": {},
+        },
+    }
+
+    overall_repos: set[str] = set()
+
+    for stage_name, (base_dir, glob_pattern) in stage_globs.items():
+        stage_phase_totals: dict = {}
+        stage_repos: set[str] = set()
+        stage_files: list[str] = []
+
+        if not base_dir.exists():
+            summary["stages"][stage_name] = {
+                "files": 0,
+                "repos": 0,
+                "phase_totals": {},
+                "metric_files": [],
+            }
+            continue
+
+        metric_files = sorted(base_dir.glob(glob_pattern))
+
+        for metrics_path in metric_files:
+            try:
+                with open(metrics_path, "r", encoding="utf-8") as metrics_file:
+                    metrics = yaml.safe_load(metrics_file) or {}
+            except Exception:
+                continue
+
+            stage_files.append(str(metrics_path))
+            repo = str(metrics.get("repo", "")).strip()
+            if repo:
+                stage_repos.add(repo)
+                overall_repos.add(repo)
+
+            for phase_name, phase_data in (metrics.get("phases", {}) or {}).items():
+                phase_totals = stage_phase_totals.setdefault(phase_name, {})
+                _update_phase_totals(phase_totals, phase_data or {})
+
+                overall_phase_totals = summary["overall"]["phase_totals"].setdefault(phase_name, {})
+                _update_phase_totals(overall_phase_totals, phase_data or {})
+
+        for phase_totals in stage_phase_totals.values():
+            _finalize_phase_totals(phase_totals)
+
+        summary["stages"][stage_name] = {
+            "files": len(stage_files),
+            "repos": len(stage_repos),
+            "phase_totals": stage_phase_totals,
+            "metric_files": stage_files,
+        }
+
+    for phase_totals in summary["overall"]["phase_totals"].values():
+        _finalize_phase_totals(phase_totals)
+
+    summary["overall"]["files"] = sum(stage.get("files", 0) for stage in summary["stages"].values())
+    summary["overall"]["repos"] = len(overall_repos)
+    return summary
+
+
 def print_planned_summary() -> None:
     summary_text = (
         "Agentic flow: infer -> generate -> build -> diagnose -> repair -> verify -> document -> report.\n\n"
@@ -353,7 +554,9 @@ def main() -> int:
     pipeline_started_ts = time.perf_counter()
     pipeline_started_at = utc_now()
     src_dir = Path(__file__).resolve().parent
-    workspace_root = Path(args.input_file).parent
+    workspace_root = src_dir.parent.parent
+    _resolve_llm_arg_defaults(workspace_root)
+    _synchronize_llm_environment()
     run_dir = workspace_root / "runs" / f"run-{run_id}"
 
     for attr_name, (default_value, run_subdir) in RUN_DIR_DEFAULTS.items():
@@ -367,6 +570,7 @@ def main() -> int:
     reports_dir = Path(args.pipeline_reports_dir)
     run_logs_dir = reports_dir / run_id
     summary_path = resolve_summary_path(workspace_root, run_id)
+    llm_metrics_summary_path = reports_dir / f"llm-metrics-summary-{run_id}.yaml"
 
     classify_script = src_dir / "agent_classify.py"
     dockerfile_script = src_dir / "agent_dockerfile.py"
@@ -398,6 +602,7 @@ def main() -> int:
             "reports_dir": str(reports_dir),
             "run_logs_dir": str(run_logs_dir),
             "summary_path": str(summary_path),
+            "llm_metrics_summary_path": str(llm_metrics_summary_path),
             "results_dir": args.results_dir,
             "summaries_dir": args.summaries_dir,
             "dockerfiles_dir": args.dockerfiles_dir,
@@ -476,6 +681,18 @@ def main() -> int:
             f"  |  build ok={repair_outcomes['build_success']} failed={repair_outcomes['build_failed']}"
             f"  |  verify ok={repair_outcomes['verify_passed']} failed={repair_outcomes['verify_failed']} missing={repair_outcomes['verify_missing']}"
         )
+
+    llm_metrics_summary = aggregate_llm_metrics(
+        Path(args.results_dir),
+        Path(args.dockerfiles_dir),
+        Path(args.reports_dir),
+        Path(args.install_guides_dir),
+    )
+    write_summary(llm_metrics_summary_path, llm_metrics_summary)
+    log_info(
+        f"LLM metrics summary written to {llm_metrics_summary_path} "
+        f"(files={llm_metrics_summary['overall']['files']} repos={llm_metrics_summary['overall']['repos']})"
+    )
 
     log_info("Pipeline process completed (note: this indicates the pipeline ran without errors, not that builds were successful).")
     return 0

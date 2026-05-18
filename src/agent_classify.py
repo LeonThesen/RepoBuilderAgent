@@ -14,11 +14,28 @@ import yaml
 from tqdm import tqdm
 import glob
 import shutil
+from typing import Any
 
-from config import *
-from common import prompt_path
-from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
-from log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+try:
+    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.common import (
+        chat_completion_with_retries,
+        finalize_llm_metrics,
+        init_llm_metrics,
+        prompt_path,
+    )
+    from RepoBuilderAgent.src.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
+    from RepoBuilderAgent.src.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+except ImportError:
+    # Fallback for direct script execution from RepoBuilderAgent/src
+    import config as _config
+    from common import chat_completion_with_retries, finalize_llm_metrics, init_llm_metrics, prompt_path
+    from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
+    from log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+
+    OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
+    OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 
 parser = argparse.ArgumentParser(description="Analyze and classify GitHub repositories based on a given schema file.")
 parser.add_argument("--input-file", default="repos.json", help="Path to input file containing repository URLs")
@@ -34,6 +51,10 @@ parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), hel
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
 parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--selection-timeout", type=int, default=120, help="Timeout for file-selection LLM requests in seconds")
+parser.add_argument("--classification-timeout", type=int, default=240, help="Timeout for final classification LLM requests in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing analysis results")
 parser.add_argument("--learn", action="store_true", help="Learn new files from LLM selections and update config")
@@ -155,7 +176,7 @@ async def update_progress(progress_state: dict, repo_name: str) -> None:
         progress_state["bar"].set_postfix_str(repo_name)
         progress_state["bar"].update(1)
 
-def parse_llm_yaml(raw: str) -> dict:
+def parse_llm_yaml(raw: str) -> Any:
     match = re.search(r"```(?:yaml)?\n(.*?)```", raw, re.DOTALL)
     content = match.group(1) if match else raw
     return yaml.safe_load(content)
@@ -204,6 +225,8 @@ def extract_selected_files(raw: str) -> list[str]:
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
+        llm_metrics_path = results_dir / f"{repo_name}.llm-metrics.yaml"
+        llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
         try:
             log_info(f"Processing {repo_url}...")
             output_path = results_dir / f"{repo_name}.yaml"
@@ -246,7 +269,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             # Step 1: structure-only context -> select relevant files.
             structure_summary = fingerprint(
                 format="md",
-                repo_path=repo_path,
+                repo_path=str(repo_path),
                 structure_only=True,
                 include_tree=True,
                 context="step1-structure",
@@ -269,12 +292,19 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             selected_files = default_selected_files.copy()
             try:
                 log_info(f"Sending step1-selection prompt for {repo_url}...")
-                selection_response = await client.chat.completions.create(
+                selection_response = await chat_completion_with_retries(
+                    client=client,
                     model=args.model,
                     temperature=0.0,
                     messages=[{"role": "user", "content": selection_prompt}],
+                    repo_url=repo_url,
+                    phase="classify-step1-selection",
+                    metrics=llm_metrics,
+                    timeout_seconds=args.selection_timeout,
+                    max_retries=args.llm_max_retries,
+                    retry_backoff_seconds=args.llm_retry_backoff_seconds,
                 )
-                raw_selection = selection_response.choices[0].message.content.strip()
+                raw_selection = (selection_response.choices[0].message.content or "").strip()
                 log_trace(f"Received step1-selection response for {repo_name}")
                 if selection_response.usage:
                     log_info(f"[TOKENS] {json.dumps({'phase': 'classify-step1', 'repo': repo_url, 'prompt_tokens': selection_response.usage.prompt_tokens, 'completion_tokens': selection_response.usage.completion_tokens, 'total_tokens': selection_response.usage.total_tokens})}")
@@ -299,7 +329,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             # Step 2: only selected file contents are provided to the classification prompt.
             summary = fingerprint(
                 format="md",
-                repo_path=repo_path,
+                repo_path=str(repo_path),
                 selected_files=selected_files,
                 include_tree=False,
                 context="step2-selected",
@@ -315,7 +345,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             # Baseline: deterministic collection of all manifest files (no LLM filtering).
             baseline_summary = fingerprint(
                 format="md",
-                repo_path=repo_path,
+                repo_path=str(repo_path),
                 structure_only=False,
                 selected_files=None,
                 include_tree=True,
@@ -370,12 +400,19 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             log_info(f"Token metrics saved at {metrics_path}")
             log_info(f"Sending step2-classification prompt for {repo_url}...")
             try:
-                response = await client.chat.completions.create(
+                response = await chat_completion_with_retries(
+                    client=client,
                     model=args.model,
                     temperature=args.temperature,
-                    messages=[{"role": "user", "content": prompt}]
+                    messages=[{"role": "user", "content": prompt}],
+                    repo_url=repo_url,
+                    phase="classify-step2",
+                    metrics=llm_metrics,
+                    timeout_seconds=args.classification_timeout,
+                    max_retries=args.llm_max_retries,
+                    retry_backoff_seconds=args.llm_retry_backoff_seconds,
                 )
-                raw = response.choices[0].message.content.strip()
+                raw = (response.choices[0].message.content or "").strip()
                 log_trace(f"Received step2-classification response for {repo_name}")
                 if response.usage:
                     log_info(f"[TOKENS] {json.dumps({'phase': 'classify-step2', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
@@ -416,8 +453,14 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                             f"{learn_result.get('skipped_project_specific', [])}"
                         )
 
+            with open(llm_metrics_path, "w", encoding="utf-8") as f:
+                yaml.dump(finalize_llm_metrics(llm_metrics), f, sort_keys=False, allow_unicode=True)
+            log_info(f"LLM metrics saved at {llm_metrics_path}")
+
         except Exception as e:
             log_error(f"Unexpected error while processing {repo_url}: {e}")
+            with open(llm_metrics_path, "w", encoding="utf-8") as f:
+                yaml.dump(finalize_llm_metrics(llm_metrics), f, sort_keys=False, allow_unicode=True)
         finally:
             await update_progress(progress_state, repo_name)
 

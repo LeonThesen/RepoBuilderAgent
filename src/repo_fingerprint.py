@@ -12,7 +12,11 @@ import yaml
 from pathlib import Path
 from typing import Optional
 
-from log_utils import log_info, log_trace
+try:
+    from RepoBuilderAgent.src.log_utils import log_info, log_trace
+except ImportError:
+    # Fallback for direct script execution from RepoBuilderAgent/src
+    from log_utils import log_info, log_trace
 
 # ---------------------------------------------------------------------------
 # Config Loading

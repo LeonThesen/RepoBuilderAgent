@@ -8,12 +8,186 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
+from openai import APIConnectionError, APIError, APITimeoutError
 
-from log_utils import log_info, log_warn
-from repo_fingerprint import fingerprint
+try:
+    from RepoBuilderAgent.src.log_utils import log_info, log_warn
+    from RepoBuilderAgent.src.repo_fingerprint import fingerprint
+except ImportError:
+    # Fallback for direct script execution from RepoBuilderAgent/src
+    from log_utils import log_info, log_warn
+    from repo_fingerprint import fingerprint
+
+
+def init_llm_metrics(repo_url: str, model: str, endpoint: str, timeout_seconds: int, max_retries: int) -> dict:
+    return {
+        "repo": repo_url,
+        "model": model,
+        "endpoint": endpoint,
+        "timeout_seconds": timeout_seconds,
+        "max_retries": max_retries,
+        "phases": {},
+    }
+
+
+def _phase_bucket(metrics: dict, phase: str) -> dict:
+    phases = metrics.setdefault("phases", {})
+    return phases.setdefault(
+        phase,
+        {
+            "calls": 0,
+            "success": 0,
+            "timeout": 0,
+            "connection_error": 0,
+            "api_error": 0,
+            "http_error": 0,
+            "ssl_error": 0,
+            "other_error": 0,
+            "retries": 0,
+            "latencies_seconds": [],
+            "attempts": [],
+        },
+    )
+
+
+def finalize_llm_metrics(metrics: dict) -> dict:
+    for phase_data in metrics.get("phases", {}).values():
+        latencies = phase_data.get("latencies_seconds", [])
+        if latencies:
+            phase_data["latency_summary_seconds"] = {
+                "min": round(min(latencies), 3),
+                "avg": round(sum(latencies) / len(latencies), 3),
+                "max": round(max(latencies), 3),
+            }
+    return metrics
+
+
+def is_retryable_api_error(error: APIError) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        return False
+    return status_code in {408, 409, 429} or status_code >= 500
+
+
+async def chat_completion_with_retries(
+    *,
+    client,
+    model: str,
+    temperature: float,
+    messages: list[dict[str, str]],
+    repo_url: str,
+    phase: str,
+    metrics: dict,
+    timeout_seconds: int,
+    max_retries: int,
+    retry_backoff_seconds: float,
+):
+    bucket = _phase_bucket(metrics, phase)
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_retries + 2):
+        bucket["calls"] += 1
+        started = time.perf_counter()
+        try:
+            response = await client.with_options(timeout=timeout_seconds).chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=messages,
+            )
+            latency = round(time.perf_counter() - started, 3)
+            bucket["success"] += 1
+            bucket["latencies_seconds"].append(latency)
+            bucket["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "status": "success",
+                    "latency_seconds": latency,
+                }
+            )
+            return response
+        except APITimeoutError as error:
+            latency = round(time.perf_counter() - started, 3)
+            bucket["timeout"] += 1
+            bucket["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "status": "timeout",
+                    "latency_seconds": latency,
+                    "error": str(error),
+                }
+            )
+            last_error = error
+            if attempt > max_retries:
+                break
+            delay_seconds = round(retry_backoff_seconds * (2 ** (attempt - 1)), 3)
+            bucket["retries"] += 1
+            log_warn(
+                f"OpenAI timeout for {repo_url} [{phase}] attempt {attempt}/{max_retries + 1}; retrying in {delay_seconds}s"
+            )
+            await asyncio.sleep(delay_seconds)
+        except APIConnectionError as error:
+            latency = round(time.perf_counter() - started, 3)
+            bucket["connection_error"] += 1
+            bucket["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "status": "connection_error",
+                    "latency_seconds": latency,
+                    "error": str(error),
+                }
+            )
+            last_error = error
+            if attempt > max_retries:
+                break
+            delay_seconds = round(retry_backoff_seconds * (2 ** (attempt - 1)), 3)
+            bucket["retries"] += 1
+            log_warn(
+                f"OpenAI connection error for {repo_url} [{phase}] attempt {attempt}/{max_retries + 1}; retrying in {delay_seconds}s"
+            )
+            await asyncio.sleep(delay_seconds)
+        except APIError as error:
+            latency = round(time.perf_counter() - started, 3)
+            bucket["api_error"] += 1
+            bucket["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "status": "api_error",
+                    "latency_seconds": latency,
+                    "error": str(error),
+                    "status_code": getattr(error, "status_code", None),
+                }
+            )
+            last_error = error
+            if attempt > max_retries or not is_retryable_api_error(error):
+                break
+            delay_seconds = round(retry_backoff_seconds * (2 ** (attempt - 1)), 3)
+            bucket["retries"] += 1
+            log_warn(
+                f"Retryable API error for {repo_url} [{phase}] attempt {attempt}/{max_retries + 1}; retrying in {delay_seconds}s"
+            )
+            await asyncio.sleep(delay_seconds)
+        except Exception as error:
+            latency = round(time.perf_counter() - started, 3)
+            bucket["other_error"] += 1
+            bucket["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "status": "other_error",
+                    "latency_seconds": latency,
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                }
+            )
+            last_error = error
+            break
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Unexpected completion retry flow for {repo_url} [{phase}]")
 
 
 def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | None = None) -> str:
@@ -27,10 +201,41 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
     - Java keystore import into the DEFAULT OpenJDK keystore (preserves public root CAs)
     - Rust/cargo CA configuration
     """
+    def ensure_root_for_chown(content: str) -> str:
+        """Ensure RUN chown commands execute as root, then restore prior user."""
+        lines_local = content.split("\n")
+        rewritten: list[str] = []
+        current_user = "root"
+
+        for raw_line in lines_local:
+            stripped = raw_line.strip()
+            upper = stripped.upper()
+
+            if upper.startswith("USER "):
+                parts = stripped.split(None, 1)
+                if len(parts) == 2 and parts[1].strip():
+                    current_user = parts[1].strip()
+                rewritten.append(raw_line)
+                continue
+
+            is_chown_run = upper.startswith("RUN ") and "CHOWN" in upper
+            if is_chown_run and current_user not in {"root", "0"}:
+                rewritten.append("USER root")
+                rewritten.append(raw_line)
+                rewritten.append(f"USER {current_user}")
+            else:
+                rewritten.append(raw_line)
+
+        return "\n".join(rewritten)
+
     if not ca_cert_b64:
         ca_cert_b64 = os.getenv("MANUALREPOS_CA_CERT_B64")
     if not ca_cert_b64:
-        return dockerfile_content
+        return ensure_root_for_chown(dockerfile_content)
+
+    # Avoid repeatedly injecting very large CA blocks on retries/repair passes.
+    if "manualrepos-refresh-ca-certificates" in dockerfile_content:
+        return ensure_root_for_chown(dockerfile_content)
 
     decoded_bundle = base64.b64decode(ca_cert_b64).decode("utf-8")
     cert_blocks = []
@@ -102,31 +307,18 @@ ENV MAVEN_OPTS="-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.n
     lines = dockerfile_content.split("\n")
     injected_lines = []
     inserted = False
-    current_user_is_root = True
 
     for line in lines:
-        stripped_line = line.strip()
-        lower_line = stripped_line.lower()
-        if inserted and (
-            (stripped_line.upper().startswith("USER") and lower_line != "user root")
-            or (
-                stripped_line.upper().startswith("RUN")
-                and current_user_is_root
-                and ca_refresh_script_path not in lower_line
-                and any(token in lower_line for token in ("gradle", "gradlew", "mvn", "maven", " java"))
-            )
-        ):
-            injected_lines.append(f"RUN {ca_refresh_script_path}")
-        injected_lines.append(line)
-        # Insert CA setup after first FROM line
+        # Insert CA setup after first FROM line, before anything else
         if not inserted and line.strip().upper().startswith("FROM"):
+            injected_lines.append(line)
             injected_lines.append("USER root")
             injected_lines.append(ca_setup_commands.strip())
             inserted = True
-        if stripped_line.upper().startswith("USER"):
-            current_user_is_root = lower_line == "user root"
+        else:
+            injected_lines.append(line)
 
-    return "\n".join(injected_lines)
+    return ensure_root_for_chown("\n".join(injected_lines))
 
 
 def repo_name_from_url(repo_url: str) -> str:

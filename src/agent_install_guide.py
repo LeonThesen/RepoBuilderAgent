@@ -10,19 +10,45 @@ import httpx
 from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-from common import (
-    ensure_repo_checkout,
-    load_repo_urls,
-    load_summary,
-    prompt_path,
-    read_yaml_file,
-    render_yaml,
-    repo_name_from_url,
-    should_use_progress,
-    update_progress,
-)
+try:
+    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.common import (
+        chat_completion_with_retries,
+        ensure_repo_checkout,
+        finalize_llm_metrics,
+        init_llm_metrics,
+        load_repo_urls,
+        load_summary,
+        prompt_path,
+        read_yaml_file,
+        render_yaml,
+        repo_name_from_url,
+        should_use_progress,
+        update_progress,
+    )
+except ImportError:
+    # Fallback for direct script execution from RepoBuilderAgent/src
+    import config as _config
+    from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from common import (
+        chat_completion_with_retries,
+        ensure_repo_checkout,
+        finalize_llm_metrics,
+        init_llm_metrics,
+        load_repo_urls,
+        load_summary,
+        prompt_path,
+        read_yaml_file,
+        render_yaml,
+        repo_name_from_url,
+        should_use_progress,
+        update_progress,
+    )
+
+    OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
+    OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 
 
 parser = argparse.ArgumentParser(
@@ -40,6 +66,9 @@ parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), hel
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
 parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--install-guide-timeout", type=int, default=240, help="Timeout for INSTALL.md generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated install guides")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
@@ -107,6 +136,8 @@ async def generate_install_guide(
     async with sem:
         repo_name = repo_name_from_url(repo_url)
         output_path = output_dir / repo_name / "INSTALL.md"
+        llm_metrics_path = output_dir / repo_name / "llm-metrics.yaml"
+        llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
 
         try:
             if output_path.exists() and not args.force:
@@ -149,10 +180,17 @@ async def generate_install_guide(
             install_guide_content = ""
             generation_prompt = prompt
             for attempt in range(1, 3):
-                response = await client.chat.completions.create(
+                response = await chat_completion_with_retries(
+                    client=client,
                     model=args.model,
                     temperature=args.temperature,
                     messages=[{"role": "user", "content": generation_prompt}],
+                    repo_url=repo_url,
+                    phase="install-guide",
+                    metrics=llm_metrics,
+                    timeout_seconds=args.install_guide_timeout,
+                    max_retries=args.llm_max_retries,
+                    retry_backoff_seconds=args.llm_retry_backoff_seconds,
                 )
                 raw = response.choices[0].message.content or ""
                 install_guide_content = extract_markdown(raw)
@@ -181,6 +219,10 @@ async def generate_install_guide(
             log_trace(f"INSTALL.md written for {repo_name} at {output_path}")
             log_info(f"Saved INSTALL.md to {output_path}")
 
+            with open(llm_metrics_path, "w", encoding="utf-8") as metrics_file:
+                metrics_file.write(render_yaml(finalize_llm_metrics(llm_metrics)))
+            log_info(f"LLM metrics saved at {llm_metrics_path}")
+
         except httpx.HTTPError as error:
             log_warn(f"HTTP error for {repo_url}: {error}")
         except ssl.SSLError as error:
@@ -192,6 +234,9 @@ async def generate_install_guide(
         except Exception as error:
             log_error(f"Unexpected error while generating INSTALL.md for {repo_url}: {error}")
         finally:
+            llm_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(llm_metrics_path, "w", encoding="utf-8") as metrics_file:
+                metrics_file.write(render_yaml(finalize_llm_metrics(llm_metrics)))
             await update_progress(progress_state, repo_name)
 
 

@@ -11,21 +11,49 @@ import httpx
 from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-from common import (
-    ensure_repo_checkout,
-    inject_ca_cert_into_dockerfile,
-    load_repo_urls,
-    load_summary,
-    prompt_path,
-    read_yaml_file,
-    render_yaml,
-    repo_name_from_url,
-    should_use_progress,
-    update_progress,
-    validate_dockerfile_syntax,
-)
+try:
+    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.common import (
+        chat_completion_with_retries,
+        ensure_repo_checkout,
+        finalize_llm_metrics,
+        init_llm_metrics,
+        inject_ca_cert_into_dockerfile,
+        load_repo_urls,
+        load_summary,
+        prompt_path,
+        read_yaml_file,
+        render_yaml,
+        repo_name_from_url,
+        should_use_progress,
+        update_progress,
+        validate_dockerfile_syntax,
+    )
+except ImportError:
+    # Fallback for direct script execution from RepoBuilderAgent/src
+    import config as _config
+    from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from common import (
+        chat_completion_with_retries,
+        ensure_repo_checkout,
+        finalize_llm_metrics,
+        init_llm_metrics,
+        inject_ca_cert_into_dockerfile,
+        load_repo_urls,
+        load_summary,
+        prompt_path,
+        read_yaml_file,
+        render_yaml,
+        repo_name_from_url,
+        should_use_progress,
+        update_progress,
+        validate_dockerfile_syntax,
+    )
+
+    OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
+    OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 
 
 parser = argparse.ArgumentParser(
@@ -43,6 +71,10 @@ parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), hel
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
 parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--repair-timeout", type=int, default=240, help="Timeout for Dockerfile repair LLM calls in seconds")
+parser.add_argument("--verify-repair-timeout", type=int, default=180, help="Timeout for verification-command repair LLM calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
@@ -93,8 +125,8 @@ _DELETE_DOCS_EXTENSIONS: tuple[str, ...] = (
     ".md", ".rst", ".adoc", ".asciidoc", ".textile", ".wiki",
     # Office / print documents
     ".pdf", ".doc", ".docx", ".odt", ".rtf",
-    # Other doc formats
-    ".tex", ".pod", ".man", ".1", ".2", ".3", ".4", ".5", ".6", ".7", ".8",
+    # Other doc formats (avoid man-page style sources like .1-.8 that can be build inputs)
+    ".tex", ".pod", ".man",
     # Notebook / presentation
     ".ipynb", ".pptx", ".ppt",
 )
@@ -108,19 +140,6 @@ _DELETE_DOCS_FILE_NAMES: frozenset[str] = frozenset({
     ".drone.yml", ".drone.yaml",
     "bitbucket-pipelines.yml", "bitbucket-pipelines.yaml",
     "CODEOWNERS",
-    # Plain-text documentation files (no extension)
-    "README", "INSTALL", "INSTALL.txt",
-    "CHANGELOG", "CHANGELOG.txt", "CHANGES", "CHANGES.txt",
-    "HISTORY", "HISTORY.txt", "NEWS", "NEWS.txt",
-    "AUTHORS", "AUTHORS.txt", "CONTRIBUTORS", "CONTRIBUTORS.txt",
-    "CONTRIBUTING",
-    "NOTICE", "NOTICE.txt",
-    "HACKING", "HACKING.txt",
-    "TODO", "TODO.txt",
-    "ROADMAP", "ROADMAP.txt",
-    "BUGS", "FAQ", "THANKS", "THANKS.txt",
-    # Common plain-text docs with extension
-    "readme.txt", "install.txt", "changelog.txt",
 })
 _DELETE_DOCS_DIR_NAMES: frozenset[str] = frozenset({
     # CI/CD directories
@@ -252,6 +271,56 @@ def normalize_verify_command(command: str) -> str:
     )
 
 
+def _extract_verify_binary_name(command: str) -> str:
+    """Best-effort extraction of the primary executable from a verify command."""
+    stripped = command.strip()
+    if not stripped:
+        return ""
+
+    # Ignore optional PATH export prefix used by normalize_verify_command.
+    if stripped.startswith("export PATH=") and ";" in stripped:
+        stripped = stripped.split(";", 1)[1].strip()
+
+    primary = re.split(r"\s|&&|\|\|", stripped, maxsplit=1)[0].strip()
+    if not primary or primary in {"if", "test", "[", "echo", "true", "false"}:
+        return ""
+    return primary
+
+
+def build_deterministic_verify_fallback(repo_name: str, verify_command: str) -> str:
+    """Create a deterministic fallback verify command for command-not-found cases."""
+    primary = _extract_verify_binary_name(verify_command)
+    candidates: list[str] = []
+
+    for value in [primary, repo_name, repo_name.replace("_", "-")]:
+        cleaned = value.strip()
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+
+    shell_candidates = " ".join(f'"{candidate}"' for candidate in candidates)
+
+    # Deterministic fallback:
+    # 1) Try likely binary names.
+    # 2) If no binary exists, confirm build artifacts exist in known build/output paths.
+    return (
+        "set -eu; "
+        f"for cmd in {shell_candidates}; do "
+        "if command -v \"$cmd\" >/dev/null 2>&1; then "
+        "echo \"fallback: found command $cmd\"; "
+        "\"$cmd\" --version >/dev/null 2>&1 || \"$cmd\" -V >/dev/null 2>&1 || \"$cmd\" -v >/dev/null 2>&1 || true; "
+        "exit 0; "
+        "fi; "
+        "done; "
+        "if find /home/manualrepos/repo -maxdepth 6 -type f "
+        "\\( -path '*/target/release/*' -o -path '*/build/*' -o -name '*.so*' -o -name '*.a' -o -name '*.jar' -o -name '*.whl' \\) "
+        "| head -n 1 | grep -q .; then "
+        "echo 'fallback: found build artifact in repository'; "
+        "exit 0; "
+        "fi; "
+        "exit 127"
+    )
+
+
 def _apply_repair(
     repo_url: str,
     repo_name: str,
@@ -260,14 +329,14 @@ def _apply_repair(
     dockerfile_path: Path,
     report_dir: Path,
     attempt: int,
-) -> tuple[str | None, bool]:
+) -> tuple[str, bool]:
     """Validate and write a repaired Dockerfile. Returns (updated_content, should_stop)."""
     if not repaired.strip():
         log_warn(f"Repair model returned an empty Dockerfile for {repo_url}; stopping retries.")
-        return None, True
+        return current, True
     if repaired.strip() == current.strip():
         log_warn(f"Repair model returned an unchanged Dockerfile for {repo_url}; stopping retries.")
-        return None, True
+        return current, True
     write_text(dockerfile_path, repaired)
     write_text(report_dir / f"attempt-{attempt}.repaired.Dockerfile", repaired)
     log_trace(f"Updated Dockerfile for {repo_name} after attempt {attempt}")
@@ -297,17 +366,52 @@ async def run_build(command: list[str], repo_name: str, attempt: int) -> tuple[i
     return returncode, "".join(output_chunks)
 
 
+async def get_image_runtime_context(image_tag: str) -> tuple[str, str]:
+    """Resolve runtime user/workdir from built image config for verify execution."""
+    command = [
+        args.container_cli,
+        "image",
+        "inspect",
+        "--format",
+        "{{.Config.User}}|{{.Config.WorkingDir}}",
+        image_tag,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await process.communicate()
+    if process.returncode != 0:
+        return "", ""
+
+    rendered = output.decode("utf-8", errors="replace").strip()
+    if "|" not in rendered:
+        return "", ""
+    user, workdir = rendered.split("|", 1)
+    return user.strip(), workdir.strip()
+
+
 async def run_build_verification(image_tag: str, repo_name: str, attempt: int, smoke_command: str) -> tuple[int, str, list[str], bool]:
+    user, workdir = await get_image_runtime_context(image_tag)
     command = [
         args.container_cli,
         "run",
         "--rm",
+    ]
+
+    if user:
+        command.extend(["--user", user])
+    if workdir:
+        command.extend(["--workdir", workdir])
+
+    command.extend([
         "--entrypoint",
         "/bin/sh",
         image_tag,
         "-lc",
         smoke_command,
-    ]
+    ])
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -346,6 +450,7 @@ async def request_repair(
     summary: str,
     dockerfile_content: str,
     build_log: str,
+    llm_metrics: dict,
 ) -> str:
     base_template = get_base_template(classification)
     prompt = (
@@ -358,14 +463,21 @@ async def request_repair(
         .replace("{{BUILD_LOG}}", trim_log(build_log))
     )
 
-    response = await client.chat.completions.create(
+    response = await chat_completion_with_retries(
+        client=client,
         model=args.model,
         temperature=args.temperature,
         messages=[{"role": "user", "content": prompt}],
+        repo_url=repo_url,
+        phase="repair",
+        metrics=llm_metrics,
+        timeout_seconds=args.repair_timeout,
+        max_retries=args.llm_max_retries,
+        retry_backoff_seconds=args.llm_retry_backoff_seconds,
     )
     if response.usage:
         log_info(f"[TOKENS] {json.dumps({'phase': 'repair', 'repo': repo_url, 'attempt': attempt_number, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return extract_dockerfile(response.choices[0].message.content.strip())
+    return extract_dockerfile((response.choices[0].message.content or "").strip())
 
 
 async def request_verification_command_repair(
@@ -374,6 +486,7 @@ async def request_verification_command_repair(
     dockerfile_content: str,
     current_verify_command: str,
     verify_log: str,
+    llm_metrics: dict,
 ) -> str:
     prompt = (
         VERIFY_PROMPT_TEMPLATE
@@ -386,18 +499,70 @@ async def request_verification_command_repair(
         "\nReturn a replacement command that addresses the failure evidence below."
         "\nDo not require a background daemon unless the Dockerfile clearly starts it within the same one-liner."
         "\nPreserve the same verification intent, but prefer offline, foreground, deterministic checks."
+        "\nPrefer a quick smoke check over a heavyweight full-suite test by default."
+        "\nIf failure evidence indicates command-not-found or exit code 127, choose a command that exists in the final image (use command -v guards when uncertain)."
+        "\nDo not assume the executable name equals the repository name."
+        "\nReturn only one shell command, no prose."
         f"\n\nPrevious command:\n{current_verify_command}"
         f"\n\nFailure log:\n{trim_log(verify_log)}\n"
     )
 
-    response = await client.chat.completions.create(
+    response = await chat_completion_with_retries(
+        client=client,
         model=args.model,
         temperature=args.temperature,
         messages=[{"role": "user", "content": prompt}],
+        repo_url=repo_url,
+        phase="verify-repair",
+        metrics=llm_metrics,
+        timeout_seconds=args.verify_repair_timeout,
+        max_retries=args.llm_max_retries,
+        retry_backoff_seconds=args.llm_retry_backoff_seconds,
     )
     if response.usage:
         log_info(f"[TOKENS] {json.dumps({'phase': 'verify-repair', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return response.choices[0].message.content.strip().strip("`")
+    return (response.choices[0].message.content or "").strip().strip("`")
+
+
+async def request_verification_command_refresh(
+    repo_url: str,
+    classification: dict,
+    dockerfile_content: str,
+    current_verify_command: str,
+    llm_metrics: dict,
+) -> str:
+    """Refresh verify command when Dockerfile changes materially during repair."""
+    prompt = (
+        VERIFY_PROMPT_TEMPLATE
+        .replace("{{REPO_URL}}", repo_url)
+        .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
+        .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
+    )
+    prompt += (
+        "\n\nThe Dockerfile was rewritten during repair."
+        "\nReturn the best verification command for the updated Dockerfile context."
+        "\nPrefer a quick deterministic check over heavyweight full-suite tests by default."
+        "\nDo not assume the executable name equals the repository name."
+        "\nUse command -v guards when command availability is uncertain."
+        "\nUse one shell command only, no prose or markdown fences."
+        f"\n\nCurrent command:\n{current_verify_command}\n"
+    )
+
+    response = await chat_completion_with_retries(
+        client=client,
+        model=args.model,
+        temperature=args.temperature,
+        messages=[{"role": "user", "content": prompt}],
+        repo_url=repo_url,
+        phase="verify-refresh",
+        metrics=llm_metrics,
+        timeout_seconds=args.verify_repair_timeout,
+        max_retries=args.llm_max_retries,
+        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+    )
+    if response.usage:
+        log_info(f"[TOKENS] {json.dumps({'phase': 'verify-refresh', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
+    return (response.choices[0].message.content or "").strip().strip("`")
 
 
 async def repair_repository(
@@ -414,6 +579,8 @@ async def repair_repository(
         dockerfile_path = dockerfiles_dir / f"{repo_name}.Dockerfile"
         report_dir = reports_dir / repo_name
         report_path = report_dir / "report.yaml"
+        llm_metrics_path = report_dir / "llm-metrics.yaml"
+        llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
 
         report: dict = {
             "repo": repo_url,
@@ -565,6 +732,34 @@ async def repair_repository(
                         )
                         break
 
+                    if verify_exit_code == 127:
+                        fallback_command = build_deterministic_verify_fallback(repo_name, verify_command_to_use)
+                        fallback_log_path = report_dir / f"attempt-{attempt}.verify-fallback.log"
+                        log_info(
+                            f"Verification command not found for {repo_url}; running deterministic fallback verification"
+                        )
+                        fb_exit_code, fb_output, fb_cmd_list, fb_timed_out = await run_build_verification(
+                            image_tag,
+                            repo_name,
+                            attempt,
+                            fallback_command,
+                        )
+                        fallback_log = combine_build_output(fb_cmd_list, fb_exit_code, fb_output)
+                        write_text(fallback_log_path, fallback_log)
+                        report["attempts"][-1]["build_verification_fallback"] = {
+                            "exit_code": fb_exit_code,
+                            "timed_out": fb_timed_out,
+                            "command": fb_cmd_list,
+                            "log": str(fallback_log_path),
+                        }
+                        if fb_exit_code == 0:
+                            report["success"] = True
+                            report["successful_attempt"] = attempt
+                            log_info(
+                                f"Build and deterministic fallback verification succeeded for {repo_url} on attempt {attempt}; image tag: {image_tag}; build log: {build_log_path}; fallback log: {fallback_log_path}"
+                            )
+                            break
+
                     log_warn(
                         f"Build verification failed for {repo_url} on attempt {attempt} with exit code {verify_exit_code}; verify log: {verify_log_path}"
                     )
@@ -577,6 +772,7 @@ async def repair_repository(
                             dockerfile_content=current_dockerfile,
                             current_verify_command=verify_command_to_use,
                             verify_log=verify_log,
+                            llm_metrics=llm_metrics,
                         )
                     )
 
@@ -617,6 +813,34 @@ async def repair_repository(
                         )
                         break
 
+                    if retry_exit_code == 127:
+                        fallback_command = build_deterministic_verify_fallback(repo_name, verify_command_to_use)
+                        fallback_log_path = report_dir / f"attempt-{attempt}.verify-fallback.log"
+                        log_info(
+                            f"Updated verification command not found for {repo_url}; running deterministic fallback verification"
+                        )
+                        fb_exit_code, fb_output, fb_cmd_list, fb_timed_out = await run_build_verification(
+                            image_tag,
+                            repo_name,
+                            attempt,
+                            fallback_command,
+                        )
+                        fallback_log = combine_build_output(fb_cmd_list, fb_exit_code, fb_output)
+                        write_text(fallback_log_path, fallback_log)
+                        report["attempts"][-1]["build_verification_fallback"] = {
+                            "exit_code": fb_exit_code,
+                            "timed_out": fb_timed_out,
+                            "command": fb_cmd_list,
+                            "log": str(fallback_log_path),
+                        }
+                        if fb_exit_code == 0:
+                            report["success"] = True
+                            report["successful_attempt"] = attempt
+                            log_info(
+                                f"Build and deterministic fallback verification succeeded for {repo_url} on attempt {attempt} after verification command update; image tag: {image_tag}; build log: {build_log_path}; fallback log: {fallback_log_path}"
+                            )
+                            break
+
                     log_warn(
                         f"Updated build verification still failing for {repo_url} on attempt {attempt} with exit code {retry_exit_code}; verify log: {retry_verify_log_path}"
                     )
@@ -635,6 +859,7 @@ async def repair_repository(
                         summary=summary,
                         dockerfile_content=current_dockerfile,
                         build_log=build_log,
+                        llm_metrics=llm_metrics,
                     )
                     current_dockerfile, stop = _apply_repair(
                         repo_url, repo_name, current_dockerfile, repaired_dockerfile,
@@ -642,6 +867,21 @@ async def repair_repository(
                     )
                     if stop:
                         break
+                    refreshed_verify_command = normalize_verify_command(
+                        await request_verification_command_refresh(
+                            repo_url=repo_url,
+                            classification=classification,
+                            dockerfile_content=current_dockerfile,
+                            current_verify_command=verify_command_to_use,
+                            llm_metrics=llm_metrics,
+                        )
+                    )
+                    if refreshed_verify_command and refreshed_verify_command != verify_command_to_use:
+                        verify_command_to_use = refreshed_verify_command
+                        write_text(verify_command_path, verify_command_to_use + "\n")
+                        log_info(
+                            f"Updated verification command after Dockerfile repair for {repo_url}: {verify_command_to_use}"
+                        )
 
                 log_warn(
                     f"Build attempt {attempt} failed for {repo_url} with exit code {exit_code}; build log: {build_log_path}"
@@ -659,6 +899,7 @@ async def repair_repository(
                     summary=summary,
                     dockerfile_content=current_dockerfile,
                     build_log=build_log,
+                    llm_metrics=llm_metrics,
                 )
                 current_dockerfile, stop = _apply_repair(
                     repo_url, repo_name, current_dockerfile, repaired_dockerfile,
@@ -666,9 +907,26 @@ async def repair_repository(
                 )
                 if stop:
                     break
+                refreshed_verify_command = normalize_verify_command(
+                    await request_verification_command_refresh(
+                        repo_url=repo_url,
+                        classification=classification,
+                        dockerfile_content=current_dockerfile,
+                        current_verify_command=verify_command_to_use,
+                        llm_metrics=llm_metrics,
+                    )
+                )
+                if refreshed_verify_command and refreshed_verify_command != verify_command_to_use:
+                    verify_command_to_use = refreshed_verify_command
+                    write_text(verify_command_path, verify_command_to_use + "\n")
+                    log_info(
+                        f"Updated verification command after Dockerfile repair for {repo_url}: {verify_command_to_use}"
+                    )
 
             write_text(report_path, render_yaml(report))
             log_info(f"Repair report written to {report_path}")
+            write_text(llm_metrics_path, render_yaml(finalize_llm_metrics(llm_metrics)))
+            log_info(f"LLM metrics saved at {llm_metrics_path}")
 
         except httpx.HTTPError as error:
             log_warn(f"HTTP error for {repo_url}: {error}")
@@ -683,6 +941,7 @@ async def repair_repository(
         finally:
             if report["attempts"]:
                 write_text(report_path, render_yaml(report))
+            write_text(llm_metrics_path, render_yaml(finalize_llm_metrics(llm_metrics)))
             await update_progress(progress_state, repo_name)
 
 

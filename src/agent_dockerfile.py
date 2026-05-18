@@ -10,21 +10,49 @@ import httpx
 from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-from common import (
-    ensure_repo_checkout,
-    inject_ca_cert_into_dockerfile,
-    load_repo_urls,
-    load_summary,
-    prompt_path,
-    read_yaml_file,
-    render_yaml,
-    repo_name_from_url,
-    should_use_progress,
-    update_progress,
-    validate_dockerfile_syntax,
-)
+try:
+    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.common import (
+        chat_completion_with_retries,
+        ensure_repo_checkout,
+        finalize_llm_metrics,
+        init_llm_metrics,
+        inject_ca_cert_into_dockerfile,
+        load_repo_urls,
+        load_summary,
+        prompt_path,
+        read_yaml_file,
+        render_yaml,
+        repo_name_from_url,
+        should_use_progress,
+        update_progress,
+        validate_dockerfile_syntax,
+    )
+except ImportError:
+    # Fallback for direct script execution from RepoBuilderAgent/src
+    import config as _config
+    from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from common import (
+        chat_completion_with_retries,
+        ensure_repo_checkout,
+        finalize_llm_metrics,
+        init_llm_metrics,
+        inject_ca_cert_into_dockerfile,
+        load_repo_urls,
+        load_summary,
+        prompt_path,
+        read_yaml_file,
+        render_yaml,
+        repo_name_from_url,
+        should_use_progress,
+        update_progress,
+        validate_dockerfile_syntax,
+    )
+
+    OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
+    OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 
 
 parser = argparse.ArgumentParser(
@@ -42,6 +70,10 @@ parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), hel
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
 parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--dockerfile-timeout", type=int, default=240, help="Timeout for Dockerfile generation calls in seconds")
+parser.add_argument("--verify-cmd-timeout", type=int, default=180, help="Timeout for verification command generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated Dockerfiles")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint")
@@ -197,6 +229,8 @@ async def generate_dockerfile(
     async with sem:
         repo_name = repo_name_from_url(repo_url)
         output_path = output_dir / f"{repo_name}.Dockerfile"
+        llm_metrics_path = output_dir / f"{repo_name}.llm-metrics.yaml"
+        llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
 
         try:
             if output_path.exists() and not args.force:
@@ -237,10 +271,17 @@ async def generate_dockerfile(
                     prompt += render_repeated_lint_guardrail(failed_lint_attempts)
 
                 log_info(f"Generating Dockerfile for {repo_url} (lint attempt {lint_attempt})...")
-                response = await client.chat.completions.create(
+                response = await chat_completion_with_retries(
+                    client=client,
                     model=args.model,
                     temperature=args.temperature,
                     messages=[{"role": "user", "content": prompt}],
+                    repo_url=repo_url,
+                    phase="dockerfile",
+                    metrics=llm_metrics,
+                    timeout_seconds=args.dockerfile_timeout,
+                    max_retries=args.llm_max_retries,
+                    retry_backoff_seconds=args.llm_retry_backoff_seconds,
                 )
                 raw = response.choices[0].message.content.strip()
                 dockerfile_content = extract_dockerfile(raw)
@@ -302,10 +343,17 @@ async def generate_dockerfile(
                 .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
             )
             log_info(f"Generating build verification command for {repo_url}...")
-            verify_response = await client.chat.completions.create(
+            verify_response = await chat_completion_with_retries(
+                client=client,
                 model=args.model,
                 temperature=args.temperature,
                 messages=[{"role": "user", "content": verify_prompt}],
+                repo_url=repo_url,
+                phase="dockerfile-verify-cmd",
+                metrics=llm_metrics,
+                timeout_seconds=args.verify_cmd_timeout,
+                max_retries=args.llm_max_retries,
+                retry_backoff_seconds=args.llm_retry_backoff_seconds,
             )
             verify_command = verify_response.choices[0].message.content.strip().strip("`")
             if verify_response.usage:
@@ -314,6 +362,10 @@ async def generate_dockerfile(
             with open(verify_command_path, "w", encoding="utf-8") as verify_file:
                 verify_file.write(verify_command + "\n")
             log_info(f"Saved build verification command to {verify_command_path}: {verify_command}")
+
+            with open(llm_metrics_path, "w", encoding="utf-8") as metrics_file:
+                metrics_file.write(render_yaml(finalize_llm_metrics(llm_metrics)))
+            log_info(f"LLM metrics saved at {llm_metrics_path}")
 
         except httpx.HTTPError as error:
             log_warn(f"HTTP error for {repo_url}: {error}")
@@ -326,6 +378,8 @@ async def generate_dockerfile(
         except Exception as error:
             log_error(f"Unexpected error while generating Dockerfile for {repo_url}: {error}")
         finally:
+            with open(llm_metrics_path, "w", encoding="utf-8") as metrics_file:
+                metrics_file.write(render_yaml(finalize_llm_metrics(llm_metrics)))
             await update_progress(progress_state, repo_name)
 
 
