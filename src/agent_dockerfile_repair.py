@@ -123,7 +123,8 @@ set_trace_enabled(args.trace)
 # or build instructions from the repo context.
 _DELETE_DOCS_EXTENSIONS: tuple[str, ...] = (
     # Markup documentation
-    ".md", ".rst", ".adoc", ".asciidoc", ".textile", ".wiki",
+    # Keep markdown because many repositories require README/LICENSE files at build/test time.
+    ".rst", ".adoc", ".asciidoc", ".textile", ".wiki",
     # Office / print documents
     ".pdf", ".doc", ".docx", ".odt", ".rtf",
     # Other doc formats (avoid man-page style sources like .1-.8 that can be build inputs)
@@ -171,9 +172,14 @@ def delete_docs_build_context(repo_path: Path, repo_name: str) -> None:
         if item.is_dir():
             if item.name in _DELETE_DOCS_DIR_NAMES:
                 rel = item.relative_to(repo_path)
-                log_trace(f"[delete-docs {repo_name}] Removing CI/CD directory: {rel}")
-                shutil.rmtree(item)
-                removed_dirs.append(str(rel))
+                # Only delete top-level or second-level doc directories.
+                # Deeper directories named "doc" may be source modules (e.g., Rust crate submodules).
+                if len(rel.parts) <= 2:
+                    log_trace(f"[delete-docs {repo_name}] Removing CI/CD directory: {rel}")
+                    shutil.rmtree(item)
+                    removed_dirs.append(str(rel))
+                else:
+                    log_trace(f"[delete-docs {repo_name}] Skipping deep source dir: {rel}")
         elif item.is_file():
             if item.suffix.lower() in _DELETE_DOCS_EXTENSIONS:
                 rel = item.relative_to(repo_path)
@@ -254,6 +260,71 @@ def trim_log(log: str) -> str:
 
     half = args.max_log_chars // 2
     return log[:half] + "\n\n... [log truncated] ...\n\n" + log[-half:]
+
+
+def _extract_evidence_lines(log: str, keywords: list[str], limit: int = 3) -> list[str]:
+    evidence: list[str] = []
+    lowered_keywords = [value.lower() for value in keywords]
+    for raw_line in log.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(keyword in lowered for keyword in lowered_keywords):
+            evidence.append(line)
+            if len(evidence) >= limit:
+                break
+    return evidence
+
+
+def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool) -> dict:
+    lowered = log.lower()
+
+    if timed_out or exit_code == 124:
+        return {
+            "phase": phase,
+            "category": "timeout",
+            "confidence": "high",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "evidence": _extract_evidence_lines(log, ["timeout", "timed out", "exit_code: 124"]),
+        }
+
+    category_rules: list[tuple[str, list[str], str]] = [
+        ("python_missing", ["env: 'python': no such file or directory", "env: ''python'': no such file or directory", "python: not found"], "high"),
+        ("shell_missing", ["no usable shell found", "unable to find executable file", "exec: \"/bin/sh\": stat /bin/sh: no such file or directory"], "high"),
+        ("missing_command", ["command not found", "not found in $path", "executable file not found"], "high"),
+        ("permission_error", ["permission denied", "operation not permitted", "eacces"], "high"),
+        ("network_tls", ["certificate verify failed", "x509", "pkix", "unable to get local issuer certificate", "self-signed certificate"], "medium"),
+        ("network_resolution", ["could not resolve host", "temporary failure resolving", "connection timed out"], "medium"),
+        ("missing_dependency", ["unable to locate package", "no package", "not installed", "could not find", "fatal error:"], "medium"),
+    ]
+
+    for category, keywords, confidence in category_rules:
+        if any(keyword in lowered for keyword in keywords):
+            return {
+                "phase": phase,
+                "category": category,
+                "confidence": confidence,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "evidence": _extract_evidence_lines(log, keywords),
+            }
+
+    return {
+        "phase": phase,
+        "category": "unknown",
+        "confidence": "low",
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "evidence": _extract_evidence_lines(log, ["error", "failed", "exception"]),
+    }
+
+
+def render_failure_hints_for_prompt(failure_hints: dict | None) -> str:
+    if not failure_hints:
+        return ""
+    return json.dumps(failure_hints, indent=2, sort_keys=True)
 
 
 def write_text(path: Path, content: str) -> None:
@@ -499,6 +570,7 @@ async def request_repair(
     summary: str,
     dockerfile_content: str,
     build_log: str,
+    failure_hints: dict | None,
     llm_metrics: dict,
 ) -> str:
     base_template = get_base_template(classification)
@@ -511,6 +583,18 @@ async def request_repair(
         .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
         .replace("{{BUILD_LOG}}", trim_log(build_log))
     )
+    if failure_hints:
+        prompt += (
+            "\n\nUse these normalized failure hints as primary guidance for your fix."
+            "\nPrefer addressing high-confidence categories first."
+            f"\n\nFAILURE_HINTS_JSON:\n{render_failure_hints_for_prompt(failure_hints)}\n"
+        )
+        if failure_hints.get("category") == "python_missing":
+            prompt += (
+                "\nTargeted remediation hint: build tooling expects `python` on PATH."
+                "\nPrefer adding `python-is-python3` (Debian/Ubuntu) or a safe equivalent symlink in the image,"
+                "\nrather than editing project source or skipping required build steps.\n"
+            )
 
     response = await chat_completion_with_retries(
         client=client,
@@ -535,6 +619,7 @@ async def request_verification_command_repair(
     dockerfile_content: str,
     current_verify_command: str,
     verify_log: str,
+    failure_hints: dict | None,
     llm_metrics: dict,
 ) -> str:
     prompt = (
@@ -555,6 +640,11 @@ async def request_verification_command_repair(
         f"\n\nPrevious command:\n{current_verify_command}"
         f"\n\nFailure log:\n{trim_log(verify_log)}\n"
     )
+    if failure_hints:
+        prompt += (
+            "\nUse these normalized failure hints to choose a command that matches the actual runtime context."
+            f"\n\nFAILURE_HINTS_JSON:\n{render_failure_hints_for_prompt(failure_hints)}\n"
+        )
 
     response = await chat_completion_with_retries(
         client=client,
@@ -753,6 +843,9 @@ async def repair_repository(
                     }
                 )
 
+                build_failure_hints = extract_failure_hints(build_log, "build", exit_code, timed_out=False)
+                report["attempts"][-1]["failure_hints_build"] = build_failure_hints
+
                 if exit_code == 0:
                     verify_log_path = report_dir / f"attempt-{attempt}.verify.log"
                     log_info(
@@ -772,6 +865,8 @@ async def repair_repository(
                         "command": verify_cmd_list,
                         "log": str(verify_log_path),
                     }
+                    verify_failure_hints = extract_failure_hints(verify_log, "verify", verify_exit_code, verify_timed_out)
+                    report["attempts"][-1]["failure_hints_verify"] = verify_failure_hints
 
                     if verify_exit_code == 0:
                         report["success"] = True
@@ -821,6 +916,7 @@ async def repair_repository(
                             dockerfile_content=current_dockerfile,
                             current_verify_command=verify_command_to_use,
                             verify_log=verify_log,
+                            failure_hints=verify_failure_hints,
                             llm_metrics=llm_metrics,
                         )
                     )
@@ -853,6 +949,8 @@ async def repair_repository(
                         "command": retry_cmd_list,
                         "log": str(retry_verify_log_path),
                     }
+                    retry_failure_hints = extract_failure_hints(retry_verify_log, "verify-retry", retry_exit_code, retry_timed_out)
+                    report["attempts"][-1]["failure_hints_verify_retry"] = retry_failure_hints
 
                     if retry_exit_code == 0:
                         report["success"] = True
@@ -908,6 +1006,11 @@ async def repair_repository(
                         summary=summary,
                         dockerfile_content=current_dockerfile,
                         build_log=build_log,
+                        failure_hints={
+                            "build": build_failure_hints,
+                            "verify": verify_failure_hints,
+                            "verify_retry": retry_failure_hints,
+                        },
                         llm_metrics=llm_metrics,
                     )
                     current_dockerfile, stop = _apply_repair(
@@ -948,6 +1051,7 @@ async def repair_repository(
                     summary=summary,
                     dockerfile_content=current_dockerfile,
                     build_log=build_log,
+                    failure_hints={"build": build_failure_hints},
                     llm_metrics=llm_metrics,
                 )
                 current_dockerfile, stop = _apply_repair(

@@ -201,8 +201,8 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
     - Java keystore import into the DEFAULT OpenJDK keystore (preserves public root CAs)
     - Rust/cargo CA configuration
     """
-    def ensure_root_for_chown(content: str) -> str:
-        """Ensure RUN chown commands execute as root, then restore prior user."""
+    def ensure_root_for_sensitive_runs(content: str) -> str:
+        """Ensure privileged RUN commands execute as root, then restore prior user."""
         lines_local = content.split("\n")
         rewritten: list[str] = []
         current_user = "root"
@@ -218,8 +218,14 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
                 rewritten.append(raw_line)
                 continue
 
-            is_chown_run = upper.startswith("RUN ") and "CHOWN" in upper
-            if is_chown_run and current_user not in {"root", "0"}:
+            is_run = upper.startswith("RUN ")
+            is_chown_run = is_run and "CHOWN" in upper
+            uses_root_scoped_path = is_run and any(
+                p in upper for p in ("/ROOT/", "/USR/BIN/", "/USR/LOCAL/BIN/", "/BIN/", "/SBIN/", "/USR/SBIN/", "/OPT/")
+            )
+            needs_root = is_chown_run or uses_root_scoped_path
+
+            if needs_root and current_user not in {"root", "0"}:
                 rewritten.append("USER root")
                 rewritten.append(raw_line)
                 rewritten.append(f"USER {current_user}")
@@ -231,11 +237,11 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
     if not ca_cert_b64:
         ca_cert_b64 = os.getenv("MANUALREPOS_CA_CERT_B64")
     if not ca_cert_b64:
-        return ensure_root_for_chown(dockerfile_content)
+        return ensure_root_for_sensitive_runs(dockerfile_content)
 
     # Avoid repeatedly injecting very large CA blocks on retries/repair passes.
     if "manualrepos-refresh-ca-certificates" in dockerfile_content:
-        return ensure_root_for_chown(dockerfile_content)
+        return ensure_root_for_sensitive_runs(dockerfile_content)
 
     decoded_bundle = base64.b64decode(ca_cert_b64).decode("utf-8")
     cert_blocks = []
@@ -318,7 +324,7 @@ ENV MAVEN_OPTS="-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.n
         else:
             injected_lines.append(line)
 
-    return ensure_root_for_chown("\n".join(injected_lines))
+    return ensure_root_for_sensitive_runs("\n".join(injected_lines))
 
 
 def repo_name_from_url(repo_url: str) -> str:

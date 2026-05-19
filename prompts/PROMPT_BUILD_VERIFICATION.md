@@ -11,6 +11,7 @@ The command will be executed inside the final runtime image via:
 - Optimize for quick deterministic verification suitable for evaluation runs: prefer checks that usually finish in under 30 seconds.
 - If the repository ships an executable, CLI, example binary, or test binary that can run in the final image without network or file side-effects, prefer running that directly (for example `app --version`, `app --help`, an example binary, or the installed test binary).
 - If the repository ships a test suite that can run in the final image without network or file side-effects, prefer a targeted smoke test command over a full test suite.
+- Avoid full repository test suites by default (`npm test`, `pnpm test`, `cargo test --all`, `pytest` across full tree). Use them only when no lightweight runtime verification path exists.
 - For libraries without a runnable binary in the final image: verify the expected installed artifacts are present in the final image, such as shared libraries, headers, modules, or package metadata. Do not fall back to linker-cache checks as the main verification strategy.
 - For executables or CLI tools: invoke the binary with --version, --help, or a trivial no-op argument.
 - For services, daemons, or server processes: do not require a long-running background process or pre-existing listener just to verify the image. Prefer a foreground self-check, a version/help command, an offline test binary, or verification of installed runtime artifacts.
