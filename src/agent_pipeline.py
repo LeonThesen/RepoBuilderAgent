@@ -153,7 +153,7 @@ parser.add_argument("--skip-install-guide", action="store_true", help="Skip the 
 parser.add_argument(
     "--variant",
     default="flat_baseline",
-    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "one_shot_direct"],
+    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "one_shot_direct"],
     help="Pipeline variant for ablation runs.",
 )
 parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
@@ -693,6 +693,22 @@ def resolve_phase_skips() -> dict[str, bool]:
 
 
 def resolve_variant_policy() -> dict:
+    if args.variant == "ab_prev_attempt_ctx_on":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "iterative_exploration",
+            "stateful_repair_enabled": True,
+            "stateful_tree_enabled": False,
+            "prev_attempt_context_enabled": True,
+        }
+
     if args.variant == "full_system":
         return {
             "phase2_anchor": False,
@@ -820,6 +836,14 @@ def main() -> int:
         if args.stateful_repair_tree:
             log_info(f"Variant {args.variant} selected: forcing stateful repair tree OFF for phase-2 ladder consistency.")
         args.stateful_repair = False
+        args.stateful_repair_tree = False
+
+    if args.variant == "ab_prev_attempt_ctx_on":
+        if not args.stateful_repair:
+            log_info("Variant ab_prev_attempt_ctx_on selected: forcing stateful repair ON for AB-19A.")
+        if args.stateful_repair_tree:
+            log_info("Variant ab_prev_attempt_ctx_on selected: forcing stateful repair tree OFF for AB-19A isolation.")
+        args.stateful_repair = True
         args.stateful_repair_tree = False
 
     variant_policy = resolve_variant_policy()
