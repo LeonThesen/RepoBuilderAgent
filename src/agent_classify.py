@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import yaml
+import math
 from tqdm import tqdm
 import glob
 import shutil
@@ -31,7 +32,7 @@ try:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files, select_files_by_bm25
+    from RepoBuilderAgent.src.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
     from RepoBuilderAgent.src.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
@@ -44,7 +45,7 @@ except ImportError:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files, select_files_by_bm25
+    from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
     from log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -94,8 +95,13 @@ parser.add_argument("--no-analysis", action="store_true", help="Skip running the
 parser.add_argument(
     "--retrieval-strategy",
     default="iterative_react",
-    choices=["iterative_react", "bm25"],
+    choices=["iterative_react", "bm25", "neural_embedding"],
     help="Step 1.1 repository evidence-selection strategy.",
+)
+parser.add_argument(
+    "--embedding-model",
+    default=os.getenv("LLM_EMBEDDING_MODEL", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")),
+    help="Embedding model used when --retrieval-strategy=neural_embedding.",
 )
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
@@ -286,6 +292,135 @@ def build_bm25_query_terms(repo_name: str) -> list[str]:
     repo_terms = re.findall(r"[a-z0-9]+", repo_name.lower())
     return fixed_terms + repo_terms
 
+
+def build_embedding_query_text(repo_name: str) -> str:
+    terms = build_bm25_query_terms(repo_name)
+    return (
+        "Find repository files that best explain how to install, build, verify, and package this project. "
+        "Prefer manifests, READMEs, Dockerfiles, CI workflows, and dependency configuration. "
+        f"Repository: {repo_name}. Keywords: {' '.join(terms)}"
+    )
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def build_local_dense_embedding(text: str, dimensions: int = 256) -> list[float]:
+    vector = [0.0] * dimensions
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+
+    for token in tokens:
+        vector[hash(f"tok:{token}") % dimensions] += 1.0
+
+    compact = text.lower().replace("\n", " ")
+    for index in range(max(len(compact) - 2, 0)):
+        trigram = compact[index:index + 3]
+        if trigram.strip():
+            vector[hash(f"tri:{trigram}") % dimensions] += 0.25
+
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0.0:
+        return vector
+    return [value / norm for value in vector]
+
+
+def select_files_by_local_embedding(query_text: str, candidates: list[tuple[str, str]], top_k: int = 12) -> list[str]:
+    high_signal_names = {
+        "readme.md",
+        "readme.rst",
+        "readme.txt",
+        "install.md",
+        "install.txt",
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "go.mod",
+        "cargo.toml",
+        "dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "makefile",
+        "cmakelists.txt",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+        "gemfile",
+        "composer.json",
+        "setup.py",
+        "setup.cfg",
+        "pipfile",
+        "pipfile.lock",
+        ".env.example",
+    }
+    query_embedding = build_local_dense_embedding(query_text)
+    ranked: list[tuple[float, str]] = []
+
+    for rel, content in candidates:
+        candidate_embedding = build_local_dense_embedding(f"Path: {rel}\n\nContent:\n{content}")
+        score = cosine_similarity(query_embedding, candidate_embedding)
+        rel_lower = rel.lower()
+        basename = Path(rel_lower).name
+        if basename in high_signal_names:
+            score += 0.4
+        elif basename.startswith(("readme", "install")):
+            score += 0.2
+        if rel_lower.startswith(".github/workflows/"):
+            score += 0.05
+        ranked.append((score, rel))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [rel for _, rel in ranked[:top_k]]
+
+
+async def select_files_by_neural_embedding(repo_name: str, repo_path: Path, top_k: int = 12) -> list[str]:
+    candidates = collect_retrieval_candidates(repo_path)
+    if not candidates:
+        return []
+
+    query_text = build_embedding_query_text(repo_name)
+    candidate_payloads = [f"Path: {rel}\n\nContent:\n{content}" for rel, content in candidates]
+
+    try:
+        query_response = await client.embeddings.create(model=args.embedding_model, input=[query_text])
+        query_embedding = query_response.data[0].embedding
+
+        ranked: list[tuple[float, str]] = []
+        batch_size = 32
+        for start in range(0, len(candidate_payloads), batch_size):
+            batch_payloads = candidate_payloads[start:start + batch_size]
+            batch_candidates = candidates[start:start + batch_size]
+            batch_response = await client.embeddings.create(model=args.embedding_model, input=batch_payloads)
+            for item, (rel, _) in zip(batch_response.data, batch_candidates):
+                score = cosine_similarity(query_embedding, item.embedding)
+                ranked.append((score, rel))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [rel for _, rel in ranked[:top_k]]
+    except httpx.HTTPError as e:
+        log_warn(f"Embedding retrieval HTTP error for {repo_name}: {e}. Falling back to local dense retrieval.")
+    except ssl.SSLError as e:
+        log_warn(f"Embedding retrieval SSL error for {repo_name}: {e}. Falling back to local dense retrieval.")
+    except APITimeoutError as e:
+        log_warn(f"Embedding retrieval timeout for {repo_name}: {e}. Falling back to local dense retrieval.")
+    except APIError as e:
+        log_warn(f"Embedding retrieval API error for {repo_name}: {e}. Falling back to local dense retrieval.")
+    except Exception as e:
+        log_warn(f"Embedding retrieval unexpected error for {repo_name}: {e}. Falling back to local dense retrieval.")
+
+    return select_files_by_local_embedding(query_text, candidates, top_k=top_k)
+
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
@@ -351,6 +486,12 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     log_warn(f"BM25 selection returned no files for {repo_url}; using defaults.")
                     selected_files = default_selected_files.copy()
                 log_info(f"Selected {len(selected_files)} files for {repo_name} via BM25 retrieval.")
+            elif args.retrieval_strategy == "neural_embedding":
+                selected_files = await select_files_by_neural_embedding(repo_name, repo_path)
+                if not selected_files:
+                    log_warn(f"Neural embedding selection returned no files for {repo_url}; using defaults.")
+                    selected_files = default_selected_files.copy()
+                log_info(f"Selected {len(selected_files)} files for {repo_name} via neural embedding retrieval.")
             else:
                 selection_prompt = (
                     SELECT_FILES_PROMPT_TEMPLATE

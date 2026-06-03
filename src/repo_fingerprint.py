@@ -158,7 +158,7 @@ def _iter_selected_file_matches(root: Path, pattern: str):
             yield file_rel, file_path
 
 
-def _collect_retrieval_candidates(root: Path, max_bytes: int = 4096) -> list[tuple[str, str]]:
+def collect_retrieval_candidates(root: Path, max_bytes: int = 4096) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     exact_names = {
         "readme.md",
@@ -409,7 +409,7 @@ def _tokenize_text(value: str) -> list[str]:
 
 def select_files_by_bm25(root: Path, query_terms: list[str], top_k: int = 12) -> list[str]:
     """Rank manifest/config files using a lightweight BM25 scorer."""
-    candidates = _collect_retrieval_candidates(root)
+    candidates = collect_retrieval_candidates(root)
     if not candidates:
         return []
 

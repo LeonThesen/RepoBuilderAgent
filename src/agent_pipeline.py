@@ -153,7 +153,7 @@ parser.add_argument("--skip-install-guide", action="store_true", help="Skip the 
 parser.add_argument(
     "--variant",
     default="flat_baseline",
-    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "one_shot_direct"],
+    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "one_shot_direct"],
     help="Pipeline variant for ablation runs.",
 )
 parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
@@ -696,10 +696,25 @@ def resolve_phase_skips() -> dict[str, bool]:
 def resolve_classify_retrieval_strategy() -> str:
     if args.variant == "ab_retrieval_bm25":
         return "bm25"
+    if args.variant == "ab_retrieval_neural_embedding":
+        return "neural_embedding"
     return "iterative_react"
 
 
 def resolve_variant_policy() -> dict:
+    if args.variant == "ab_retrieval_neural_embedding":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "neural_embedding_retrieval",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "neural_embedding",
+        }
+
     if args.variant == "ab_retrieval_bm25":
         return {
             "phase2_anchor": False,
@@ -882,7 +897,7 @@ def main() -> int:
         log_info("Variant one_shot_direct selected: disabling --run-analysis because classification is skipped.")
         args.run_analysis = False
 
-    if args.variant in {"flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_retrieval_bm25"}:
+    if args.variant in {"flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_retrieval_bm25", "ab_retrieval_neural_embedding"}:
         if args.stateful_repair:
             log_info(f"Variant {args.variant} selected: forcing stateful repair OFF for phase-2 ladder consistency.")
         if args.stateful_repair_tree:
