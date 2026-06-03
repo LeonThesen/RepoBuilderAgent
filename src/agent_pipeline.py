@@ -150,6 +150,12 @@ parser.add_argument("--skip-classify", action="store_true", help="Skip the class
 parser.add_argument("--skip-dockerfile", action="store_true", help="Skip the Dockerfile generation phase")
 parser.add_argument("--skip-repair", action="store_true", help="Skip the Dockerfile repair phase")
 parser.add_argument("--skip-install-guide", action="store_true", help="Skip the INSTALL.md generation phase")
+parser.add_argument(
+    "--variant",
+    default="flat_baseline",
+    choices=["flat_baseline", "one_shot_direct"],
+    help="Pipeline variant for ablation runs.",
+)
 parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
 parser.add_argument("--pipeline-reports-dir", default="pipeline-reports", help="Directory where pipeline logs and summary are written")
 parser.add_argument("--pipeline-summary-path", default="", help="Optional explicit path for the pipeline summary YAML")
@@ -394,6 +400,8 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
     command = build_agent_command(python_executable, script_path)
     if args.force:
         command.append("--force")
+    if args.variant == "one_shot_direct":
+        command.append("--one-shot-direct")
     command.extend([
         "--dockerfile-timeout", str(args.dockerfile_timeout),
         "--verify-cmd-timeout", str(args.verify_cmd_timeout),
@@ -670,6 +678,20 @@ def print_planned_summary() -> None:
     print(summary_text, end="")
 
 
+def resolve_phase_skips() -> dict[str, bool]:
+    skips = {
+        "classify": args.skip_classify,
+        "dockerfile": args.skip_dockerfile,
+        "repair": args.skip_repair,
+        "install_guide": args.skip_install_guide,
+    }
+    if args.variant == "one_shot_direct":
+        skips["classify"] = True
+        skips["repair"] = True
+        skips["install_guide"] = True
+    return skips
+
+
 def main() -> int:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     pipeline_started_ts = time.perf_counter()
@@ -703,10 +725,15 @@ def main() -> int:
         print_planned_summary()
         return 0
 
-    phases_selected = not (args.skip_classify and args.skip_dockerfile and args.skip_repair and args.skip_install_guide)
+    phase_skips = resolve_phase_skips()
+    phases_selected = not (phase_skips["classify"] and phase_skips["dockerfile"] and phase_skips["repair"] and phase_skips["install_guide"])
     if not phases_selected and not args.run_analysis:
         log_error("Nothing to do. All pipeline phases were skipped and --run-analysis was not set.")
         return 1
+
+    if args.variant == "one_shot_direct" and args.run_analysis:
+        log_info("Variant one_shot_direct selected: disabling --run-analysis because classification is skipped.")
+        args.run_analysis = False
 
     summary: dict = {
         "run_id": run_id,
@@ -717,6 +744,12 @@ def main() -> int:
         "trace": {
             "enabled": args.trace,
             "forwarded_to_child_agents": args.trace,
+        },
+        "variant": args.variant,
+        "variant_policy": {
+            "repo_context_source": "static_fingerprint_only" if args.variant == "one_shot_direct" else "staged_pipeline",
+            "classification_required": args.variant != "one_shot_direct",
+            "repair_enabled": args.variant != "one_shot_direct",
         },
         "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
         "paths": {
@@ -737,7 +770,7 @@ def main() -> int:
     }
 
     try:
-        if not args.skip_classify:
+        if not phase_skips["classify"]:
             summary["phases"].append(
                 run_step(
                     "classification",
@@ -755,7 +788,7 @@ def main() -> int:
                 )
             )
 
-        if not args.skip_dockerfile:
+        if not phase_skips["dockerfile"]:
             summary["phases"].append(
                 run_step(
                     "dockerfile generation",
@@ -764,7 +797,7 @@ def main() -> int:
                 )
             )
 
-        if not args.skip_repair:
+        if not phase_skips["repair"]:
             summary["phases"].append(
                 run_step(
                     "dockerfile repair",
@@ -773,7 +806,7 @@ def main() -> int:
                 )
             )
 
-        if not args.skip_install_guide:
+        if not phase_skips["install_guide"]:
             summary["phases"].append(
                 run_step(
                     "install guide generation",
@@ -796,7 +829,7 @@ def main() -> int:
     if summary["status"] != "success":
         return 1
 
-    if not args.skip_repair:
+    if not phase_skips["repair"]:
         repair_outcomes = collect_repair_outcomes(Path(args.reports_dir))
         log_info(
             f"Build outcomes ({repair_outcomes['total_reports']} reports)"

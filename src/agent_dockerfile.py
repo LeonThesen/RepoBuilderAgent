@@ -36,6 +36,7 @@ try:
         update_progress,
         validate_dockerfile_syntax,
     )
+    from RepoBuilderAgent.src.repo_fingerprint import fingerprint
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import config as _config
@@ -63,6 +64,7 @@ except ImportError:
         update_progress,
         validate_dockerfile_syntax,
     )
+    from repo_fingerprint import fingerprint
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -102,6 +104,7 @@ parser.add_argument("--dockerfile-timeout", type=int, default=int(TIMEOUTS["dock
 parser.add_argument("--verify-cmd-timeout", type=int, default=int(TIMEOUTS["verify_cmd_timeout"]), help="Timeout for verification command generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated Dockerfiles")
+parser.add_argument("--one-shot-direct", action="store_true", help="Generate Dockerfile from static repository fingerprint only, without classification outputs")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
@@ -175,6 +178,64 @@ def get_base_template(classification: dict) -> str:
 
     log_error(f"Base template not found at {template_path}")
     return ""
+
+
+def infer_language_from_repo(repo_path: Path) -> str:
+    checks = [
+        ("pyproject.toml", "python"),
+        ("requirements.txt", "python"),
+        ("package.json", "typescript"),
+        ("Cargo.toml", "rust"),
+        ("pom.xml", "java"),
+        ("build.gradle", "java"),
+        ("build.gradle.kts", "java"),
+        ("CMakeLists.txt", "cpp"),
+        ("Makefile", "c"),
+    ]
+    for rel, language in checks:
+        if (repo_path / rel).exists():
+            return language
+
+    extension_counts: dict[str, int] = {"python": 0, "typescript": 0, "rust": 0, "java": 0, "cpp": 0, "c": 0}
+    for file_path in repo_path.rglob("*"):
+        if not file_path.is_file():
+            continue
+        suffix = file_path.suffix.lower()
+        if suffix == ".py":
+            extension_counts["python"] += 1
+        elif suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            extension_counts["typescript"] += 1
+        elif suffix == ".rs":
+            extension_counts["rust"] += 1
+        elif suffix in {".java", ".kt"}:
+            extension_counts["java"] += 1
+        elif suffix in {".cpp", ".cc", ".cxx", ".hpp", ".hh"}:
+            extension_counts["cpp"] += 1
+        elif suffix in {".c", ".h"}:
+            extension_counts["c"] += 1
+
+    inferred = max(extension_counts, key=extension_counts.get)
+    return inferred if extension_counts[inferred] > 0 else "c"
+
+
+def build_synthetic_classification(repo_url: str, inferred_language: str) -> dict:
+    normalized = {
+        "python": ["Python"],
+        "typescript": ["TypeScript"],
+        "rust": ["Rust"],
+        "java": ["Java"],
+        "cpp": ["C++"],
+        "c": ["C"],
+    }.get(inferred_language, ["C"])
+    return {
+        "repo": repo_url,
+        "mode": "one_shot_direct",
+        "categories": {
+            "programming_language": {
+                "value": normalized,
+            }
+        },
+    }
 
 
 def render_failed_lint_attempts(failed_attempts: list[dict[str, str]]) -> str:
@@ -266,19 +327,36 @@ async def generate_dockerfile(
                 log_info(f"Skipping {repo_url}: existing Dockerfile found at {output_path}")
                 return
 
-            classification_path = results_dir / f"{repo_name}.yaml"
-            classification = read_yaml_file(classification_path)
-            if not classification:
-                log_warn(
-                    f"Skipping {repo_url}: classification result missing at {classification_path}. Run agent_classify.py first."
-                )
-                return
-
             repo_path = repos_dir / repo_name
             if not await ensure_repo_checkout(repo_url, repo_path, "skipping Dockerfile generation"):
                 return
 
-            summary = load_summary(repo_name, repo_path, summaries_dir)
+            if args.one_shot_direct:
+                inferred_language = infer_language_from_repo(repo_path)
+                classification = build_synthetic_classification(repo_url, inferred_language)
+                summary = fingerprint(
+                    format="md",
+                    repo_path=str(repo_path),
+                    structure_only=False,
+                    selected_files=None,
+                    include_tree=True,
+                    context="one-shot-direct-static",
+                )
+                llm_metrics["one_shot_direct"] = {
+                    "enabled": True,
+                    "context_source": "static_fingerprint_only",
+                    "inferred_language": inferred_language,
+                }
+            else:
+                classification_path = results_dir / f"{repo_name}.yaml"
+                classification = read_yaml_file(classification_path)
+                if not classification:
+                    log_warn(
+                        f"Skipping {repo_url}: classification result missing at {classification_path}. Run agent_classify.py first."
+                    )
+                    return
+                summary = load_summary(repo_name, repo_path, summaries_dir)
+
             base_template = get_base_template(classification)
 
             # Regenerate until Hadolint accepts the Dockerfile. These retries do not
