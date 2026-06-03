@@ -31,7 +31,7 @@ try:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
+    from RepoBuilderAgent.src.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files, select_files_by_bm25
     from RepoBuilderAgent.src.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
@@ -44,7 +44,7 @@ except ImportError:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
+    from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files, select_files_by_bm25
     from log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -91,6 +91,12 @@ parser.add_argument("--summaries-dir", default="summaries", help="Directory cont
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
 parser.add_argument("--analysis-dir", default="analysis", help="Directory containing aggregated analysis outputs")
 parser.add_argument("--no-analysis", action="store_true", help="Skip running the analysis script after completion")
+parser.add_argument(
+    "--retrieval-strategy",
+    default="iterative_react",
+    choices=["iterative_react", "bm25"],
+    help="Step 1.1 repository evidence-selection strategy.",
+)
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
@@ -253,6 +259,33 @@ def extract_selected_files(raw: str) -> list[str]:
         cleaned.append(p)
     return cleaned
 
+
+def build_bm25_query_terms(repo_name: str) -> list[str]:
+    fixed_terms = [
+        "install",
+        "installation",
+        "build",
+        "setup",
+        "dependency",
+        "dependencies",
+        "requirements",
+        "package",
+        "docker",
+        "workflow",
+        "ci",
+        "compile",
+        "test",
+        "make",
+        "cmake",
+        "gradle",
+        "maven",
+        "cargo",
+        "npm",
+        "pip",
+    ]
+    repo_terms = re.findall(r"[a-z0-9]+", repo_name.lower())
+    return fixed_terms + repo_terms
+
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
@@ -310,50 +343,58 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             with open(structure_summary_path, "w") as f:
                 f.write(structure_summary)
 
-            selection_prompt = (
-                SELECT_FILES_PROMPT_TEMPLATE
-                .replace("{{REPO_URL}}", repo_url)
-                .replace("{{STRUCTURE_CONTENT}}", structure_summary)
-            )
-            step1_tokens = estimate_tokens(selection_prompt, args.model)
-            log_info(f"Prompt tokens for {repo_name} step1-selection: {step1_tokens:,}")
-
             selected_files = default_selected_files.copy()
-            try:
-                log_info(f"Sending step1-selection prompt for {repo_url}...")
-                selection_response = await chat_completion_with_retries(
-                    client=client,
-                    model=args.model,
-                    temperature=EFFECTIVE_TEMPERATURE,
-                    messages=[{"role": "user", "content": selection_prompt}],
-                    repo_url=repo_url,
-                    phase="classify-step1-selection",
-                    metrics=llm_metrics,
-                    timeout_seconds=args.selection_timeout,
-                    max_retries=args.llm_max_retries,
-                    retry_backoff_seconds=args.llm_retry_backoff_seconds,
+            step1_tokens = 0
+            if args.retrieval_strategy == "bm25":
+                selected_files = select_files_by_bm25(repo_path, build_bm25_query_terms(repo_name))
+                if not selected_files:
+                    log_warn(f"BM25 selection returned no files for {repo_url}; using defaults.")
+                    selected_files = default_selected_files.copy()
+                log_info(f"Selected {len(selected_files)} files for {repo_name} via BM25 retrieval.")
+            else:
+                selection_prompt = (
+                    SELECT_FILES_PROMPT_TEMPLATE
+                    .replace("{{REPO_URL}}", repo_url)
+                    .replace("{{STRUCTURE_CONTENT}}", structure_summary)
                 )
-                raw_selection = (selection_response.choices[0].message.content or "").strip()
-                log_trace(f"Received step1-selection response for {repo_name}")
-                if selection_response.usage:
-                    log_info(f"[TOKENS] {json.dumps({'phase': 'classify-step1', 'repo': repo_url, 'prompt_tokens': selection_response.usage.prompt_tokens, 'completion_tokens': selection_response.usage.completion_tokens, 'total_tokens': selection_response.usage.total_tokens})}")
-                parsed_selection = extract_selected_files(raw_selection)
-                if parsed_selection:
-                    selected_files = parsed_selection
-                else:
-                    log_warn(f"No selected files returned for {repo_url}; using defaults.")
-            except httpx.HTTPError as e:
-                log_warn(f"Selection HTTP error for {repo_url}: {e}. Using default file selection.")
-            except ssl.SSLError as e:
-                log_warn(f"Selection SSL error for {repo_url}: {e}. Using default file selection.")
-            except APITimeoutError as e:
-                log_warn(f"Selection timeout for {repo_url}: {e}. Using default file selection.")
-            except APIError as e:
-                log_warn(f"Selection API error for {repo_url}: {e}. Using default file selection.")
+                step1_tokens = estimate_tokens(selection_prompt, args.model)
+                log_info(f"Prompt tokens for {repo_name} step1-selection: {step1_tokens:,}")
+
+                try:
+                    log_info(f"Sending step1-selection prompt for {repo_url}...")
+                    selection_response = await chat_completion_with_retries(
+                        client=client,
+                        model=args.model,
+                        temperature=EFFECTIVE_TEMPERATURE,
+                        messages=[{"role": "user", "content": selection_prompt}],
+                        repo_url=repo_url,
+                        phase="classify-step1-selection",
+                        metrics=llm_metrics,
+                        timeout_seconds=args.selection_timeout,
+                        max_retries=args.llm_max_retries,
+                        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+                    )
+                    raw_selection = (selection_response.choices[0].message.content or "").strip()
+                    log_trace(f"Received step1-selection response for {repo_name}")
+                    if selection_response.usage:
+                        log_info(f"[TOKENS] {json.dumps({'phase': 'classify-step1', 'repo': repo_url, 'prompt_tokens': selection_response.usage.prompt_tokens, 'completion_tokens': selection_response.usage.completion_tokens, 'total_tokens': selection_response.usage.total_tokens})}")
+                    parsed_selection = extract_selected_files(raw_selection)
+                    if parsed_selection:
+                        selected_files = parsed_selection
+                    else:
+                        log_warn(f"No selected files returned for {repo_url}; using defaults.")
+                except httpx.HTTPError as e:
+                    log_warn(f"Selection HTTP error for {repo_url}: {e}. Using default file selection.")
+                except ssl.SSLError as e:
+                    log_warn(f"Selection SSL error for {repo_url}: {e}. Using default file selection.")
+                except APITimeoutError as e:
+                    log_warn(f"Selection timeout for {repo_url}: {e}. Using default file selection.")
+                except APIError as e:
+                    log_warn(f"Selection API error for {repo_url}: {e}. Using default file selection.")
 
             selected_files_path = summary_dir / f"{repo_name}.selected-files.yaml"
             with open(selected_files_path, "w") as f:
-                yaml.dump({"selected_files": selected_files}, f, sort_keys=False, allow_unicode=True)
+                yaml.dump({"retrieval_strategy": args.retrieval_strategy, "selected_files": selected_files}, f, sort_keys=False, allow_unicode=True)
 
             # Step 2: only selected file contents are provided to the classification prompt.
             summary = fingerprint(
@@ -401,6 +442,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             metrics = {
                 "repo": repo_url,
                 "model": args.model,
+                "retrieval_strategy": args.retrieval_strategy,
                 "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
                 "tokens": {
                     "baseline_full_classification": baseline_tokens,
