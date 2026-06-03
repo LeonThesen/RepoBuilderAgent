@@ -9,15 +9,35 @@ from pathlib import Path
 try:
     from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.log_utils import log_error, log_info, set_trace_enabled
+    from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import config as _config
     from log_utils import log_error, log_info, set_trace_enabled
+    from timeout_config import load_timeout_defaults
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
     OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 import yaml
+
+
+TIMEOUTS = load_timeout_defaults(
+    "agent_pipeline",
+    {
+        "timeout": 120,
+        "llm_max_retries": 2,
+        "llm_retry_backoff_seconds": 2.0,
+        "selection_timeout": 120,
+        "classification_timeout": 240,
+        "dockerfile_timeout": 240,
+        "verify_cmd_timeout": 180,
+        "repair_timeout": 240,
+        "verify_repair_timeout": 180,
+        "install_guide_timeout": 240,
+        "verify_timeout": 30,
+    },
+)
 
 
 parser = argparse.ArgumentParser(
@@ -34,16 +54,16 @@ parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for model calls")
-parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
-parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
-parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
-parser.add_argument("--selection-timeout", type=int, default=120, help="Timeout for classify step1 file-selection calls in seconds")
-parser.add_argument("--classification-timeout", type=int, default=240, help="Timeout for classify step2 classification calls in seconds")
-parser.add_argument("--dockerfile-timeout", type=int, default=240, help="Timeout for Dockerfile generation calls in seconds")
-parser.add_argument("--verify-cmd-timeout", type=int, default=180, help="Timeout for Dockerfile verification-command generation calls in seconds")
-parser.add_argument("--repair-timeout", type=int, default=240, help="Timeout for Dockerfile repair calls in seconds")
-parser.add_argument("--verify-repair-timeout", type=int, default=180, help="Timeout for verification-command repair calls in seconds")
-parser.add_argument("--install-guide-timeout", type=int, default=240, help="Timeout for install-guide generation calls in seconds")
+parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--selection-timeout", type=int, default=int(TIMEOUTS["selection_timeout"]), help="Timeout for classify step1 file-selection calls in seconds")
+parser.add_argument("--classification-timeout", type=int, default=int(TIMEOUTS["classification_timeout"]), help="Timeout for classify step2 classification calls in seconds")
+parser.add_argument("--dockerfile-timeout", type=int, default=int(TIMEOUTS["dockerfile_timeout"]), help="Timeout for Dockerfile generation calls in seconds")
+parser.add_argument("--verify-cmd-timeout", type=int, default=int(TIMEOUTS["verify_cmd_timeout"]), help="Timeout for Dockerfile verification-command generation calls in seconds")
+parser.add_argument("--repair-timeout", type=int, default=int(TIMEOUTS["repair_timeout"]), help="Timeout for Dockerfile repair calls in seconds")
+parser.add_argument("--verify-repair-timeout", type=int, default=int(TIMEOUTS["verify_repair_timeout"]), help="Timeout for verification-command repair calls in seconds")
+parser.add_argument("--install-guide-timeout", type=int, default=int(TIMEOUTS["install_guide_timeout"]), help="Timeout for install-guide generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated artifacts where supported")
 parser.add_argument("--learn", action="store_true", help="Enable learning of new manifest file patterns during classification")
@@ -62,7 +82,59 @@ parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum nu
 parser.add_argument("--skip-delete-docs", action="store_true", help="Skip deleting documentation and CI/CD files from the build context before building")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint before docker build")
 parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside built images to verify the build produced working software")
-parser.add_argument("--verify-timeout", type=int, default=30, help="Timeout in seconds for build verification container execution")
+parser.add_argument("--verify-timeout", type=int, default=int(TIMEOUTS["verify_timeout"]), help="Timeout in seconds for build verification container execution")
+stateful_group = parser.add_mutually_exclusive_group()
+stateful_group.add_argument(
+    "--stateful-repair",
+    dest="stateful_repair",
+    action="store_true",
+    help="Enable stateful Dockerfile repair prompts that include compact summaries of previous repair attempts.",
+)
+stateful_group.add_argument(
+    "--no-stateful-repair",
+    dest="stateful_repair",
+    action="store_false",
+    help="Disable stateful Dockerfile repair prompts.",
+)
+parser.set_defaults(stateful_repair=False)
+parser.add_argument(
+    "--stateful-history-window",
+    type=int,
+    default=4,
+    help="When stateful repair is enabled, include at most this many recent repair attempts in prompt history.",
+)
+parser.add_argument(
+    "--stateful-history-max-chars",
+    type=int,
+    default=4000,
+    help="Maximum characters from serialized repair history included in each stateful repair prompt.",
+)
+stateful_tree_group = parser.add_mutually_exclusive_group()
+stateful_tree_group.add_argument(
+    "--stateful-repair-tree",
+    dest="stateful_repair_tree",
+    action="store_true",
+    help="When stateful repair is enabled, also include a compact decision-tree summary of prior attempts.",
+)
+stateful_tree_group.add_argument(
+    "--no-stateful-repair-tree",
+    dest="stateful_repair_tree",
+    action="store_false",
+    help="Disable decision-tree serialization for stateful repair prompts.",
+)
+parser.set_defaults(stateful_repair_tree=False)
+parser.add_argument(
+    "--stateful-tree-max-chars",
+    type=int,
+    default=2500,
+    help="Maximum characters from serialized stateful decision tree included in each repair prompt.",
+)
+parser.add_argument(
+    "--stateful-tree-max-children",
+    type=int,
+    default=5,
+    help="Maximum child branches retained per decision-tree node before pruning.",
+)
 parser.add_argument("--skip-classify", action="store_true", help="Skip the classification phase")
 parser.add_argument("--skip-dockerfile", action="store_true", help="Skip the Dockerfile generation phase")
 parser.add_argument("--skip-repair", action="store_true", help="Skip the Dockerfile repair phase")
@@ -339,6 +411,22 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
     command.extend([
         "--verify-command", args.verify_command,
         "--verify-timeout", str(args.verify_timeout),
+    ])
+    if args.stateful_repair:
+        command.append("--stateful-repair")
+    else:
+        command.append("--no-stateful-repair")
+    command.extend([
+        "--stateful-history-window", str(args.stateful_history_window),
+        "--stateful-history-max-chars", str(args.stateful_history_max_chars),
+    ])
+    if args.stateful_repair_tree:
+        command.append("--stateful-repair-tree")
+    else:
+        command.append("--no-stateful-repair-tree")
+    command.extend([
+        "--stateful-tree-max-chars", str(args.stateful_tree_max_chars),
+        "--stateful-tree-max-children", str(args.stateful_tree_max_children),
     ])
     return command
 
