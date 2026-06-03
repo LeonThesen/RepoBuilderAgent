@@ -24,18 +24,31 @@ try:
         init_llm_metrics,
         prompt_path,
     )
+    from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
     from RepoBuilderAgent.src.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import config as _config
     from common import chat_completion_with_retries, finalize_llm_metrics, init_llm_metrics, prompt_path
+    from timeout_config import load_timeout_defaults
     from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
     from log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
     OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
+
+TIMEOUTS = load_timeout_defaults(
+    "agent_classify",
+    {
+        "timeout": 120,
+        "llm_max_retries": 2,
+        "llm_retry_backoff_seconds": 2.0,
+        "selection_timeout": 120,
+        "classification_timeout": 240,
+    },
+)
 
 parser = argparse.ArgumentParser(description="Analyze and classify GitHub repositories based on a given schema file.")
 parser.add_argument("--input-file", default="repos.json", help="Path to input file containing repository URLs")
@@ -50,11 +63,11 @@ parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
-parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
-parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
-parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
-parser.add_argument("--selection-timeout", type=int, default=120, help="Timeout for file-selection LLM requests in seconds")
-parser.add_argument("--classification-timeout", type=int, default=240, help="Timeout for final classification LLM requests in seconds")
+parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--selection-timeout", type=int, default=int(TIMEOUTS["selection_timeout"]), help="Timeout for file-selection LLM requests in seconds")
+parser.add_argument("--classification-timeout", type=int, default=int(TIMEOUTS["classification_timeout"]), help="Timeout for final classification LLM requests in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing analysis results")
 parser.add_argument("--learn", action="store_true", help="Learn new files from LLM selections and update config")

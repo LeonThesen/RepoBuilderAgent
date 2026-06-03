@@ -13,6 +13,7 @@ from tqdm import tqdm
 try:
     from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
@@ -31,6 +32,7 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import config as _config
     from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from timeout_config import load_timeout_defaults
     from common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
@@ -50,6 +52,16 @@ except ImportError:
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
     OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 
+TIMEOUTS = load_timeout_defaults(
+    "agent_install_guide",
+    {
+        "timeout": 120,
+        "llm_max_retries": 2,
+        "llm_retry_backoff_seconds": 2.0,
+        "install_guide_timeout": 240,
+    },
+)
+
 
 parser = argparse.ArgumentParser(
     description="Generate human-readable INSTALL.md guides from final Dockerfiles and repository evidence."
@@ -65,10 +77,10 @@ parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
-parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
-parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
-parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
-parser.add_argument("--install-guide-timeout", type=int, default=240, help="Timeout for INSTALL.md generation calls in seconds")
+parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--install-guide-timeout", type=int, default=int(TIMEOUTS["install_guide_timeout"]), help="Timeout for INSTALL.md generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated install guides")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
