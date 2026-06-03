@@ -17,7 +17,10 @@
   - Prefer explicit evidence (e.g., .nvmrc) over implicit inference (e.g., guessing from import syntax)
   - Always populate build_steps and verification — these are critical for downstream Dockerfile generation
   </guidelines>
+  {{PROMPT_PROFILE_DIRECTIVES}}
   </system>
+
+  {{PROMPT_PROFILE_FEWSHOT}}
 
   <examples>
 

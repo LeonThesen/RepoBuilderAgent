@@ -25,6 +25,12 @@ try:
         prompt_path,
     )
     from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.prompt_profiles import (
+        apply_prompt_profile,
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
     from RepoBuilderAgent.src.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
     from RepoBuilderAgent.src.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 except ImportError:
@@ -32,6 +38,12 @@ except ImportError:
     import config as _config
     from common import chat_completion_with_retries, finalize_llm_metrics, init_llm_metrics, prompt_path
     from timeout_config import load_timeout_defaults
+    from prompt_profiles import (
+        apply_prompt_profile,
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
     from repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, learn_new_files
     from log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
 
@@ -62,7 +74,8 @@ parser.add_argument("--schema", default="schemas/schema.yaml", help="Path to the
 parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
-parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
+parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"), help="Prompt profile name from RepoBuilderAgent/config/prompt_profiles.yaml (supports alias P*)")
+parser.add_argument("--temperature", type=float, default=None, help="Temperature override for the model; defaults to selected prompt profile value")
 parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
 parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
 parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
@@ -79,6 +92,8 @@ parser.add_argument("--repos-dir", default="repos", help="Directory containing c
 parser.add_argument("--analysis-dir", default="analysis", help="Directory containing aggregated analysis outputs")
 parser.add_argument("--no-analysis", action="store_true", help="Skip running the analysis script after completion")
 args = parser.parse_args()
+PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 # httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
 # Use ssl.create_default_context() to pull in the OS trust store instead.
@@ -94,7 +109,10 @@ client = AsyncOpenAI(
 
 # Load the prompt template from the agent subrepo.
 with open(prompt_path("PROMPT.md"), "r") as f:
-    PROMPT_TEMPLATE = f.read()
+    PROMPT_TEMPLATE = apply_prompt_profile(f.read(), PROMPT_PROFILE, "classify-step2")
+
+with open(prompt_path("PROMPT_SELECT_FILES.md"), "r") as f:
+    SELECT_FILES_PROMPT_TEMPLATE = apply_prompt_profile(f.read(), PROMPT_PROFILE, "classify-step1-selection")
 
 sem = asyncio.Semaphore(4)
 
@@ -240,6 +258,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
         repo_name = repo_url.split("/")[-1].replace(".git", "")
         llm_metrics_path = results_dir / f"{repo_name}.llm-metrics.yaml"
         llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
+        llm_metrics["prompt_profile"] = prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE)
         try:
             log_info(f"Processing {repo_url}...")
             output_path = results_dir / f"{repo_name}.yaml"
@@ -291,9 +310,6 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             with open(structure_summary_path, "w") as f:
                 f.write(structure_summary)
 
-            with open(prompt_path("PROMPT_SELECT_FILES.md"), "r") as f:
-                SELECT_FILES_PROMPT_TEMPLATE = f.read()
-
             selection_prompt = (
                 SELECT_FILES_PROMPT_TEMPLATE
                 .replace("{{REPO_URL}}", repo_url)
@@ -308,7 +324,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 selection_response = await chat_completion_with_retries(
                     client=client,
                     model=args.model,
-                    temperature=0.0,
+                    temperature=EFFECTIVE_TEMPERATURE,
                     messages=[{"role": "user", "content": selection_prompt}],
                     repo_url=repo_url,
                     phase="classify-step1-selection",
@@ -385,6 +401,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             metrics = {
                 "repo": repo_url,
                 "model": args.model,
+                "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
                 "tokens": {
                     "baseline_full_classification": baseline_tokens,
                     "step1_selection_prompt": step1_tokens,
@@ -416,7 +433,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 response = await chat_completion_with_retries(
                     client=client,
                     model=args.model,
-                    temperature=args.temperature,
+                    temperature=EFFECTIVE_TEMPERATURE,
                     messages=[{"role": "user", "content": prompt}],
                     repo_url=repo_url,
                     phase="classify-step2",

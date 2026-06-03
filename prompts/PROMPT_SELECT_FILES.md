@@ -17,7 +17,10 @@ selected_files:
   - path/to/file1
   - path/to/file2
 </output_format>
+{{PROMPT_PROFILE_DIRECTIVES}}
 </system>
+
+{{PROMPT_PROFILE_FEWSHOT}}
 
 Select relevant files for this repository:
 

@@ -10,11 +10,21 @@ try:
     from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.log_utils import log_error, log_info, set_trace_enabled
     from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.prompt_profiles import (
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import config as _config
     from log_utils import log_error, log_info, set_trace_enabled
     from timeout_config import load_timeout_defaults
+    from prompt_profiles import (
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -53,7 +63,8 @@ parser.add_argument(
 parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
-parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for model calls")
+parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"), help="Prompt profile name from RepoBuilderAgent/config/prompt_profiles.yaml (supports alias P*)")
+parser.add_argument("--temperature", type=float, default=None, help="Temperature override for model calls; defaults to selected prompt profile value")
 parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
 parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
 parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
@@ -144,6 +155,8 @@ parser.add_argument("--pipeline-reports-dir", default="pipeline-reports", help="
 parser.add_argument("--pipeline-summary-path", default="", help="Optional explicit path for the pipeline summary YAML")
 parser.add_argument("--print-summary", action="store_true", help="Print planned pipeline summary and exit without running phases")
 args = parser.parse_args()
+PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 
 DEFAULT_RESULTS_DIR = "classification_results"
@@ -258,14 +271,16 @@ def render_command(command: list[str]) -> str:
 
 
 def append_shared_model_args(command: list[str]) -> list[str]:
+    command.extend(["--prompt-profile", args.prompt_profile])
     if args.endpoint:
         command.extend(["--endpoint", args.endpoint])
     if args.model:
         command.extend(["--model", args.model])
     if args.api_key:
         command.extend(["--api-key", args.api_key])
+    if args.temperature is not None:
+        command.extend(["--temperature", str(args.temperature)])
     command.extend([
-        "--temperature", str(args.temperature),
         "--timeout", str(args.timeout),
         "--llm-max-retries", str(args.llm_max_retries),
         "--llm-retry-backoff-seconds", str(args.llm_retry_backoff_seconds),
@@ -703,6 +718,7 @@ def main() -> int:
             "enabled": args.trace,
             "forwarded_to_child_agents": args.trace,
         },
+        "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
         "paths": {
             "run_dir": str(run_dir),
             "reports_dir": str(reports_dir),

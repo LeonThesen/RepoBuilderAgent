@@ -17,6 +17,12 @@ try:
     from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
     from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.prompt_profiles import (
+        apply_prompt_profile,
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
     from RepoBuilderAgent.src.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
@@ -38,6 +44,12 @@ except ImportError:
     import config as _config
     from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
     from timeout_config import load_timeout_defaults
+    from prompt_profiles import (
+        apply_prompt_profile,
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
     from common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
@@ -85,7 +97,8 @@ parser.add_argument(
 parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
-parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
+parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"), help="Prompt profile name from RepoBuilderAgent/config/prompt_profiles.yaml (supports alias P*)")
+parser.add_argument("--temperature", type=float, default=None, help="Temperature override for the model; defaults to selected prompt profile value")
 parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
 parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
 parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
@@ -158,6 +171,8 @@ parser.add_argument(
 )
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
 args = parser.parse_args()
+PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 
 # httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
@@ -173,7 +188,7 @@ client = AsyncOpenAI(
 )
 
 with open(prompt_path("PROMPT_DOCKERFILE_REPAIR.md"), "r", encoding="utf-8") as prompt_file:
-    PROMPT_TEMPLATE = prompt_file.read()
+    PROMPT_TEMPLATE = apply_prompt_profile(prompt_file.read(), PROMPT_PROFILE, "repair")
 
 with open(prompt_path("PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as prompt_file:
     VERIFY_PROMPT_TEMPLATE = prompt_file.read()
@@ -845,7 +860,7 @@ async def request_repair(
     response = await chat_completion_with_retries(
         client=client,
         model=args.model,
-        temperature=args.temperature,
+        temperature=EFFECTIVE_TEMPERATURE,
         messages=[{"role": "user", "content": prompt}],
         repo_url=repo_url,
         phase="repair",
@@ -895,7 +910,7 @@ async def request_verification_command_repair(
     response = await chat_completion_with_retries(
         client=client,
         model=args.model,
-        temperature=args.temperature,
+        temperature=EFFECTIVE_TEMPERATURE,
         messages=[{"role": "user", "content": prompt}],
         repo_url=repo_url,
         phase="verify-repair",
@@ -936,7 +951,7 @@ async def request_verification_command_refresh(
     response = await chat_completion_with_retries(
         client=client,
         model=args.model,
-        temperature=args.temperature,
+        temperature=EFFECTIVE_TEMPERATURE,
         messages=[{"role": "user", "content": prompt}],
         repo_url=repo_url,
         phase="verify-refresh",
@@ -966,6 +981,7 @@ async def repair_repository(
         report_path = report_dir / "report.yaml"
         llm_metrics_path = report_dir / "llm-metrics.yaml"
         llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
+        llm_metrics["prompt_profile"] = prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE)
 
         report: dict = {
             "repo": repo_url,
@@ -973,6 +989,7 @@ async def repair_repository(
             "max_attempts": args.max_attempts,
             "success": False,
             "attempts": [],
+            "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
             "stateful_repair": {
                 "enabled": args.stateful_repair,
                 "tree_enabled": args.stateful_repair_tree,

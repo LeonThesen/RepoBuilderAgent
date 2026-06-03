@@ -21,6 +21,9 @@ The INSTALL.md must explain how to build and verify the repository locally based
 </guidelines>
 </system>
 
+{{PROMPT_PROFILE_DIRECTIVES}}
+{{PROMPT_PROFILE_FEWSHOT}}
+
 <repo>
 {{REPO_URL}}
 </repo>
