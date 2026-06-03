@@ -95,7 +95,7 @@ parser.add_argument("--no-analysis", action="store_true", help="Skip running the
 parser.add_argument(
     "--retrieval-strategy",
     default="iterative_react",
-    choices=["iterative_react", "bm25", "neural_embedding"],
+    choices=["iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint"],
     help="Step 1.1 repository evidence-selection strategy.",
 )
 parser.add_argument(
@@ -479,6 +479,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 f.write(structure_summary)
 
             selected_files = default_selected_files.copy()
+            baseline_summary = ""
             step1_tokens = 0
             if args.retrieval_strategy == "bm25":
                 selected_files = select_files_by_bm25(repo_path, build_bm25_query_terms(repo_name))
@@ -492,6 +493,17 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     log_warn(f"Neural embedding selection returned no files for {repo_url}; using defaults.")
                     selected_files = default_selected_files.copy()
                 log_info(f"Selected {len(selected_files)} files for {repo_name} via neural embedding retrieval.")
+            elif args.retrieval_strategy == "one_shot_fingerprint":
+                baseline_summary = fingerprint(
+                    format="md",
+                    repo_path=str(repo_path),
+                    structure_only=False,
+                    selected_files=None,
+                    include_tree=True,
+                    context="step2-one-shot-fingerprint",
+                )
+                selected_files = []
+                log_info(f"Using static repo fingerprint for {repo_name} via one-shot retrieval.")
             else:
                 selection_prompt = (
                     SELECT_FILES_PROMPT_TEMPLATE
@@ -538,13 +550,16 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 yaml.dump({"retrieval_strategy": args.retrieval_strategy, "selected_files": selected_files}, f, sort_keys=False, allow_unicode=True)
 
             # Step 2: only selected file contents are provided to the classification prompt.
-            summary = fingerprint(
-                format="md",
-                repo_path=str(repo_path),
-                selected_files=selected_files,
-                include_tree=False,
-                context="step2-selected",
-            )
+            if args.retrieval_strategy == "one_shot_fingerprint":
+                summary = baseline_summary
+            else:
+                summary = fingerprint(
+                    format="md",
+                    repo_path=str(repo_path),
+                    selected_files=selected_files,
+                    include_tree=False,
+                    context="step2-selected",
+                )
             summary_path = summary_dir / f"{repo_name}.md"
             with open(summary_path, "w") as f:
                 f.write(summary)
@@ -554,14 +569,15 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
 
             # Token accounting for baseline vs two-step prompts.
             # Baseline: deterministic collection of all manifest files (no LLM filtering).
-            baseline_summary = fingerprint(
-                format="md",
-                repo_path=str(repo_path),
-                structure_only=False,
-                selected_files=None,
-                include_tree=True,
-                context="baseline-full",
-            )
+            if not baseline_summary:
+                baseline_summary = fingerprint(
+                    format="md",
+                    repo_path=str(repo_path),
+                    structure_only=False,
+                    selected_files=None,
+                    include_tree=True,
+                    context="baseline-full",
+                )
             
             # Trace: file set delta between baseline and LLM-selected.
             baseline_files_tuples = collect_manifest_files(repo_path)
