@@ -692,6 +692,33 @@ def resolve_phase_skips() -> dict[str, bool]:
     return skips
 
 
+def resolve_variant_policy() -> dict:
+    if args.variant == "one_shot_direct":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "static_fingerprint_only",
+            "classification_required": False,
+            "repair_enabled": False,
+            "exploration_enabled": False,
+            "synthesis_enabled": False,
+            "validation_enabled": False,
+            "scratchpads_enabled": False,
+            "retrieval_strategy": "none",
+        }
+
+    return {
+        "phase2_anchor": True,
+        "repo_context_source": "staged_pipeline",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
+        "retrieval_strategy": "baseline_one_shot_fingerprint",
+    }
+
+
 def main() -> int:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     pipeline_started_ts = time.perf_counter()
@@ -735,6 +762,16 @@ def main() -> int:
         log_info("Variant one_shot_direct selected: disabling --run-analysis because classification is skipped.")
         args.run_analysis = False
 
+    if args.variant == "flat_baseline":
+        if args.stateful_repair:
+            log_info("Variant flat_baseline selected: forcing stateful repair OFF for baseline consistency.")
+        if args.stateful_repair_tree:
+            log_info("Variant flat_baseline selected: forcing stateful repair tree OFF for baseline consistency.")
+        args.stateful_repair = False
+        args.stateful_repair_tree = False
+
+    variant_policy = resolve_variant_policy()
+
     summary: dict = {
         "run_id": run_id,
         "started_at": pipeline_started_at,
@@ -746,11 +783,7 @@ def main() -> int:
             "forwarded_to_child_agents": args.trace,
         },
         "variant": args.variant,
-        "variant_policy": {
-            "repo_context_source": "static_fingerprint_only" if args.variant == "one_shot_direct" else "staged_pipeline",
-            "classification_required": args.variant != "one_shot_direct",
-            "repair_enabled": args.variant != "one_shot_direct",
-        },
+        "variant_policy": variant_policy,
         "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
         "paths": {
             "run_dir": str(run_dir),
