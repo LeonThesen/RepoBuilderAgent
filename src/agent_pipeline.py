@@ -153,7 +153,7 @@ parser.add_argument("--skip-install-guide", action="store_true", help="Skip the 
 parser.add_argument(
     "--variant",
     default="flat_baseline",
-    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_stateful_tree_on", "one_shot_direct"],
+    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_stateful_tree_on", "ab_stateful_tree_off", "one_shot_direct"],
     help="Pipeline variant for ablation runs.",
 )
 parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
@@ -693,6 +693,22 @@ def resolve_phase_skips() -> dict[str, bool]:
 
 
 def resolve_variant_policy() -> dict:
+    if args.variant == "ab_stateful_tree_off":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "iterative_exploration",
+            "stateful_repair_enabled": True,
+            "stateful_tree_enabled": False,
+            "prev_attempt_context_enabled": True,
+        }
+
     if args.variant == "ab_stateful_tree_on":
         return {
             "phase2_anchor": False,
@@ -861,6 +877,14 @@ def main() -> int:
             log_info("Variant ab_stateful_tree_on selected: forcing stateful repair tree ON for AB-20A isolation.")
         args.stateful_repair = True
         args.stateful_repair_tree = True
+
+    if args.variant == "ab_stateful_tree_off":
+        if not args.stateful_repair:
+            log_info("Variant ab_stateful_tree_off selected: forcing stateful repair ON for AB-20B.")
+        if args.stateful_repair_tree:
+            log_info("Variant ab_stateful_tree_off selected: forcing stateful repair tree OFF for AB-20B isolation.")
+        args.stateful_repair = True
+        args.stateful_repair_tree = False
 
     if args.variant == "ab_prev_attempt_ctx_on":
         if not args.stateful_repair:
