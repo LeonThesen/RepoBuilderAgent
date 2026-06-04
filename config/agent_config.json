@@ -5,6 +5,12 @@
     "repair": true,
     "install_guide": true
   },
+  "architecture": {
+    "exploration_enabled": true,
+    "synthesis_enabled": true,
+    "validation_enabled": true,
+    "scratchpads_enabled": true
+  },
   "classification": {
     "retrieval_strategy": "iterative_react",
     "embedding_model": "text-embedding-3-small",

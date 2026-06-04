@@ -91,6 +91,11 @@ parser.add_argument("--results-dir", default="classification_results", help="Dir
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
 parser.add_argument("--analysis-dir", default="analysis", help="Directory containing aggregated analysis outputs")
+parser.add_argument("--scratchpad-dir", default="", help="Optional directory to write per-repo architecture scratchpads")
+parser.add_argument("--exploration-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable exploration-stage artifact generation")
+parser.add_argument("--synthesis-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable synthesis-stage artifact generation")
+parser.add_argument("--validation-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable validation-stage artifact generation")
+parser.add_argument("--scratchpads-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable architecture scratchpad artifact generation")
 parser.add_argument("--no-analysis", action="store_true", help="Skip running the analysis script after completion")
 parser.add_argument(
     "--retrieval-strategy",
@@ -779,6 +784,77 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             with open(selected_files_path, "w") as f:
                 yaml.dump({"retrieval_strategy": args.retrieval_strategy, "selected_files": selected_files}, f, sort_keys=False, allow_unicode=True)
 
+            selected_lower = [str(path).lower() for path in selected_files]
+            manifest_markers = (
+                "package.json",
+                "pyproject.toml",
+                "requirements.txt",
+                "go.mod",
+                "cargo.toml",
+                "pom.xml",
+                "build.gradle",
+                "build.gradle.kts",
+            )
+            has_manifest = any(any(marker in path for marker in manifest_markers) for path in selected_lower)
+            has_ci = any(path.startswith(".github/workflows/") for path in selected_lower)
+            has_docker = any("dockerfile" in path or "docker-compose" in path for path in selected_lower)
+            has_tests = any(
+                "/test" in path
+                or path.startswith("test/")
+                or path.startswith("tests/")
+                or path.endswith(".spec.ts")
+                or path.endswith("_test.go")
+                for path in selected_lower
+            )
+
+            high_signal_files = [
+                path
+                for path in selected_files
+                if any(
+                    marker in path.lower()
+                    for marker in (
+                        "package.json",
+                        "pyproject.toml",
+                        "requirements",
+                        "go.mod",
+                        "cargo.toml",
+                        "pom.xml",
+                        "build.gradle",
+                        "dockerfile",
+                        "docker-compose",
+                        ".github/workflows",
+                    )
+                )
+            ]
+
+            exploration_artifact = {
+                "repo": repo_url,
+                "stage": "exploration",
+                "retrieval_strategy": args.retrieval_strategy,
+                "react": {
+                    "steps": len(react_trace),
+                    "stop_reason": react_stop_reason,
+                },
+                "high_signal_files": high_signal_files,
+                "evidence_gaps": {
+                    "manifest_evidence_missing": not has_manifest,
+                    "ci_workflow_evidence_missing": not has_ci,
+                    "docker_evidence_missing": not has_docker,
+                    "test_evidence_missing": not has_tests,
+                },
+                "focus_questions": [
+                    "Which build tool and entrypoints are required for reproducible builds?",
+                    "Which system dependencies are likely required inside container builds?",
+                    "What is the minimal verification command that proves runtime correctness?",
+                ],
+            }
+            exploration_path = None
+            if args.exploration_enabled:
+                exploration_path = summary_dir / f"{repo_name}.exploration.yaml"
+                with open(exploration_path, "w", encoding="utf-8") as exploration_file:
+                    yaml.dump(exploration_artifact, exploration_file, sort_keys=False, allow_unicode=True)
+                log_info(f"Exploration artifact saved at {exploration_path}")
+
             # Step 2: only selected file contents are provided to the classification prompt.
             if args.retrieval_strategy == "one_shot_fingerprint":
                 summary = baseline_summary
@@ -796,6 +872,84 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             log_info(f"Generated structure summary at {structure_summary_path}")
             log_info(f"Selected files list saved at {selected_files_path}")
             log_info(f"Generated selected-files summary at {summary_path}")
+
+            build_hypotheses: list[str] = []
+            if any("package.json" in path for path in selected_lower):
+                build_hypotheses.append("Use Node.js package-manager driven install/build flow inferred from package.json.")
+            if any("pyproject.toml" in path or "requirements.txt" in path for path in selected_lower):
+                build_hypotheses.append("Use Python dependency installation before running project-specific build/test steps.")
+            if any("go.mod" in path for path in selected_lower):
+                build_hypotheses.append("Use Go module restore and compile/test verification path.")
+            if any("cargo.toml" in path for path in selected_lower):
+                build_hypotheses.append("Use Cargo dependency fetch and build workflow with Rust toolchain in image.")
+            if not build_hypotheses:
+                build_hypotheses.append("Fallback to minimal deterministic build strategy based on discovered repository structure.")
+
+            synthesis_artifact = {
+                "repo": repo_url,
+                "stage": "synthesis",
+                "build_strategy_hypotheses": build_hypotheses,
+                "dependency_assumptions": {
+                    "system_build_tools_required": any(marker in path for marker in ("binding.gyp", "cmake", "makefile") for path in selected_lower),
+                    "network_install_steps_likely": any(
+                        marker in path
+                        for marker in ("package.json", "requirements.txt", "pyproject.toml", "go.mod", "cargo.toml")
+                        for path in selected_lower
+                    ),
+                },
+                "risk_notes": [
+                    "manifest_evidence_missing" if exploration_artifact["evidence_gaps"]["manifest_evidence_missing"] else None,
+                    "docker_evidence_missing" if exploration_artifact["evidence_gaps"]["docker_evidence_missing"] else None,
+                    "test_evidence_missing" if exploration_artifact["evidence_gaps"]["test_evidence_missing"] else None,
+                ],
+            }
+            synthesis_artifact["risk_notes"] = [item for item in synthesis_artifact["risk_notes"] if item]
+            synthesis_path = None
+            if args.synthesis_enabled:
+                synthesis_path = summary_dir / f"{repo_name}.synthesis.yaml"
+                with open(synthesis_path, "w", encoding="utf-8") as synthesis_file:
+                    yaml.dump(synthesis_artifact, synthesis_file, sort_keys=False, allow_unicode=True)
+                log_info(f"Synthesis artifact saved at {synthesis_path}")
+
+            validation_checks = {
+                "manifest_evidence": {
+                    "status": "pass" if has_manifest else "warn",
+                    "detail": "Manifest/build metadata detected in selected evidence." if has_manifest else "No manifest/build metadata detected in selected evidence.",
+                },
+                "ci_workflow_evidence": {
+                    "status": "pass" if has_ci else "warn",
+                    "detail": "CI workflow files detected." if has_ci else "No CI workflow files detected in selected evidence.",
+                },
+                "docker_evidence": {
+                    "status": "pass" if has_docker else "warn",
+                    "detail": "Docker-related files detected." if has_docker else "No Docker-related files detected in selected evidence.",
+                },
+                "test_evidence": {
+                    "status": "pass" if has_tests else "warn",
+                    "detail": "Test-related files detected." if has_tests else "No test-related files detected in selected evidence.",
+                },
+                "selected_summary_non_empty": {
+                    "status": "pass" if bool(summary.strip()) else "fail",
+                    "detail": "Reduced selected-files summary is non-empty." if bool(summary.strip()) else "Reduced selected-files summary is empty.",
+                },
+            }
+            validation_warnings = [
+                key
+                for key, value in validation_checks.items()
+                if value.get("status") in {"warn", "fail"}
+            ]
+            validation_artifact = {
+                "repo": repo_url,
+                "stage": "validation",
+                "checks": validation_checks,
+                "warnings": validation_warnings,
+            }
+            validation_path = None
+            if args.validation_enabled:
+                validation_path = summary_dir / f"{repo_name}.validation.yaml"
+                with open(validation_path, "w", encoding="utf-8") as validation_file:
+                    yaml.dump(validation_artifact, validation_file, sort_keys=False, allow_unicode=True)
+                log_info(f"Validation artifact saved at {validation_path}")
 
             # Token accounting for baseline vs two-step prompts.
             # Baseline: deterministic collection of all manifest files (no LLM filtering).
@@ -859,6 +1013,52 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
 
             with open(metrics_path, "w") as f:
                 yaml.dump(metrics, f, sort_keys=False, allow_unicode=True)
+
+            if args.scratchpads_enabled and args.scratchpad_dir:
+                scratchpad_dir = Path(args.scratchpad_dir)
+                scratchpad_dir.mkdir(parents=True, exist_ok=True)
+                scratchpad_path = scratchpad_dir / f"{repo_name}.architecture-scratchpad.yaml"
+                scratchpad_payload = {
+                    "schema_version": "1.0",
+                    "repo": repo_url,
+                    "generated_by": "agent_classify.py",
+                    "contract": {
+                        "required_sections": ["exploration", "synthesis", "validation"],
+                        "optional_sections": ["react_trace"],
+                    },
+                    "architecture": {
+                        "retrieval_strategy": args.retrieval_strategy,
+                        "exploration": {
+                            "selected_files_count": len(selected_files),
+                            "selected_files": selected_files,
+                            "react_steps": len(react_trace),
+                            "react_stop_reason": react_stop_reason,
+                            "exploration_artifact_path": str(exploration_path) if exploration_path else None,
+                            "evidence_gaps": exploration_artifact["evidence_gaps"],
+                        },
+                        "synthesis": {
+                            "selected_summary_path": str(summary_path),
+                            "structure_summary_path": str(structure_summary_path),
+                            "selected_files_path": str(selected_files_path),
+                            "synthesis_artifact_path": str(synthesis_path) if synthesis_path else None,
+                            "build_strategy_hypotheses": synthesis_artifact["build_strategy_hypotheses"],
+                            "risk_notes": synthesis_artifact["risk_notes"],
+                            "prompt_tokens": {
+                                "step1_selection": step1_tokens,
+                                "step2_classification": step2_tokens,
+                                "two_step_total": two_step_total_tokens,
+                            },
+                        },
+                        "validation": {
+                            "validation_artifact_path": str(validation_path) if validation_path else None,
+                            "checks": validation_checks,
+                            "warnings": validation_warnings,
+                        },
+                    },
+                }
+                with open(scratchpad_path, "w", encoding="utf-8") as scratchpad_file:
+                    yaml.dump(scratchpad_payload, scratchpad_file, sort_keys=False, allow_unicode=True)
+                log_info(f"Architecture scratchpad saved at {scratchpad_path}")
 
             log_info(f"Token metrics saved at {metrics_path}")
             log_info(f"Sending step2-classification prompt for {repo_url}...")

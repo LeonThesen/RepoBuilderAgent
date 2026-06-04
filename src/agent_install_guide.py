@@ -25,10 +25,13 @@ try:
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
+        load_architecture_scratchpad,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
@@ -50,10 +53,13 @@ except ImportError:
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
+        load_architecture_scratchpad,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
@@ -192,6 +198,8 @@ async def generate_install_guide(
                 return
 
             summary = load_summary(repo_name, repo_path, summaries_dir)
+            architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
+            validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
             dockerfile_content = dockerfile_path.read_text(encoding="utf-8")
             verify_command_path = dockerfiles_dir / f"{repo_name}.verify-command"
             verify_command = verify_command_path.read_text(encoding="utf-8").strip() if verify_command_path.exists() else ""
@@ -203,6 +211,8 @@ async def generate_install_guide(
                 .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
                 .replace("{{VERIFY_COMMAND}}", verify_command)
             )
+            prompt += render_validation_findings_for_prompt(validation_artifact)
+            prompt += render_architecture_scratchpad_for_prompt(architecture_scratchpad)
 
             log_info(f"Generating INSTALL.md for {repo_url}...")
             install_guide_content = ""

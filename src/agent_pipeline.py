@@ -423,6 +423,35 @@ def _expect_str(value, *, key: str) -> str:
 def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, bool]) -> dict:
     applied: dict = {}
 
+    architecture_cfg = agent_config.get("architecture")
+    if architecture_cfg is not None:
+        if not isinstance(architecture_cfg, dict):
+            raise ValueError("agent_config.architecture must be an object")
+        if "exploration_enabled" in architecture_cfg:
+            args.arch_exploration_enabled = _expect_bool(
+                architecture_cfg["exploration_enabled"],
+                key="architecture.exploration_enabled",
+            )
+            applied.setdefault("architecture", {})["exploration_enabled"] = args.arch_exploration_enabled
+        if "synthesis_enabled" in architecture_cfg:
+            args.arch_synthesis_enabled = _expect_bool(
+                architecture_cfg["synthesis_enabled"],
+                key="architecture.synthesis_enabled",
+            )
+            applied.setdefault("architecture", {})["synthesis_enabled"] = args.arch_synthesis_enabled
+        if "validation_enabled" in architecture_cfg:
+            args.arch_validation_enabled = _expect_bool(
+                architecture_cfg["validation_enabled"],
+                key="architecture.validation_enabled",
+            )
+            applied.setdefault("architecture", {})["validation_enabled"] = args.arch_validation_enabled
+        if "scratchpads_enabled" in architecture_cfg:
+            args.arch_scratchpads_enabled = _expect_bool(
+                architecture_cfg["scratchpads_enabled"],
+                key="architecture.scratchpads_enabled",
+            )
+            applied.setdefault("architecture", {})["scratchpads_enabled"] = args.arch_scratchpads_enabled
+
     phases_cfg = agent_config.get("phases")
     if phases_cfg is not None:
         if not isinstance(phases_cfg, dict):
@@ -581,9 +610,14 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         "--react-max-total-files", str(args.react_max_total_files),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
+        "--scratchpad-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
         "--analysis-dir", args.analysis_dir,
     ])
+    command.append("--exploration-enabled" if args.arch_exploration_enabled else "--no-exploration-enabled")
+    command.append("--synthesis-enabled" if args.arch_synthesis_enabled else "--no-synthesis-enabled")
+    command.append("--validation-enabled" if args.arch_validation_enabled else "--no-validation-enabled")
+    command.append("--scratchpads-enabled" if args.arch_scratchpads_enabled else "--no-scratchpads-enabled")
     command.append("--no-analysis")
     return command
 
@@ -1134,6 +1168,12 @@ def main() -> int:
         args.stateful_repair = True
         args.stateful_repair_tree = False
 
+    base_variant_policy = resolve_variant_policy()
+    args.arch_exploration_enabled = bool(base_variant_policy.get("exploration_enabled", True))
+    args.arch_synthesis_enabled = bool(base_variant_policy.get("synthesis_enabled", True))
+    args.arch_validation_enabled = bool(base_variant_policy.get("validation_enabled", True))
+    args.arch_scratchpads_enabled = bool(base_variant_policy.get("scratchpads_enabled", True))
+
     if args.variant == "ab_prev_attempt_ctx_on":
         if not args.stateful_repair:
             log_info("Variant ab_prev_attempt_ctx_on selected: forcing stateful repair ON for AB-19A.")
@@ -1194,6 +1234,18 @@ def main() -> int:
             "classification": {
                 "retrieval_strategy": resolve_classify_retrieval_strategy(),
                 "embedding_model": args.embedding_model,
+                "architecture": {
+                    "exploration_enabled": args.arch_exploration_enabled,
+                    "synthesis_enabled": args.arch_synthesis_enabled,
+                    "validation_enabled": args.arch_validation_enabled,
+                    "scratchpads_enabled": args.arch_scratchpads_enabled,
+                },
+                "artifact_patterns": {
+                    "exploration": str(Path(args.summaries_dir) / "<repo>.exploration.yaml"),
+                    "synthesis": str(Path(args.summaries_dir) / "<repo>.synthesis.yaml"),
+                    "validation": str(Path(args.summaries_dir) / "<repo>.validation.yaml"),
+                    "scratchpad": str(Path(args.summaries_dir) / "<repo>.architecture-scratchpad.yaml"),
+                },
                 "react": {
                     "max_steps": args.react_max_steps,
                     "files_per_step": args.react_files_per_step,

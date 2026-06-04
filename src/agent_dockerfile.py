@@ -26,10 +26,13 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        load_architecture_scratchpad,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
@@ -54,10 +57,13 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        load_architecture_scratchpad,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
@@ -357,6 +363,10 @@ async def generate_dockerfile(
                     return
                 summary = load_summary(repo_name, repo_path, summaries_dir)
 
+            architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
+            synthesis_artifact = read_yaml_file(summaries_dir / f"{repo_name}.synthesis.yaml")
+            validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
+
             base_template = get_base_template(classification)
 
             # Regenerate until Hadolint accepts the Dockerfile. These retries do not
@@ -372,6 +382,10 @@ async def generate_dockerfile(
                     .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
                     .replace("{{SUMMARY_CONTENT}}", summary)
                 )
+                if synthesis_artifact:
+                    prompt += "\n\nSYNTHESIS_ARTIFACT:\n" + render_yaml(synthesis_artifact)
+                prompt += render_validation_findings_for_prompt(validation_artifact)
+                prompt += render_architecture_scratchpad_for_prompt(architecture_scratchpad)
 
                 if failed_lint_attempts:
                     prompt += render_failed_lint_attempts(failed_lint_attempts)

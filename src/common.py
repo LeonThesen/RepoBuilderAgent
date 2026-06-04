@@ -23,6 +23,9 @@ except ImportError:
     from repo_fingerprint import fingerprint
 
 
+ARCHITECTURE_SCRATCHPAD_SCHEMA_VERSION = "1.0"
+
+
 def init_llm_metrics(repo_url: str, model: str, endpoint: str, timeout_seconds: int, max_retries: int) -> dict:
     return {
         "repo": repo_url,
@@ -376,6 +379,65 @@ def load_summary(repo_name: str, repo_path: Path, summaries_dir: Path) -> str:
         selected_files=None,
         include_tree=True,
         context="summary-baseline",
+    )
+
+
+def load_architecture_scratchpad(repo_name: str, summaries_dir: Path) -> dict | None:
+    scratchpad_path = summaries_dir / f"{repo_name}.architecture-scratchpad.yaml"
+    if not scratchpad_path.exists():
+        return None
+
+    try:
+        with open(scratchpad_path, "r", encoding="utf-8") as scratchpad_file:
+            loaded = yaml.safe_load(scratchpad_file)
+    except Exception:
+        return None
+
+    if not isinstance(loaded, dict):
+        return None
+
+    schema_version = str(loaded.get("schema_version", "")).strip()
+    if schema_version and schema_version != ARCHITECTURE_SCRATCHPAD_SCHEMA_VERSION:
+        log_warn(
+            f"Skipping architecture scratchpad for {repo_name}: unsupported schema version {schema_version}"
+        )
+        return None
+
+    if not schema_version:
+        loaded["schema_version"] = ARCHITECTURE_SCRATCHPAD_SCHEMA_VERSION
+    return loaded
+
+
+def render_architecture_scratchpad_for_prompt(scratchpad: dict | None, *, max_chars: int = 8000) -> str:
+    if not scratchpad:
+        return ""
+
+    rendered = yaml.dump(scratchpad, sort_keys=False, allow_unicode=True)
+    safe_max = max(256, int(max_chars))
+    if len(rendered) > safe_max:
+        rendered = "... [architecture scratchpad truncated] ...\n" + rendered[-safe_max:]
+
+    return (
+        "\n\nARCHITECTURE_SCRATCHPAD:\n"
+        "Use this cross-phase exploration/synthesis/validation context when making decisions.\n"
+        f"{rendered}\n"
+    )
+
+
+def render_validation_findings_for_prompt(validation_artifact: dict | None) -> str:
+    if not validation_artifact:
+        return ""
+
+    warnings = validation_artifact.get("warnings") or []
+    checks = validation_artifact.get("checks") or {}
+    if not warnings and not checks:
+        return ""
+
+    rendered = yaml.dump(validation_artifact, sort_keys=False, allow_unicode=True)
+    return (
+        "\n\nVALIDATION_FINDINGS:\n"
+        "Treat warnings as evidence gaps and prefer conservative, reproducible build assumptions when uncertain.\n"
+        f"{rendered}\n"
     )
 
 

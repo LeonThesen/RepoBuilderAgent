@@ -29,10 +29,13 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        load_architecture_scratchpad,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
@@ -56,10 +59,13 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        load_architecture_scratchpad,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
@@ -822,6 +828,7 @@ async def request_repair(
     failure_hints: dict | None,
     llm_metrics: dict,
     repair_history: list[dict] | None = None,
+    architecture_scratchpad_context: str = "",
 ) -> str:
     base_template = get_base_template(classification)
     prompt = (
@@ -856,6 +863,8 @@ async def request_repair(
                 "\nAlso use this compact decision tree to choose strategy shifts when repeated branches fail."
                 f"\n\nSTATEFUL_REPAIR_DECISION_TREE:\n{render_stateful_decision_tree_for_prompt(repair_history)}\n"
             )
+    if architecture_scratchpad_context:
+        prompt += architecture_scratchpad_context
 
     response = await chat_completion_with_retries(
         client=client,
@@ -882,6 +891,7 @@ async def request_verification_command_repair(
     verify_log: str,
     failure_hints: dict | None,
     llm_metrics: dict,
+    architecture_scratchpad_context: str = "",
 ) -> str:
     prompt = (
         VERIFY_PROMPT_TEMPLATE
@@ -906,6 +916,8 @@ async def request_verification_command_repair(
             "\nUse these normalized failure hints to choose a command that matches the actual runtime context."
             f"\n\nFAILURE_HINTS_JSON:\n{render_failure_hints_for_prompt(failure_hints)}\n"
         )
+    if architecture_scratchpad_context:
+        prompt += architecture_scratchpad_context
 
     response = await chat_completion_with_retries(
         client=client,
@@ -930,6 +942,7 @@ async def request_verification_command_refresh(
     dockerfile_content: str,
     current_verify_command: str,
     llm_metrics: dict,
+    architecture_scratchpad_context: str = "",
 ) -> str:
     """Refresh verify command when Dockerfile changes materially during repair."""
     prompt = (
@@ -947,6 +960,8 @@ async def request_verification_command_refresh(
         "\nUse one shell command only, no prose or markdown fences."
         f"\n\nCurrent command:\n{current_verify_command}\n"
     )
+    if architecture_scratchpad_context:
+        prompt += architecture_scratchpad_context
 
     response = await chat_completion_with_retries(
         client=client,
@@ -1054,6 +1069,12 @@ async def repair_repository(
                 log_info(f"[verify {repo_name}] No generated verification command found; using default: {verify_command_to_use}")
 
             summary = load_summary(repo_name, repo_path, summaries_dir)
+            architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
+            validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
+            architecture_scratchpad_context = (
+                render_validation_findings_for_prompt(validation_artifact)
+                + render_architecture_scratchpad_for_prompt(architecture_scratchpad)
+            )
             current_dockerfile = dockerfile_path.read_text(encoding="utf-8")
             repair_history: list[dict] = []
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -1190,6 +1211,7 @@ async def repair_repository(
                             verify_log=verify_log,
                             failure_hints=verify_failure_hints,
                             llm_metrics=llm_metrics,
+                            architecture_scratchpad_context=architecture_scratchpad_context,
                         )
                     )
 
@@ -1285,6 +1307,7 @@ async def repair_repository(
                         },
                         llm_metrics=llm_metrics,
                         repair_history=repair_history,
+                        architecture_scratchpad_context=architecture_scratchpad_context,
                     )
                     prior_dockerfile = current_dockerfile
                     current_dockerfile, stop = _apply_repair(
@@ -1317,6 +1340,7 @@ async def repair_repository(
                             dockerfile_content=current_dockerfile,
                             current_verify_command=verify_command_to_use,
                             llm_metrics=llm_metrics,
+                            architecture_scratchpad_context=architecture_scratchpad_context,
                         )
                     )
                     if refreshed_verify_command and refreshed_verify_command != verify_command_to_use:
@@ -1345,6 +1369,7 @@ async def repair_repository(
                     failure_hints={"build": build_failure_hints},
                     llm_metrics=llm_metrics,
                     repair_history=repair_history,
+                    architecture_scratchpad_context=architecture_scratchpad_context,
                 )
                 prior_dockerfile = current_dockerfile
                 current_dockerfile, stop = _apply_repair(
@@ -1371,6 +1396,7 @@ async def repair_repository(
                         dockerfile_content=current_dockerfile,
                         current_verify_command=verify_command_to_use,
                         llm_metrics=llm_metrics,
+                        architecture_scratchpad_context=architecture_scratchpad_context,
                     )
                 )
                 if refreshed_verify_command and refreshed_verify_command != verify_command_to_use:
