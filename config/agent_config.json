@@ -1,0 +1,28 @@
+{
+  "phases": {
+    "classify": true,
+    "dockerfile": true,
+    "repair": true,
+    "install_guide": true
+  },
+  "classification": {
+    "retrieval_strategy": "iterative_react",
+    "embedding_model": "text-embedding-3-small",
+    "react": {
+      "max_steps": 4,
+      "files_per_step": 8,
+      "max_total_files": 24
+    }
+  },
+  "dockerfile": {
+    "one_shot_direct": false
+  },
+  "repair": {
+    "stateful_repair": true,
+    "stateful_repair_tree": true,
+    "history_window": 4,
+    "history_max_chars": 4000,
+    "tree_max_chars": 2500,
+    "tree_max_children": 5
+  }
+}

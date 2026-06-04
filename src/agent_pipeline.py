@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timezone
+import json
 import os
 import subprocess
 import sys
@@ -155,6 +156,46 @@ parser.add_argument(
     default="flat_baseline",
     choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react", "one_shot_direct"],
     help="Pipeline variant for ablation runs.",
+)
+parser.add_argument(
+    "--agent-config",
+    default="",
+    help="Optional JSON file with runtime architecture controls (phases/retrieval/ReAct/stateful repair).",
+)
+parser.add_argument(
+    "--retrieval-strategy",
+    default="",
+    choices=["iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint"],
+    help="Override classify retrieval strategy independently of --variant.",
+)
+parser.add_argument(
+    "--embedding-model",
+    default=os.getenv("LLM_EMBEDDING_MODEL", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")),
+    help="Embedding model passed to classify when retrieval strategy is neural_embedding.",
+)
+parser.add_argument(
+    "--react-max-steps",
+    type=int,
+    default=4,
+    help="Maximum retrieval iterations passed to classify for iterative_react strategy.",
+)
+parser.add_argument(
+    "--react-files-per-step",
+    type=int,
+    default=8,
+    help="Maximum files accepted per iterative_react step.",
+)
+parser.add_argument(
+    "--react-max-total-files",
+    type=int,
+    default=24,
+    help="Maximum total selected files across iterative_react steps.",
+)
+parser.add_argument(
+    "--dockerfile-one-shot-direct",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override one-shot-direct Dockerfile generation mode without changing other phases.",
 )
 parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
 parser.add_argument("--pipeline-reports-dir", default="pipeline-reports", help="Directory where pipeline logs and summary are written")
@@ -334,6 +375,152 @@ def resolve_output_dir(workspace_root: Path, run_dir: Path, value: str, default_
     return candidate
 
 
+def _resolve_agent_config_path(workspace_root: Path) -> Path | None:
+    if not args.agent_config:
+        return None
+
+    candidate = Path(args.agent_config).expanduser()
+    if not candidate.is_absolute():
+        candidate = (workspace_root / candidate).resolve()
+    return candidate
+
+
+def _load_agent_config(path: Path) -> dict:
+    if not path.exists():
+        raise ValueError(f"agent config not found: {path}")
+
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in agent config {path}: {exc}") from exc
+
+    if not isinstance(loaded, dict):
+        raise ValueError(f"agent config root must be a JSON object: {path}")
+
+    return loaded
+
+
+def _expect_bool(value, *, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"agent_config.{key} must be boolean")
+
+
+def _expect_int(value, *, key: str, min_value: int = 1) -> int:
+    if not isinstance(value, int):
+        raise ValueError(f"agent_config.{key} must be integer")
+    if value < min_value:
+        raise ValueError(f"agent_config.{key} must be >= {min_value}")
+    return value
+
+
+def _expect_str(value, *, key: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError(f"agent_config.{key} must be non-empty string")
+
+
+def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, bool]) -> dict:
+    applied: dict = {}
+
+    phases_cfg = agent_config.get("phases")
+    if phases_cfg is not None:
+        if not isinstance(phases_cfg, dict):
+            raise ValueError("agent_config.phases must be an object")
+        phase_key_map = {
+            "classify": "skip_classify",
+            "dockerfile": "skip_dockerfile",
+            "repair": "skip_repair",
+            "install_guide": "skip_install_guide",
+        }
+        for phase_name, arg_name in phase_key_map.items():
+            if phase_name not in phases_cfg:
+                continue
+            enabled = _expect_bool(phases_cfg[phase_name], key=f"phases.{phase_name}")
+            phase_skips[phase_name] = not enabled
+            setattr(args, arg_name, not enabled)
+            applied.setdefault("phases", {})[phase_name] = enabled
+
+    classification_cfg = agent_config.get("classification")
+    if classification_cfg is not None:
+        if not isinstance(classification_cfg, dict):
+            raise ValueError("agent_config.classification must be an object")
+
+        if "retrieval_strategy" in classification_cfg:
+            retrieval_strategy = _expect_str(classification_cfg["retrieval_strategy"], key="classification.retrieval_strategy")
+            allowed = {"iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint"}
+            if retrieval_strategy not in allowed:
+                raise ValueError(
+                    "agent_config.classification.retrieval_strategy must be one of "
+                    + ", ".join(sorted(allowed))
+                )
+            args.retrieval_strategy = retrieval_strategy
+            applied.setdefault("classification", {})["retrieval_strategy"] = retrieval_strategy
+
+        if "embedding_model" in classification_cfg:
+            embedding_model = _expect_str(classification_cfg["embedding_model"], key="classification.embedding_model")
+            args.embedding_model = embedding_model
+            applied.setdefault("classification", {})["embedding_model"] = embedding_model
+
+        react_cfg = classification_cfg.get("react")
+        if react_cfg is not None:
+            if not isinstance(react_cfg, dict):
+                raise ValueError("agent_config.classification.react must be an object")
+
+            if "max_steps" in react_cfg:
+                args.react_max_steps = _expect_int(react_cfg["max_steps"], key="classification.react.max_steps")
+                applied.setdefault("classification", {}).setdefault("react", {})["max_steps"] = args.react_max_steps
+            if "files_per_step" in react_cfg:
+                args.react_files_per_step = _expect_int(react_cfg["files_per_step"], key="classification.react.files_per_step")
+                applied.setdefault("classification", {}).setdefault("react", {})["files_per_step"] = args.react_files_per_step
+            if "max_total_files" in react_cfg:
+                args.react_max_total_files = _expect_int(react_cfg["max_total_files"], key="classification.react.max_total_files")
+                applied.setdefault("classification", {}).setdefault("react", {})["max_total_files"] = args.react_max_total_files
+
+    dockerfile_cfg = agent_config.get("dockerfile")
+    if dockerfile_cfg is not None:
+        if not isinstance(dockerfile_cfg, dict):
+            raise ValueError("agent_config.dockerfile must be an object")
+        if "one_shot_direct" in dockerfile_cfg:
+            args.dockerfile_one_shot_direct = _expect_bool(
+                dockerfile_cfg["one_shot_direct"],
+                key="dockerfile.one_shot_direct",
+            )
+            applied.setdefault("dockerfile", {})["one_shot_direct"] = args.dockerfile_one_shot_direct
+
+    repair_cfg = agent_config.get("repair")
+    if repair_cfg is not None:
+        if not isinstance(repair_cfg, dict):
+            raise ValueError("agent_config.repair must be an object")
+
+        if "stateful_repair" in repair_cfg:
+            args.stateful_repair = _expect_bool(repair_cfg["stateful_repair"], key="repair.stateful_repair")
+            applied.setdefault("repair", {})["stateful_repair"] = args.stateful_repair
+        if "stateful_repair_tree" in repair_cfg:
+            args.stateful_repair_tree = _expect_bool(repair_cfg["stateful_repair_tree"], key="repair.stateful_repair_tree")
+            applied.setdefault("repair", {})["stateful_repair_tree"] = args.stateful_repair_tree
+        if "history_window" in repair_cfg:
+            args.stateful_history_window = _expect_int(repair_cfg["history_window"], key="repair.history_window")
+            applied.setdefault("repair", {})["history_window"] = args.stateful_history_window
+        if "history_max_chars" in repair_cfg:
+            args.stateful_history_max_chars = _expect_int(
+                repair_cfg["history_max_chars"],
+                key="repair.history_max_chars",
+            )
+            applied.setdefault("repair", {})["history_max_chars"] = args.stateful_history_max_chars
+        if "tree_max_chars" in repair_cfg:
+            args.stateful_tree_max_chars = _expect_int(repair_cfg["tree_max_chars"], key="repair.tree_max_chars")
+            applied.setdefault("repair", {})["tree_max_chars"] = args.stateful_tree_max_chars
+        if "tree_max_children" in repair_cfg:
+            args.stateful_tree_max_children = _expect_int(
+                repair_cfg["tree_max_children"],
+                key="repair.tree_max_children",
+            )
+            applied.setdefault("repair", {})["tree_max_children"] = args.stateful_tree_max_children
+
+    return applied
+
+
 def run_step(name: str, command: list[str], log_path: Path) -> dict:
     started_at = utc_now()
     started_ts = time.perf_counter()
@@ -388,6 +575,10 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         "--selection-timeout", str(args.selection_timeout),
         "--classification-timeout", str(args.classification_timeout),
         "--retrieval-strategy", resolve_classify_retrieval_strategy(),
+        "--embedding-model", args.embedding_model,
+        "--react-max-steps", str(args.react_max_steps),
+        "--react-files-per-step", str(args.react_files_per_step),
+        "--react-max-total-files", str(args.react_max_total_files),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
@@ -401,7 +592,10 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
     command = build_agent_command(python_executable, script_path)
     if args.force:
         command.append("--force")
-    if args.variant == "one_shot_direct":
+    one_shot_direct = args.variant == "one_shot_direct"
+    if args.dockerfile_one_shot_direct is not None:
+        one_shot_direct = args.dockerfile_one_shot_direct
+    if one_shot_direct:
         command.append("--one-shot-direct")
     command.extend([
         "--dockerfile-timeout", str(args.dockerfile_timeout),
@@ -694,6 +888,8 @@ def resolve_phase_skips() -> dict[str, bool]:
 
 
 def resolve_classify_retrieval_strategy() -> str:
+    if args.retrieval_strategy:
+        return args.retrieval_strategy
     if args.variant == "ab_retrieval_bm25":
         return "bm25"
     if args.variant == "ab_retrieval_neural_embedding":
@@ -913,20 +1109,7 @@ def main() -> int:
     install_guide_script = src_dir / "agent_install_guide.py"
     analysis_script = src_dir / "parse_results.py"
 
-    if args.print_summary:
-        print_planned_summary()
-        return 0
-
     phase_skips = resolve_phase_skips()
-    phases_selected = not (phase_skips["classify"] and phase_skips["dockerfile"] and phase_skips["repair"] and phase_skips["install_guide"])
-    if not phases_selected and not args.run_analysis:
-        log_error("Nothing to do. All pipeline phases were skipped and --run-analysis was not set.")
-        return 1
-
-    if args.variant == "one_shot_direct" and args.run_analysis:
-        log_info("Variant one_shot_direct selected: disabling --run-analysis because classification is skipped.")
-        args.run_analysis = False
-
     if args.variant in {"flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react"}:
         if args.stateful_repair:
             log_info(f"Variant {args.variant} selected: forcing stateful repair OFF for phase-2 ladder consistency.")
@@ -959,6 +1142,30 @@ def main() -> int:
         args.stateful_repair = True
         args.stateful_repair_tree = False
 
+    agent_config_path = _resolve_agent_config_path(workspace_root)
+    agent_config_applied: dict = {}
+    if agent_config_path is not None:
+        try:
+            agent_config = _load_agent_config(agent_config_path)
+            agent_config_applied = _apply_agent_config_overrides(agent_config, phase_skips)
+            log_info(f"Applied runtime agent config: {agent_config_path}")
+        except ValueError as error:
+            log_error(str(error))
+            return 1
+
+    if args.print_summary:
+        print_planned_summary()
+        return 0
+
+    phases_selected = not (phase_skips["classify"] and phase_skips["dockerfile"] and phase_skips["repair"] and phase_skips["install_guide"])
+    if not phases_selected and not args.run_analysis:
+        log_error("Nothing to do. All pipeline phases were skipped and --run-analysis was not set.")
+        return 1
+
+    if phase_skips["classify"] and args.run_analysis:
+        log_info("Classification is skipped: disabling --run-analysis because parse_results depends on classify outputs.")
+        args.run_analysis = False
+
     variant_policy = resolve_variant_policy()
 
     summary: dict = {
@@ -973,6 +1180,42 @@ def main() -> int:
         },
         "variant": args.variant,
         "variant_policy": variant_policy,
+        "agent_config": {
+            "path": str(agent_config_path) if agent_config_path is not None else None,
+            "applied_overrides": agent_config_applied,
+        },
+        "effective_runtime_controls": {
+            "phases": {
+                "classify": not phase_skips["classify"],
+                "dockerfile": not phase_skips["dockerfile"],
+                "repair": not phase_skips["repair"],
+                "install_guide": not phase_skips["install_guide"],
+            },
+            "classification": {
+                "retrieval_strategy": resolve_classify_retrieval_strategy(),
+                "embedding_model": args.embedding_model,
+                "react": {
+                    "max_steps": args.react_max_steps,
+                    "files_per_step": args.react_files_per_step,
+                    "max_total_files": args.react_max_total_files,
+                },
+            },
+            "dockerfile": {
+                "one_shot_direct": (
+                    args.variant == "one_shot_direct"
+                    if args.dockerfile_one_shot_direct is None
+                    else args.dockerfile_one_shot_direct
+                ),
+            },
+            "repair": {
+                "stateful_repair": args.stateful_repair,
+                "stateful_repair_tree": args.stateful_repair_tree,
+                "history_window": args.stateful_history_window,
+                "history_max_chars": args.stateful_history_max_chars,
+                "tree_max_chars": args.stateful_tree_max_chars,
+                "tree_max_children": args.stateful_tree_max_children,
+            },
+        },
         "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
         "paths": {
             "run_dir": str(run_dir),
