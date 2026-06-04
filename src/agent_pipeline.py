@@ -8,20 +8,20 @@ import time
 from pathlib import Path
 
 try:
-    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.log_utils import log_error, log_info, set_trace_enabled
-    from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
-    from RepoBuilderAgent.src.prompt_profiles import (
+    from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_trace_enabled
+    from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.core.prompt_profiles import (
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    import config as _config
-    from log_utils import log_error, log_info, set_trace_enabled
-    from timeout_config import load_timeout_defaults
-    from prompt_profiles import (
+    import core.config as _config
+    from core.log_utils import log_error, log_info, set_trace_enabled
+    from core.timeout_config import load_timeout_defaults
+    from core.prompt_profiles import (
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
@@ -149,6 +149,7 @@ parser.add_argument(
 )
 parser.add_argument("--skip-classify", action="store_true", help="Skip the classification phase")
 parser.add_argument("--skip-dockerfile", action="store_true", help="Skip the Dockerfile generation phase")
+parser.add_argument("--skip-validation-gate", action="store_true", help="Skip the post-generation validation gate phase")
 parser.add_argument("--skip-repair", action="store_true", help="Skip the Dockerfile repair phase")
 parser.add_argument("--skip-install-guide", action="store_true", help="Skip the INSTALL.md generation phase")
 parser.add_argument(
@@ -190,6 +191,18 @@ parser.add_argument(
     type=int,
     default=24,
     help="Maximum total selected files across iterative_react steps.",
+)
+parser.add_argument(
+    "--react-final-cap",
+    type=int,
+    default=12,
+    help="Hard final cap on selected files after retrieval normalization/reranking.",
+)
+parser.add_argument(
+    "--step2-token-budget",
+    type=int,
+    default=12000,
+    help="Target token budget for Step 2 classification prompt (0 disables budget packing).",
 )
 parser.add_argument(
     "--synthesis-react-max-steps",
@@ -495,6 +508,7 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
         phase_key_map = {
             "classify": "skip_classify",
             "dockerfile": "skip_dockerfile",
+            "validation_gate": "skip_validation_gate",
             "repair": "skip_repair",
             "install_guide": "skip_install_guide",
         }
@@ -541,6 +555,17 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
             if "max_total_files" in react_cfg:
                 args.react_max_total_files = _expect_int(react_cfg["max_total_files"], key="classification.react.max_total_files")
                 applied.setdefault("classification", {}).setdefault("react", {})["max_total_files"] = args.react_max_total_files
+            if "final_cap" in react_cfg:
+                args.react_final_cap = _expect_int(react_cfg["final_cap"], key="classification.react.final_cap")
+                applied.setdefault("classification", {}).setdefault("react", {})["final_cap"] = args.react_final_cap
+
+        if "step2_token_budget" in classification_cfg:
+            args.step2_token_budget = _expect_int(
+                classification_cfg["step2_token_budget"],
+                key="classification.step2_token_budget",
+                min_value=0,
+            )
+            applied.setdefault("classification", {})["step2_token_budget"] = args.step2_token_budget
 
     dockerfile_cfg = agent_config.get("dockerfile")
     if dockerfile_cfg is not None:
@@ -644,6 +669,8 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         "--react-max-steps", str(args.react_max_steps),
         "--react-files-per-step", str(args.react_files_per_step),
         "--react-max-total-files", str(args.react_max_total_files),
+        "--react-final-cap", str(args.react_final_cap),
+        "--step2-token-budget", str(args.step2_token_budget),
         "--synthesis-react-max-steps", str(args.synthesis_react_max_steps),
         "--validation-react-max-steps", str(args.validation_react_max_steps),
         "--results-dir", args.results_dir,
@@ -718,6 +745,19 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
     command.extend([
         "--stateful-tree-max-chars", str(args.stateful_tree_max_chars),
         "--stateful-tree-max-children", str(args.stateful_tree_max_children),
+    ])
+    return command
+
+
+def build_validation_gate_command(python_executable: str, script_path: Path) -> list[str]:
+    command = build_agent_command(python_executable, script_path, include_model_args=False)
+    if args.skip_hadolint:
+        command.append("--skip-hadolint-gate")
+    if args.trace:
+        command.append("--trace")
+    command.extend([
+        "--summaries-dir", args.summaries_dir,
+        "--dockerfiles-dir", args.dockerfiles_dir,
     ])
     return command
 
@@ -950,11 +990,13 @@ def resolve_phase_skips() -> dict[str, bool]:
     skips = {
         "classify": args.skip_classify,
         "dockerfile": args.skip_dockerfile,
+        "validation_gate": args.skip_validation_gate,
         "repair": args.skip_repair,
         "install_guide": args.skip_install_guide,
     }
     if args.variant == "one_shot_direct":
         skips["classify"] = True
+        skips["validation_gate"] = True
         skips["repair"] = True
         skips["install_guide"] = True
     return skips
@@ -1179,6 +1221,7 @@ def main() -> int:
     classify_script = src_dir / "agent_classify.py"
     dockerfile_script = src_dir / "agent_dockerfile.py"
     repair_script = src_dir / "agent_dockerfile_repair.py"
+    validation_gate_script = src_dir / "agent_validation_gate.py"
     install_guide_script = src_dir / "agent_install_guide.py"
     analysis_script = src_dir / "parse_results.py"
 
@@ -1236,7 +1279,13 @@ def main() -> int:
         print_planned_summary()
         return 0
 
-    phases_selected = not (phase_skips["classify"] and phase_skips["dockerfile"] and phase_skips["repair"] and phase_skips["install_guide"])
+    phases_selected = not (
+        phase_skips["classify"]
+        and phase_skips["dockerfile"]
+        and phase_skips["validation_gate"]
+        and phase_skips["repair"]
+        and phase_skips["install_guide"]
+    )
     if not phases_selected and not args.run_analysis:
         log_error("Nothing to do. All pipeline phases were skipped and --run-analysis was not set.")
         return 1
@@ -1267,6 +1316,7 @@ def main() -> int:
             "phases": {
                 "classify": not phase_skips["classify"],
                 "dockerfile": not phase_skips["dockerfile"],
+                "validation_gate": not phase_skips["validation_gate"],
                 "repair": not phase_skips["repair"],
                 "install_guide": not phase_skips["install_guide"],
             },
@@ -1286,13 +1336,16 @@ def main() -> int:
                     "exploration": str(Path(args.summaries_dir) / "<repo>.exploration.yaml"),
                     "synthesis": str(Path(args.summaries_dir) / "<repo>.synthesis.yaml"),
                     "validation": str(Path(args.summaries_dir) / "<repo>.validation.yaml"),
+                    "post_generation_validation": str(Path(args.summaries_dir) / "<repo>.postgen-validation.yaml"),
                     "scratchpad": str(Path(args.summaries_dir) / "<repo>.architecture-scratchpad.yaml"),
                 },
                 "react": {
                     "max_steps": args.react_max_steps,
                     "files_per_step": args.react_files_per_step,
                     "max_total_files": args.react_max_total_files,
+                    "final_cap": args.react_final_cap,
                 },
+                "step2_token_budget": args.step2_token_budget,
             },
             "dockerfile": {
                 "one_shot_direct": (
@@ -1353,6 +1406,15 @@ def main() -> int:
                     "dockerfile generation",
                     build_dockerfile_command(python_executable, dockerfile_script),
                     run_logs_dir / "dockerfile-generation.log",
+                )
+            )
+
+        if not phase_skips["validation_gate"]:
+            summary["phases"].append(
+                run_step(
+                    "post-generation validation gate",
+                    build_validation_gate_command(python_executable, validation_gate_script),
+                    run_logs_dir / "post-generation-validation-gate.log",
                 )
             )
 

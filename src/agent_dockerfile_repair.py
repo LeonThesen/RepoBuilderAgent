@@ -14,61 +14,67 @@ from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
 try:
-    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
-    from RepoBuilderAgent.src.prompt_profiles import (
+    from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.common import (
+    from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
         load_architecture_scratchpad,
+        load_shared_repository_state,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
+        render_shared_repository_state_for_prompt,
         render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
+        upsert_shared_repository_state,
         update_progress,
         validate_dockerfile_syntax,
     )
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    import config as _config
-    from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from timeout_config import load_timeout_defaults
-    from prompt_profiles import (
+    import core.config as _config
+    from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from core.timeout_config import load_timeout_defaults
+    from core.prompt_profiles import (
         apply_prompt_profile,
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from common import (
+    from core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
         load_architecture_scratchpad,
+        load_shared_repository_state,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
+        render_shared_repository_state_for_prompt,
         render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
+        upsert_shared_repository_state,
         update_progress,
         validate_dockerfile_syntax,
     )
@@ -1070,10 +1076,30 @@ async def repair_repository(
 
             summary = load_summary(repo_name, repo_path, summaries_dir)
             architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
+            shared_repository_state = load_shared_repository_state(repo_name, summaries_dir)
             validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
+            postgen_validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.postgen-validation.yaml")
+            if isinstance(postgen_validation_artifact, dict):
+                decision = postgen_validation_artifact.get("decision")
+                if isinstance(decision, dict) and decision.get("run_repair") is False:
+                    reason = str(decision.get("reason", "validation_gate_blocked"))
+                    log_warn(f"Skipping repair for {repo_url}: post-generation validation gate blocked repair ({reason}).")
+                    upsert_shared_repository_state(
+                        repo_name,
+                        summaries_dir,
+                        repo_url=repo_url,
+                        stage_name="repair",
+                        stage_update={
+                            "status": "skipped_by_validation_gate",
+                            "reason": reason,
+                            "postgen_validation_artifact": str(summaries_dir / f"{repo_name}.postgen-validation.yaml"),
+                        },
+                    )
+                    return
             architecture_scratchpad_context = (
                 render_validation_findings_for_prompt(validation_artifact)
                 + render_architecture_scratchpad_for_prompt(architecture_scratchpad)
+                + render_shared_repository_state_for_prompt(shared_repository_state)
             )
             current_dockerfile = dockerfile_path.read_text(encoding="utf-8")
             repair_history: list[dict] = []
@@ -1138,6 +1164,14 @@ async def repair_repository(
 
                 build_failure_hints = extract_failure_hints(build_log, "build", exit_code, timed_out=False)
                 report["attempts"][-1]["failure_hints_build"] = build_failure_hints
+                upsert_shared_repository_state(
+                    repo_name,
+                    summaries_dir,
+                    repo_url=repo_url,
+                    stage_name="repair",
+                    stage_update={"status": "in_progress", "attempt": attempt},
+                    failure_hint=build_failure_hints,
+                )
 
                 if exit_code == 0:
                     verify_log_path = report_dir / f"attempt-{attempt}.verify.log"
@@ -1160,6 +1194,14 @@ async def repair_repository(
                     }
                     verify_failure_hints = extract_failure_hints(verify_log, "verify", verify_exit_code, verify_timed_out)
                     report["attempts"][-1]["failure_hints_verify"] = verify_failure_hints
+                    upsert_shared_repository_state(
+                        repo_name,
+                        summaries_dir,
+                        repo_url=repo_url,
+                        stage_name="repair",
+                        stage_update={"status": "in_progress", "attempt": attempt},
+                        failure_hint=verify_failure_hints,
+                    )
 
                     if verify_exit_code == 0:
                         report["success"] = True
@@ -1245,6 +1287,14 @@ async def repair_repository(
                     }
                     retry_failure_hints = extract_failure_hints(retry_verify_log, "verify-retry", retry_exit_code, retry_timed_out)
                     report["attempts"][-1]["failure_hints_verify_retry"] = retry_failure_hints
+                    upsert_shared_repository_state(
+                        repo_name,
+                        summaries_dir,
+                        repo_url=repo_url,
+                        stage_name="repair",
+                        stage_update={"status": "in_progress", "attempt": attempt},
+                        failure_hint=retry_failure_hints,
+                    )
 
                     if retry_exit_code == 0:
                         report["success"] = True
@@ -1414,6 +1464,18 @@ async def repair_repository(
                     report["stateful_repair"]["decision_tree"] = build_stateful_decision_tree(repair_history)
             write_text(llm_metrics_path, render_yaml(finalize_llm_metrics(llm_metrics)))
             log_info(f"LLM metrics saved at {llm_metrics_path}")
+            upsert_shared_repository_state(
+                repo_name,
+                summaries_dir,
+                repo_url=repo_url,
+                stage_name="repair",
+                stage_update={
+                    "status": "completed" if report.get("success") else "failed",
+                    "success": bool(report.get("success", False)),
+                    "attempts": len(report.get("attempts", [])),
+                    "report_path": str(report_path),
+                },
+            )
 
         except httpx.HTTPError as error:
             log_warn(f"HTTP error for {repo_url}: {error}")

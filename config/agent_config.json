@@ -17,10 +17,12 @@
   "classification": {
     "retrieval_strategy": "iterative_react",
     "embedding_model": "text-embedding-3-small",
+    "step2_token_budget": 12000,
     "react": {
       "max_steps": 4,
       "files_per_step": 8,
-      "max_total_files": 24
+      "max_total_files": 24,
+      "final_cap": 12
     }
   },
   "dockerfile": {

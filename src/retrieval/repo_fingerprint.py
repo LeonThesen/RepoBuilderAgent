@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from RepoBuilderAgent.src.log_utils import log_info, log_trace
+    from RepoBuilderAgent.src.core.log_utils import log_info, log_trace
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    from log_utils import log_info, log_trace
+    from core.log_utils import log_info, log_trace
 
 # ---------------------------------------------------------------------------
 # Config Loading

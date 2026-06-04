@@ -9,21 +9,23 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from openai import APIConnectionError, APIError, APITimeoutError
 
 try:
-    from RepoBuilderAgent.src.log_utils import log_info, log_warn
-    from RepoBuilderAgent.src.repo_fingerprint import fingerprint
+    from RepoBuilderAgent.src.core.log_utils import log_info, log_warn
+    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    from log_utils import log_info, log_warn
-    from repo_fingerprint import fingerprint
+    from core.log_utils import log_info, log_warn
+    from retrieval.repo_fingerprint import fingerprint
 
 
 ARCHITECTURE_SCRATCHPAD_SCHEMA_VERSION = "1.0"
+SHARED_REPOSITORY_STATE_SCHEMA_VERSION = "1.0"
 
 
 def init_llm_metrics(repo_url: str, model: str, endpoint: str, timeout_seconds: int, max_retries: int) -> dict:
@@ -408,6 +410,127 @@ def load_architecture_scratchpad(repo_name: str, summaries_dir: Path) -> dict | 
     return loaded
 
 
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _shared_repository_state_path(repo_name: str, summaries_dir: Path) -> Path:
+    return summaries_dir / f"{repo_name}.shared-state.yaml"
+
+
+def _new_shared_repository_state(repo_name: str, repo_url: str = "") -> dict:
+    return {
+        "schema_version": SHARED_REPOSITORY_STATE_SCHEMA_VERSION,
+        "repo": repo_url,
+        "repo_name": repo_name,
+        "updated_at": _now_utc_iso(),
+        "stages": {
+            "classify": {},
+            "dockerfile": {},
+            "repair": {},
+            "install_guide": {},
+        },
+        "signals": {
+            "failure_hints": [],
+        },
+    }
+
+
+def load_shared_repository_state(repo_name: str, summaries_dir: Path) -> dict | None:
+    state_path = _shared_repository_state_path(repo_name, summaries_dir)
+    if not state_path.exists():
+        return None
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            loaded = yaml.safe_load(state_file)
+    except Exception:
+        return None
+
+    if not isinstance(loaded, dict):
+        return None
+
+    schema_version = str(loaded.get("schema_version", "")).strip()
+    if schema_version and schema_version != SHARED_REPOSITORY_STATE_SCHEMA_VERSION:
+        log_warn(
+            f"Skipping shared repository state for {repo_name}: unsupported schema version {schema_version}"
+        )
+        return None
+
+    if not schema_version:
+        loaded["schema_version"] = SHARED_REPOSITORY_STATE_SCHEMA_VERSION
+    return loaded
+
+
+def upsert_shared_repository_state(
+    repo_name: str,
+    summaries_dir: Path,
+    *,
+    repo_url: str = "",
+    stage_name: str | None = None,
+    stage_update: dict | None = None,
+    failure_hint: dict | None = None,
+) -> dict:
+    shared_state = load_shared_repository_state(repo_name, summaries_dir) or _new_shared_repository_state(
+        repo_name,
+        repo_url=repo_url,
+    )
+
+    if repo_url and not shared_state.get("repo"):
+        shared_state["repo"] = repo_url
+
+    stages = shared_state.setdefault("stages", {})
+    signals = shared_state.setdefault("signals", {})
+    failure_hints = signals.setdefault("failure_hints", [])
+    if not isinstance(failure_hints, list):
+        failure_hints = []
+        signals["failure_hints"] = failure_hints
+
+    if stage_name:
+        stage_bucket = stages.setdefault(stage_name, {})
+        if isinstance(stage_bucket, dict) and isinstance(stage_update, dict):
+            stage_bucket.update(stage_update)
+            stage_bucket["updated_at"] = _now_utc_iso()
+
+    if isinstance(failure_hint, dict) and failure_hint:
+        hint_record = dict(failure_hint)
+        hint_record.setdefault("recorded_at", _now_utc_iso())
+        failure_hints.append(hint_record)
+        if len(failure_hints) > 30:
+            del failure_hints[:-30]
+
+    shared_state["updated_at"] = _now_utc_iso()
+
+    state_path = _shared_repository_state_path(repo_name, summaries_dir)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as state_file:
+        yaml.dump(shared_state, state_file, sort_keys=False, allow_unicode=True)
+
+    return shared_state
+
+
+def render_shared_repository_state_for_prompt(shared_state: dict | None, *, max_chars: int = 8000) -> str:
+    if not shared_state:
+        return ""
+
+    rendered = yaml.dump(shared_state, sort_keys=False, allow_unicode=True)
+    safe_max = max(256, int(max_chars))
+    if len(rendered) > safe_max:
+        head_chars = max(128, safe_max // 2)
+        tail_chars = max(128, safe_max - head_chars)
+        rendered = (
+            rendered[:head_chars]
+            + "\n... [shared repository state truncated] ...\n"
+            + rendered[-tail_chars:]
+        )
+
+    return (
+        "\n\nSHARED_REPOSITORY_STATE:\n"
+        "Use this as cross-phase memory, including prior stage outputs and failure signals.\n"
+        f"{rendered}\n"
+    )
+
+
 def render_architecture_scratchpad_for_prompt(scratchpad: dict | None, *, max_chars: int = 8000) -> str:
     if not scratchpad:
         return ""
@@ -415,7 +538,13 @@ def render_architecture_scratchpad_for_prompt(scratchpad: dict | None, *, max_ch
     rendered = yaml.dump(scratchpad, sort_keys=False, allow_unicode=True)
     safe_max = max(256, int(max_chars))
     if len(rendered) > safe_max:
-        rendered = "... [architecture scratchpad truncated] ...\n" + rendered[-safe_max:]
+        head_chars = max(128, safe_max // 2)
+        tail_chars = max(128, safe_max - head_chars)
+        rendered = (
+            rendered[:head_chars]
+            + "\n... [architecture scratchpad truncated] ...\n"
+            + rendered[-tail_chars:]
+        )
 
     return (
         "\n\nARCHITECTURE_SCRATCHPAD:\n"

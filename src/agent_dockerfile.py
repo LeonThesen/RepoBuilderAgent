@@ -11,66 +11,72 @@ from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
 try:
-    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.timeout_config import load_timeout_defaults
-    from RepoBuilderAgent.src.prompt_profiles import (
+    from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.common import (
+    from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
         load_architecture_scratchpad,
+        load_shared_repository_state,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
+        render_shared_repository_state_for_prompt,
         render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
+        upsert_shared_repository_state,
         update_progress,
         validate_dockerfile_syntax,
     )
-    from RepoBuilderAgent.src.repo_fingerprint import fingerprint
+    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    import config as _config
-    from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from timeout_config import load_timeout_defaults
-    from prompt_profiles import (
+    import core.config as _config
+    from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from core.timeout_config import load_timeout_defaults
+    from core.prompt_profiles import (
         apply_prompt_profile,
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from common import (
+    from core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
         load_architecture_scratchpad,
+        load_shared_repository_state,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
+        render_shared_repository_state_for_prompt,
         render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
+        upsert_shared_repository_state,
         update_progress,
         validate_dockerfile_syntax,
     )
-    from repo_fingerprint import fingerprint
+    from retrieval.repo_fingerprint import fingerprint
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -364,6 +370,7 @@ async def generate_dockerfile(
                 summary = load_summary(repo_name, repo_path, summaries_dir)
 
             architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
+            shared_repository_state = load_shared_repository_state(repo_name, summaries_dir)
             synthesis_artifact = read_yaml_file(summaries_dir / f"{repo_name}.synthesis.yaml")
             validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
 
@@ -386,6 +393,7 @@ async def generate_dockerfile(
                     prompt += "\n\nSYNTHESIS_ARTIFACT:\n" + render_yaml(synthesis_artifact)
                 prompt += render_validation_findings_for_prompt(validation_artifact)
                 prompt += render_architecture_scratchpad_for_prompt(architecture_scratchpad)
+                prompt += render_shared_repository_state_for_prompt(shared_repository_state)
 
                 if failed_lint_attempts:
                     prompt += render_failed_lint_attempts(failed_lint_attempts)
@@ -463,6 +471,7 @@ async def generate_dockerfile(
                 .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
                 .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
             )
+            verify_prompt += render_shared_repository_state_for_prompt(shared_repository_state)
             log_info(f"Generating build verification command for {repo_url}...")
             verify_response = await chat_completion_with_retries(
                 client=client,
@@ -483,6 +492,20 @@ async def generate_dockerfile(
             with open(verify_command_path, "w", encoding="utf-8") as verify_file:
                 verify_file.write(verify_command + "\n")
             log_info(f"Saved build verification command to {verify_command_path}: {verify_command}")
+
+            upsert_shared_repository_state(
+                repo_name,
+                summaries_dir,
+                repo_url=repo_url,
+                stage_name="dockerfile",
+                stage_update={
+                    "status": "completed",
+                    "dockerfile_path": str(output_path),
+                    "verify_command_path": str(verify_command_path),
+                    "hadolint_lint_attempts": lint_attempt,
+                    "hadolint_failures": len(failed_lint_attempts),
+                },
+            )
 
             with open(llm_metrics_path, "w", encoding="utf-8") as metrics_file:
                 metrics_file.write(render_yaml(finalize_llm_metrics(llm_metrics)))
