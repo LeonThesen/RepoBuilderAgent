@@ -192,6 +192,24 @@ parser.add_argument(
     help="Maximum total selected files across iterative_react steps.",
 )
 parser.add_argument(
+    "--synthesis-react-max-steps",
+    type=int,
+    default=3,
+    help="Maximum L2 synthesis loop iterations passed to classify.",
+)
+parser.add_argument(
+    "--validation-react-max-steps",
+    type=int,
+    default=3,
+    help="Maximum L3 validation loop iterations passed to classify.",
+)
+parser.add_argument(
+    "--synthesis-subagents-enabled",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable parallel synthesis sub-agent passes in classify.",
+)
+parser.add_argument(
     "--dockerfile-one-shot-direct",
     action=argparse.BooleanOptionalAction,
     default=None,
@@ -451,6 +469,24 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
                 key="architecture.scratchpads_enabled",
             )
             applied.setdefault("architecture", {})["scratchpads_enabled"] = args.arch_scratchpads_enabled
+        if "synthesis_subagents_enabled" in architecture_cfg:
+            args.synthesis_subagents_enabled = _expect_bool(
+                architecture_cfg["synthesis_subagents_enabled"],
+                key="architecture.synthesis_subagents_enabled",
+            )
+            applied.setdefault("architecture", {})["synthesis_subagents_enabled"] = args.synthesis_subagents_enabled
+        if "synthesis_react_max_steps" in architecture_cfg:
+            args.synthesis_react_max_steps = _expect_int(
+                architecture_cfg["synthesis_react_max_steps"],
+                key="architecture.synthesis_react_max_steps",
+            )
+            applied.setdefault("architecture", {})["synthesis_react_max_steps"] = args.synthesis_react_max_steps
+        if "validation_react_max_steps" in architecture_cfg:
+            args.validation_react_max_steps = _expect_int(
+                architecture_cfg["validation_react_max_steps"],
+                key="architecture.validation_react_max_steps",
+            )
+            applied.setdefault("architecture", {})["validation_react_max_steps"] = args.validation_react_max_steps
 
     phases_cfg = agent_config.get("phases")
     if phases_cfg is not None:
@@ -608,12 +644,15 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         "--react-max-steps", str(args.react_max_steps),
         "--react-files-per-step", str(args.react_files_per_step),
         "--react-max-total-files", str(args.react_max_total_files),
+        "--synthesis-react-max-steps", str(args.synthesis_react_max_steps),
+        "--validation-react-max-steps", str(args.validation_react_max_steps),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
         "--scratchpad-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
         "--analysis-dir", args.analysis_dir,
     ])
+    command.append("--synthesis-subagents-enabled" if args.synthesis_subagents_enabled else "--no-synthesis-subagents-enabled")
     command.append("--exploration-enabled" if args.arch_exploration_enabled else "--no-exploration-enabled")
     command.append("--synthesis-enabled" if args.arch_synthesis_enabled else "--no-synthesis-enabled")
     command.append("--validation-enabled" if args.arch_validation_enabled else "--no-validation-enabled")
@@ -1239,6 +1278,9 @@ def main() -> int:
                     "synthesis_enabled": args.arch_synthesis_enabled,
                     "validation_enabled": args.arch_validation_enabled,
                     "scratchpads_enabled": args.arch_scratchpads_enabled,
+                    "synthesis_subagents_enabled": args.synthesis_subagents_enabled,
+                    "synthesis_react_max_steps": args.synthesis_react_max_steps,
+                    "validation_react_max_steps": args.validation_react_max_steps,
                 },
                 "artifact_patterns": {
                     "exploration": str(Path(args.summaries_dir) / "<repo>.exploration.yaml"),

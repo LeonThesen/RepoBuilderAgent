@@ -126,6 +126,24 @@ parser.add_argument(
     default=24,
     help="Maximum total files retained across iterative_react steps.",
 )
+parser.add_argument(
+    "--synthesis-react-max-steps",
+    type=int,
+    default=3,
+    help="Maximum L2 synthesis loop iterations.",
+)
+parser.add_argument(
+    "--validation-react-max-steps",
+    type=int,
+    default=3,
+    help="Maximum L3 validation loop iterations.",
+)
+parser.add_argument(
+    "--synthesis-subagents-enabled",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable parallel synthesis sub-agent passes before iterative L2 convergence.",
+)
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
@@ -621,6 +639,412 @@ async def select_files_by_iterative_react(
 
     return selected_files, step1_tokens_total, react_trace, stop_reason
 
+
+def _normalize_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for raw in value:
+        if isinstance(raw, (str, int, float)):
+            text = str(raw).strip()
+            if text:
+                items.append(text)
+    return items
+
+
+def _normalize_validation_checks(value: Any) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, dict[str, str]] = {}
+    for key, payload in value.items():
+        if not isinstance(key, str):
+            continue
+        status = "warn"
+        detail = "No detail provided."
+        if isinstance(payload, dict):
+            raw_status = str(payload.get("status", "warn")).strip().lower()
+            if raw_status in {"pass", "warn", "fail"}:
+                status = raw_status
+            raw_detail = payload.get("detail")
+            if isinstance(raw_detail, str) and raw_detail.strip():
+                detail = raw_detail.strip()
+        elif isinstance(payload, str) and payload.strip():
+            detail = payload.strip()
+        normalized[key.strip()] = {"status": status, "detail": detail}
+    return normalized
+
+
+def _build_file_context_by_path(repo_path: Path) -> dict[str, str]:
+    file_context: dict[str, str] = {}
+    for rel, content in collect_retrieval_candidates(repo_path):
+        normalized = rel.lstrip("./")
+        if normalized and normalized not in file_context:
+            file_context[normalized] = content
+    return file_context
+
+
+def _render_requested_file_context(requested_files: list[str], file_context_by_path: dict[str, str], *, max_files: int = 6, max_chars: int = 7000) -> tuple[str, list[str]]:
+    if not requested_files:
+        return "", []
+
+    accepted: list[str] = []
+    rendered_parts: list[str] = []
+    budget_used = 0
+    safe_max_chars = max(1000, max_chars)
+
+    for rel in requested_files:
+        candidate = rel.strip().lstrip("./")
+        if not candidate or candidate in accepted:
+            continue
+        content = file_context_by_path.get(candidate)
+        if content is None:
+            continue
+
+        snippet = content.strip()
+        if not snippet:
+            continue
+
+        snippet_budget = 1200
+        if len(snippet) > snippet_budget:
+            snippet = snippet[:snippet_budget] + "\n... [truncated]"
+        block = f"### {candidate}\n{snippet}\n"
+
+        if budget_used + len(block) > safe_max_chars:
+            break
+
+        rendered_parts.append(block)
+        accepted.append(candidate)
+        budget_used += len(block)
+        if len(accepted) >= max(1, max_files):
+            break
+
+    if not rendered_parts:
+        return "", []
+
+    return "\n\nTARGETED_FILE_CONTEXT:\n" + "\n".join(rendered_parts), accepted
+
+
+async def _run_l2_synthesis_loop(
+    *,
+    repo_url: str,
+    repo_name: str,
+    selected_files: list[str],
+    summary: str,
+    exploration_artifact: dict[str, Any],
+    file_context_by_path: dict[str, str],
+    llm_metrics: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    selected_snapshot = selected_files[:]
+    selected_lower = [path.lower() for path in selected_snapshot]
+
+    base_hypotheses: list[str] = []
+    if any("package.json" in path for path in selected_lower):
+        base_hypotheses.append("Use Node.js package-manager driven install/build flow inferred from package.json.")
+    if any("pyproject.toml" in path or "requirements.txt" in path for path in selected_lower):
+        base_hypotheses.append("Use Python dependency installation before running project-specific build/test steps.")
+    if any("go.mod" in path for path in selected_lower):
+        base_hypotheses.append("Use Go module restore and compile/test verification path.")
+    if any("cargo.toml" in path for path in selected_lower):
+        base_hypotheses.append("Use Cargo dependency fetch and build workflow with Rust toolchain in image.")
+    if not base_hypotheses:
+        base_hypotheses.append("Fallback to minimal deterministic build strategy based on discovered repository structure.")
+
+    synthesis_hypotheses = base_hypotheses[:]
+    risk_notes = [
+        "manifest_evidence_missing" if exploration_artifact["evidence_gaps"]["manifest_evidence_missing"] else None,
+        "docker_evidence_missing" if exploration_artifact["evidence_gaps"]["docker_evidence_missing"] else None,
+        "test_evidence_missing" if exploration_artifact["evidence_gaps"]["test_evidence_missing"] else None,
+    ]
+    risk_notes = [item for item in risk_notes if item]
+
+    subagent_outputs: list[dict[str, Any]] = []
+    expanded_files: list[str] = []
+    targeted_context = ""
+
+    if args.synthesis_subagents_enabled:
+        roles = [
+            ("dependency", "Identify dependency installation order and package-manager assumptions."),
+            ("build", "Identify reproducible build strategy and required system build tools."),
+            ("verification", "Identify strongest in-container verification command candidates."),
+        ]
+
+        async def run_subagent(role_name: str, role_goal: str) -> dict[str, Any]:
+            prompt = (
+                f"Repository: {repo_url}\n"
+                "You are a focused synthesis sub-agent.\n"
+                f"Role: {role_name}. Goal: {role_goal}\n\n"
+                "Use the summary evidence below and return YAML with keys: findings (list), risks (list), selected_files (list), done (bool).\n\n"
+                "SUMMARY_EVIDENCE:\n"
+                f"{summary}\n"
+            )
+            response = await chat_completion_with_retries(
+                client=client,
+                model=args.model,
+                temperature=EFFECTIVE_TEMPERATURE,
+                messages=[{"role": "user", "content": prompt}],
+                repo_url=repo_url,
+                phase=f"classify-step2-synthesis-subagent-{role_name}",
+                metrics=llm_metrics,
+                timeout_seconds=args.classification_timeout,
+                max_retries=args.llm_max_retries,
+                retry_backoff_seconds=args.llm_retry_backoff_seconds,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            try:
+                parsed = parse_llm_yaml(raw)
+            except Exception:
+                parsed = {}
+            findings = _normalize_text_list(parsed.get("findings") if isinstance(parsed, dict) else [])
+            risks = _normalize_text_list(parsed.get("risks") if isinstance(parsed, dict) else [])
+            requested = extract_selected_files(raw)
+            return {
+                "role": role_name,
+                "findings": findings,
+                "risks": risks,
+                "requested_files": requested,
+            }
+
+        subagent_outputs = await asyncio.gather(*[run_subagent(role, goal) for role, goal in roles])
+        for output in subagent_outputs:
+            synthesis_hypotheses.extend(output.get("findings", []))
+            risk_notes.extend(output.get("risks", []))
+            expanded_files.extend(output.get("requested_files", []))
+
+    max_steps = max(1, int(args.synthesis_react_max_steps))
+    loop_trace: list[dict[str, Any]] = []
+    stop_reason = "max_steps"
+
+    for step_idx in range(1, max_steps + 1):
+        context_block, accepted_files = _render_requested_file_context(
+            expanded_files,
+            file_context_by_path,
+            max_files=6,
+            max_chars=7000,
+        )
+        if context_block:
+            targeted_context = context_block
+
+        prompt = (
+            f"Repository: {repo_url}\n"
+            "L2 synthesis ReAct loop. Improve build strategy hypotheses and risks using evidence.\n"
+            "Return YAML keys: thought, hypothesis_updates (list), risk_updates (list), selected_files (list), done (bool).\n"
+            "selected_files should only include NEW file paths when more evidence is needed.\n\n"
+            "CURRENT_HYPOTHESES:\n"
+            + "\n".join(f"- {item}" for item in synthesis_hypotheses[:20])
+            + "\n\nCURRENT_RISKS:\n"
+            + ("\n".join(f"- {item}" for item in risk_notes[:20]) if risk_notes else "- (none)")
+            + "\n\nSUMMARY_EVIDENCE:\n"
+            + summary
+            + "\n"
+            + targeted_context
+        )
+
+        response = await chat_completion_with_retries(
+            client=client,
+            model=args.model,
+            temperature=EFFECTIVE_TEMPERATURE,
+            messages=[{"role": "user", "content": prompt}],
+            repo_url=repo_url,
+            phase="classify-step2-synthesis-react",
+            metrics=llm_metrics,
+            timeout_seconds=args.classification_timeout,
+            max_retries=args.llm_max_retries,
+            retry_backoff_seconds=args.llm_retry_backoff_seconds,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        try:
+            parsed = parse_llm_yaml(raw)
+        except Exception:
+            parsed = {}
+
+        updates = _normalize_text_list(parsed.get("hypothesis_updates") if isinstance(parsed, dict) else [])
+        risk_updates = _normalize_text_list(parsed.get("risk_updates") if isinstance(parsed, dict) else [])
+        requested_files = extract_selected_files(raw)
+        done_flag = _parse_react_done(raw)
+
+        synthesis_hypotheses.extend(updates)
+        risk_notes.extend(risk_updates)
+        expanded_files.extend(requested_files)
+
+        loop_trace.append(
+            {
+                "step": step_idx,
+                "updates": updates,
+                "risk_updates": risk_updates,
+                "requested_files": requested_files,
+                "accepted_context_files": accepted_files,
+                "done": done_flag,
+            }
+        )
+
+        if done_flag:
+            stop_reason = "model_done"
+            break
+        if step_idx > 1 and not updates and not risk_updates and not requested_files:
+            stop_reason = "converged_no_updates"
+            break
+
+    dedup_hypotheses = list(dict.fromkeys(item.strip() for item in synthesis_hypotheses if item and item.strip()))
+    dedup_risks = list(dict.fromkeys(item.strip() for item in risk_notes if item and item.strip()))
+
+    synthesis_artifact = {
+        "repo": repo_url,
+        "stage": "synthesis",
+        "react": {
+            "steps": len(loop_trace),
+            "max_steps": max_steps,
+            "stop_reason": stop_reason,
+            "subagents_enabled": args.synthesis_subagents_enabled,
+            "subagent_count": len(subagent_outputs),
+        },
+        "subagent_outputs": subagent_outputs,
+        "build_strategy_hypotheses": dedup_hypotheses[:40],
+        "dependency_assumptions": {
+            "system_build_tools_required": any(marker in path for marker in ("binding.gyp", "cmake", "makefile") for path in selected_lower),
+            "network_install_steps_likely": any(
+                marker in path
+                for marker in ("package.json", "requirements.txt", "pyproject.toml", "go.mod", "cargo.toml")
+                for path in selected_lower
+            ),
+        },
+        "risk_notes": dedup_risks[:40],
+    }
+    return synthesis_artifact, loop_trace, stop_reason
+
+
+async def _run_l3_validation_loop(
+    *,
+    repo_url: str,
+    summary: str,
+    synthesis_artifact: dict[str, Any],
+    selected_files: list[str],
+    file_context_by_path: dict[str, str],
+    llm_metrics: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    selected_lower = [path.lower() for path in selected_files]
+    has_manifest = any(
+        any(marker in path for marker in ("package.json", "requirements.txt", "pyproject.toml", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
+        for path in selected_lower
+    )
+    has_ci = any(path.startswith(".github/workflows/") for path in selected_lower)
+    has_docker = any("dockerfile" in path or "docker-compose" in path for path in selected_lower)
+    has_tests = any("test" in path or "spec" in path for path in selected_lower)
+
+    checks: dict[str, dict[str, str]] = {
+        "manifest_evidence": {
+            "status": "pass" if has_manifest else "warn",
+            "detail": "Manifest/build metadata detected in selected evidence." if has_manifest else "No manifest/build metadata detected in selected evidence.",
+        },
+        "ci_workflow_evidence": {
+            "status": "pass" if has_ci else "warn",
+            "detail": "CI workflow files detected." if has_ci else "No CI workflow files detected in selected evidence.",
+        },
+        "docker_evidence": {
+            "status": "pass" if has_docker else "warn",
+            "detail": "Docker-related files detected." if has_docker else "No Docker-related files detected in selected evidence.",
+        },
+        "test_evidence": {
+            "status": "pass" if has_tests else "warn",
+            "detail": "Test-related files detected." if has_tests else "No test-related files detected in selected evidence.",
+        },
+        "selected_summary_non_empty": {
+            "status": "pass" if bool(summary.strip()) else "fail",
+            "detail": "Reduced selected-files summary is non-empty." if bool(summary.strip()) else "Reduced selected-files summary is empty.",
+        },
+    }
+
+    requested_files: list[str] = []
+    loop_trace: list[dict[str, Any]] = []
+    max_steps = max(1, int(args.validation_react_max_steps))
+    stop_reason = "max_steps"
+    targeted_context = ""
+
+    for step_idx in range(1, max_steps + 1):
+        context_block, accepted_files = _render_requested_file_context(
+            requested_files,
+            file_context_by_path,
+            max_files=6,
+            max_chars=7000,
+        )
+        if context_block:
+            targeted_context = context_block
+
+        prompt = (
+            f"Repository: {repo_url}\n"
+            "L3 validation ReAct loop. Validate installation/build evidence coverage and highlight risky gaps.\n"
+            "Return YAML keys: thought, checks (map), warnings (list), selected_files (list), done (bool).\n"
+            "Each checks entry must include status (pass|warn|fail) and detail.\n\n"
+            "CURRENT_CHECKS:\n"
+            + yaml.dump(checks, sort_keys=False, allow_unicode=True)
+            + "\nSYNTHESIS_ARTIFACT:\n"
+            + yaml.dump(synthesis_artifact, sort_keys=False, allow_unicode=True)
+            + "\nSUMMARY_EVIDENCE:\n"
+            + summary
+            + "\n"
+            + targeted_context
+        )
+
+        response = await chat_completion_with_retries(
+            client=client,
+            model=args.model,
+            temperature=EFFECTIVE_TEMPERATURE,
+            messages=[{"role": "user", "content": prompt}],
+            repo_url=repo_url,
+            phase="classify-step2-validation-react",
+            metrics=llm_metrics,
+            timeout_seconds=args.classification_timeout,
+            max_retries=args.llm_max_retries,
+            retry_backoff_seconds=args.llm_retry_backoff_seconds,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        try:
+            parsed = parse_llm_yaml(raw)
+        except Exception:
+            parsed = {}
+
+        parsed_checks = _normalize_validation_checks(parsed.get("checks") if isinstance(parsed, dict) else {})
+        warning_updates = _normalize_text_list(parsed.get("warnings") if isinstance(parsed, dict) else [])
+        requested = extract_selected_files(raw)
+        done_flag = _parse_react_done(raw)
+
+        checks.update(parsed_checks)
+        requested_files.extend(requested)
+        loop_trace.append(
+            {
+                "step": step_idx,
+                "updated_checks": sorted(parsed_checks.keys()),
+                "warnings": warning_updates,
+                "requested_files": requested,
+                "accepted_context_files": accepted_files,
+                "done": done_flag,
+            }
+        )
+
+        if done_flag:
+            stop_reason = "model_done"
+            break
+        if step_idx > 1 and not parsed_checks and not requested and not warning_updates:
+            stop_reason = "converged_no_updates"
+            break
+
+    validation_warnings = [
+        key
+        for key, value in checks.items()
+        if value.get("status") in {"warn", "fail"}
+    ]
+    validation_artifact = {
+        "repo": repo_url,
+        "stage": "validation",
+        "react": {
+            "steps": len(loop_trace),
+            "max_steps": max_steps,
+            "stop_reason": stop_reason,
+        },
+        "checks": checks,
+        "warnings": validation_warnings,
+    }
+    return validation_artifact, loop_trace, stop_reason
+
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
@@ -873,37 +1297,16 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             log_info(f"Selected files list saved at {selected_files_path}")
             log_info(f"Generated selected-files summary at {summary_path}")
 
-            build_hypotheses: list[str] = []
-            if any("package.json" in path for path in selected_lower):
-                build_hypotheses.append("Use Node.js package-manager driven install/build flow inferred from package.json.")
-            if any("pyproject.toml" in path or "requirements.txt" in path for path in selected_lower):
-                build_hypotheses.append("Use Python dependency installation before running project-specific build/test steps.")
-            if any("go.mod" in path for path in selected_lower):
-                build_hypotheses.append("Use Go module restore and compile/test verification path.")
-            if any("cargo.toml" in path for path in selected_lower):
-                build_hypotheses.append("Use Cargo dependency fetch and build workflow with Rust toolchain in image.")
-            if not build_hypotheses:
-                build_hypotheses.append("Fallback to minimal deterministic build strategy based on discovered repository structure.")
-
-            synthesis_artifact = {
-                "repo": repo_url,
-                "stage": "synthesis",
-                "build_strategy_hypotheses": build_hypotheses,
-                "dependency_assumptions": {
-                    "system_build_tools_required": any(marker in path for marker in ("binding.gyp", "cmake", "makefile") for path in selected_lower),
-                    "network_install_steps_likely": any(
-                        marker in path
-                        for marker in ("package.json", "requirements.txt", "pyproject.toml", "go.mod", "cargo.toml")
-                        for path in selected_lower
-                    ),
-                },
-                "risk_notes": [
-                    "manifest_evidence_missing" if exploration_artifact["evidence_gaps"]["manifest_evidence_missing"] else None,
-                    "docker_evidence_missing" if exploration_artifact["evidence_gaps"]["docker_evidence_missing"] else None,
-                    "test_evidence_missing" if exploration_artifact["evidence_gaps"]["test_evidence_missing"] else None,
-                ],
-            }
-            synthesis_artifact["risk_notes"] = [item for item in synthesis_artifact["risk_notes"] if item]
+            file_context_by_path = _build_file_context_by_path(repo_path)
+            synthesis_artifact, synthesis_loop_trace, synthesis_stop_reason = await _run_l2_synthesis_loop(
+                repo_url=repo_url,
+                repo_name=repo_name,
+                selected_files=selected_files,
+                summary=summary,
+                exploration_artifact=exploration_artifact,
+                file_context_by_path=file_context_by_path,
+                llm_metrics=llm_metrics,
+            )
             synthesis_path = None
             if args.synthesis_enabled:
                 synthesis_path = summary_dir / f"{repo_name}.synthesis.yaml"
@@ -911,39 +1314,16 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     yaml.dump(synthesis_artifact, synthesis_file, sort_keys=False, allow_unicode=True)
                 log_info(f"Synthesis artifact saved at {synthesis_path}")
 
-            validation_checks = {
-                "manifest_evidence": {
-                    "status": "pass" if has_manifest else "warn",
-                    "detail": "Manifest/build metadata detected in selected evidence." if has_manifest else "No manifest/build metadata detected in selected evidence.",
-                },
-                "ci_workflow_evidence": {
-                    "status": "pass" if has_ci else "warn",
-                    "detail": "CI workflow files detected." if has_ci else "No CI workflow files detected in selected evidence.",
-                },
-                "docker_evidence": {
-                    "status": "pass" if has_docker else "warn",
-                    "detail": "Docker-related files detected." if has_docker else "No Docker-related files detected in selected evidence.",
-                },
-                "test_evidence": {
-                    "status": "pass" if has_tests else "warn",
-                    "detail": "Test-related files detected." if has_tests else "No test-related files detected in selected evidence.",
-                },
-                "selected_summary_non_empty": {
-                    "status": "pass" if bool(summary.strip()) else "fail",
-                    "detail": "Reduced selected-files summary is non-empty." if bool(summary.strip()) else "Reduced selected-files summary is empty.",
-                },
-            }
-            validation_warnings = [
-                key
-                for key, value in validation_checks.items()
-                if value.get("status") in {"warn", "fail"}
-            ]
-            validation_artifact = {
-                "repo": repo_url,
-                "stage": "validation",
-                "checks": validation_checks,
-                "warnings": validation_warnings,
-            }
+            validation_artifact, validation_loop_trace, validation_stop_reason = await _run_l3_validation_loop(
+                repo_url=repo_url,
+                summary=summary,
+                synthesis_artifact=synthesis_artifact,
+                selected_files=selected_files,
+                file_context_by_path=file_context_by_path,
+                llm_metrics=llm_metrics,
+            )
+            validation_checks = validation_artifact["checks"]
+            validation_warnings = validation_artifact["warnings"]
             validation_path = None
             if args.validation_enabled:
                 validation_path = summary_dir / f"{repo_name}.validation.yaml"
@@ -1041,6 +1421,9 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                             "structure_summary_path": str(structure_summary_path),
                             "selected_files_path": str(selected_files_path),
                             "synthesis_artifact_path": str(synthesis_path) if synthesis_path else None,
+                            "react_steps": len(synthesis_loop_trace),
+                            "react_stop_reason": synthesis_stop_reason,
+                            "subagents_enabled": args.synthesis_subagents_enabled,
                             "build_strategy_hypotheses": synthesis_artifact["build_strategy_hypotheses"],
                             "risk_notes": synthesis_artifact["risk_notes"],
                             "prompt_tokens": {
@@ -1051,6 +1434,8 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                         },
                         "validation": {
                             "validation_artifact_path": str(validation_path) if validation_path else None,
+                            "react_steps": len(validation_loop_trace),
+                            "react_stop_reason": validation_stop_reason,
                             "checks": validation_checks,
                             "warnings": validation_warnings,
                         },
