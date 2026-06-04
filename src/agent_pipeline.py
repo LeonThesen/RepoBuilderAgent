@@ -255,6 +255,8 @@ RUN_DIR_DEFAULTS = {
     "analysis_dir": (DEFAULT_ANALYSIS_DIR, "analysis"),
 }
 
+CANONICAL_EXECUTION_BRANCH = "ablation/full-system/runtime-agent-config"
+
 
 set_trace_enabled(args.trace)
 
@@ -1002,185 +1004,210 @@ def resolve_phase_skips() -> dict[str, bool]:
     return skips
 
 
+def _expected_validation_gate_enabled_for_variant(variant: str) -> bool | None:
+    contract = {
+        "one_shot_direct": False,
+        "flat_baseline": False,
+        "exploration": False,
+        "synthesis": False,
+        "validation": True,
+        "full_system": True,
+        "ab_retrieval_bm25": True,
+        "ab_retrieval_neural_embedding": True,
+        "ab_retrieval_one_shot_fingerprint": True,
+        "ab_retrieval_iterative_react": True,
+        "ab_prev_attempt_ctx_on": True,
+        "ab_stateful_tree_on": True,
+        "ab_stateful_tree_off": True,
+    }
+    return contract.get(variant)
+
+
+def enforce_variant_phase_contract(phase_skips: dict[str, bool]) -> bool | None:
+    expected_enabled = _expected_validation_gate_enabled_for_variant(args.variant)
+    if expected_enabled is None:
+        return None
+
+    current_enabled = not bool(phase_skips.get("validation_gate", False))
+    if current_enabled != expected_enabled:
+        log_info(
+            "Variant %s selected: forcing post-generation validation gate %s for ablation-contract consistency."
+            % (args.variant, "ON" if expected_enabled else "OFF")
+        )
+        phase_skips["validation_gate"] = not expected_enabled
+        args.skip_validation_gate = not expected_enabled
+
+    effective_enabled = not bool(phase_skips.get("validation_gate", False))
+    if effective_enabled != expected_enabled:
+        raise ValueError(
+            "variant/phase contract violation: variant=%s expected validation_gate=%s but got %s"
+            % (args.variant, expected_enabled, effective_enabled)
+        )
+    return expected_enabled
+
+
 def resolve_classify_retrieval_strategy() -> str:
+    retrieval_overrides = {
+        "ab_retrieval_bm25": "bm25",
+        "ab_retrieval_neural_embedding": "neural_embedding",
+        "ab_retrieval_one_shot_fingerprint": "one_shot_fingerprint",
+        "ab_retrieval_iterative_react": "iterative_react",
+    }
     if args.retrieval_strategy:
         return args.retrieval_strategy
-    if args.variant == "ab_retrieval_bm25":
-        return "bm25"
-    if args.variant == "ab_retrieval_neural_embedding":
-        return "neural_embedding"
-    if args.variant == "ab_retrieval_one_shot_fingerprint":
-        return "one_shot_fingerprint"
-    if args.variant == "ab_retrieval_iterative_react":
-        return "iterative_react"
+    if args.variant in retrieval_overrides:
+        return retrieval_overrides[args.variant]
     return "iterative_react"
 
 
+VARIANT_POLICY_TABLE: dict[str, dict] = {
+    "ab_retrieval_iterative_react": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_react_retrieval",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_react",
+    },
+    "ab_retrieval_one_shot_fingerprint": {
+        "phase2_anchor": False,
+        "repo_context_source": "one_shot_fingerprint_retrieval",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "one_shot_fingerprint",
+    },
+    "ab_retrieval_neural_embedding": {
+        "phase2_anchor": False,
+        "repo_context_source": "neural_embedding_retrieval",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "neural_embedding",
+    },
+    "ab_retrieval_bm25": {
+        "phase2_anchor": False,
+        "repo_context_source": "bm25_retrieval",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "bm25",
+    },
+    "ab_stateful_tree_off": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_exploration",
+        "stateful_repair_enabled": True,
+        "stateful_tree_enabled": False,
+        "prev_attempt_context_enabled": True,
+    },
+    "ab_stateful_tree_on": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_exploration",
+        "stateful_repair_enabled": True,
+        "stateful_tree_enabled": True,
+        "prev_attempt_context_enabled": True,
+    },
+    "ab_prev_attempt_ctx_on": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_exploration",
+        "stateful_repair_enabled": True,
+        "stateful_tree_enabled": False,
+        "prev_attempt_context_enabled": True,
+    },
+    "full_system": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_exploration",
+    },
+    "validation": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": False,
+        "retrieval_strategy": "iterative_exploration",
+    },
+    "synthesis": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_plus_synthesis",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
+        "retrieval_strategy": "iterative_exploration",
+    },
+    "exploration": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
+        "retrieval_strategy": "iterative_exploration",
+    },
+    "one_shot_direct": {
+        "phase2_anchor": False,
+        "repo_context_source": "static_fingerprint_only",
+        "classification_required": False,
+        "repair_enabled": False,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
+        "retrieval_strategy": "none",
+    },
+}
+
+
 def resolve_variant_policy() -> dict:
-    if args.variant == "ab_retrieval_iterative_react":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_react_retrieval",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "iterative_react",
-        }
-
-    if args.variant == "ab_retrieval_one_shot_fingerprint":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "one_shot_fingerprint_retrieval",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "one_shot_fingerprint",
-        }
-
-    if args.variant == "ab_retrieval_neural_embedding":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "neural_embedding_retrieval",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "neural_embedding",
-        }
-
-    if args.variant == "ab_retrieval_bm25":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "bm25_retrieval",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "bm25",
-        }
-
-    if args.variant == "ab_stateful_tree_off":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "iterative_exploration",
-            "stateful_repair_enabled": True,
-            "stateful_tree_enabled": False,
-            "prev_attempt_context_enabled": True,
-        }
-
-    if args.variant == "ab_stateful_tree_on":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "iterative_exploration",
-            "stateful_repair_enabled": True,
-            "stateful_tree_enabled": True,
-            "prev_attempt_context_enabled": True,
-        }
-
-    if args.variant == "ab_prev_attempt_ctx_on":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "iterative_exploration",
-            "stateful_repair_enabled": True,
-            "stateful_tree_enabled": False,
-            "prev_attempt_context_enabled": True,
-        }
-
-    if args.variant == "full_system":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": True,
-            "retrieval_strategy": "iterative_exploration",
-        }
-
-    if args.variant == "validation":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_exploration_synthesis_validation",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": True,
-            "scratchpads_enabled": False,
-            "retrieval_strategy": "iterative_exploration",
-        }
-
-    if args.variant == "synthesis":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_exploration_plus_synthesis",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": True,
-            "validation_enabled": False,
-            "scratchpads_enabled": False,
-            "retrieval_strategy": "iterative_exploration",
-        }
-
-    if args.variant == "exploration":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "iterative_exploration",
-            "classification_required": True,
-            "repair_enabled": True,
-            "exploration_enabled": True,
-            "synthesis_enabled": False,
-            "validation_enabled": False,
-            "scratchpads_enabled": False,
-            "retrieval_strategy": "iterative_exploration",
-        }
-
-    if args.variant == "one_shot_direct":
-        return {
-            "phase2_anchor": False,
-            "repo_context_source": "static_fingerprint_only",
-            "classification_required": False,
-            "repair_enabled": False,
-            "exploration_enabled": False,
-            "synthesis_enabled": False,
-            "validation_enabled": False,
-            "scratchpads_enabled": False,
-            "retrieval_strategy": "none",
-        }
+    if args.variant in VARIANT_POLICY_TABLE:
+        return VARIANT_POLICY_TABLE[args.variant]
 
     return {
         "phase2_anchor": True,
@@ -1193,6 +1220,35 @@ def resolve_variant_policy() -> dict:
         "scratchpads_enabled": False,
         "retrieval_strategy": "baseline_one_shot_fingerprint",
     }
+
+
+def apply_stateful_contract_by_variant() -> None:
+    contract: dict[str, tuple[bool, bool]] = {
+        "flat_baseline": (False, False),
+        "exploration": (False, False),
+        "synthesis": (False, False),
+        "validation": (False, False),
+        "full_system": (False, False),
+        "ab_retrieval_bm25": (False, False),
+        "ab_retrieval_neural_embedding": (False, False),
+        "ab_retrieval_one_shot_fingerprint": (False, False),
+        "ab_retrieval_iterative_react": (False, False),
+        "ab_prev_attempt_ctx_on": (True, False),
+        "ab_stateful_tree_on": (True, True),
+        "ab_stateful_tree_off": (True, False),
+    }
+    expected = contract.get(args.variant)
+    if expected is None:
+        return
+    expected_stateful, expected_tree = expected
+
+    if args.stateful_repair != expected_stateful or args.stateful_repair_tree != expected_tree:
+        log_info(
+            "Variant %s selected: forcing stateful_repair=%s stateful_repair_tree=%s for ablation-contract consistency."
+            % (args.variant, expected_stateful, expected_tree)
+        )
+    args.stateful_repair = expected_stateful
+    args.stateful_repair_tree = expected_tree
 
 
 def main() -> int:
@@ -1217,6 +1273,7 @@ def main() -> int:
     run_logs_dir = reports_dir / run_id
     summary_path = resolve_summary_path(workspace_root, run_id)
     llm_metrics_summary_path = reports_dir / f"llm-metrics-summary-{run_id}.yaml"
+    runtime_config_lock_path = run_dir / "runtime-config-lock.yaml"
 
     classify_script = src_dir / "agent_classify.py"
     dockerfile_script = src_dir / "agent_dockerfile.py"
@@ -1226,43 +1283,13 @@ def main() -> int:
     analysis_script = src_dir / "parse_results.py"
 
     phase_skips = resolve_phase_skips()
-    if args.variant in {"flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react"}:
-        if args.stateful_repair:
-            log_info(f"Variant {args.variant} selected: forcing stateful repair OFF for phase-2 ladder consistency.")
-        if args.stateful_repair_tree:
-            log_info(f"Variant {args.variant} selected: forcing stateful repair tree OFF for phase-2 ladder consistency.")
-        args.stateful_repair = False
-        args.stateful_repair_tree = False
-
-    if args.variant == "ab_stateful_tree_on":
-        if not args.stateful_repair:
-            log_info("Variant ab_stateful_tree_on selected: forcing stateful repair ON for AB-20A.")
-        if not args.stateful_repair_tree:
-            log_info("Variant ab_stateful_tree_on selected: forcing stateful repair tree ON for AB-20A isolation.")
-        args.stateful_repair = True
-        args.stateful_repair_tree = True
-
-    if args.variant == "ab_stateful_tree_off":
-        if not args.stateful_repair:
-            log_info("Variant ab_stateful_tree_off selected: forcing stateful repair ON for AB-20B.")
-        if args.stateful_repair_tree:
-            log_info("Variant ab_stateful_tree_off selected: forcing stateful repair tree OFF for AB-20B isolation.")
-        args.stateful_repair = True
-        args.stateful_repair_tree = False
+    apply_stateful_contract_by_variant()
 
     base_variant_policy = resolve_variant_policy()
     args.arch_exploration_enabled = bool(base_variant_policy.get("exploration_enabled", True))
     args.arch_synthesis_enabled = bool(base_variant_policy.get("synthesis_enabled", True))
     args.arch_validation_enabled = bool(base_variant_policy.get("validation_enabled", True))
     args.arch_scratchpads_enabled = bool(base_variant_policy.get("scratchpads_enabled", True))
-
-    if args.variant == "ab_prev_attempt_ctx_on":
-        if not args.stateful_repair:
-            log_info("Variant ab_prev_attempt_ctx_on selected: forcing stateful repair ON for AB-19A.")
-        if args.stateful_repair_tree:
-            log_info("Variant ab_prev_attempt_ctx_on selected: forcing stateful repair tree OFF for AB-19A isolation.")
-        args.stateful_repair = True
-        args.stateful_repair_tree = False
 
     agent_config_path = _resolve_agent_config_path(workspace_root)
     agent_config_applied: dict = {}
@@ -1274,6 +1301,12 @@ def main() -> int:
         except ValueError as error:
             log_error(str(error))
             return 1
+
+    try:
+        expected_validation_gate_enabled = enforce_variant_phase_contract(phase_skips)
+    except ValueError as error:
+        log_error(str(error))
+        return 1
 
     if args.print_summary:
         print_planned_summary()
@@ -1302,6 +1335,7 @@ def main() -> int:
         "ended_at": None,
         "duration_seconds": None,
         "status": "failed",
+        "canonical_execution_branch": CANONICAL_EXECUTION_BRANCH,
         "trace": {
             "enabled": args.trace,
             "forwarded_to_child_agents": args.trace,
@@ -1319,6 +1353,10 @@ def main() -> int:
                 "validation_gate": not phase_skips["validation_gate"],
                 "repair": not phase_skips["repair"],
                 "install_guide": not phase_skips["install_guide"],
+            },
+            "phase_contract": {
+                "validation_gate_expected_for_variant": expected_validation_gate_enabled,
+                "validation_gate_contract_enforced": expected_validation_gate_enabled is not None,
             },
             "classification": {
                 "retrieval_strategy": resolve_classify_retrieval_strategy(),
@@ -1369,6 +1407,7 @@ def main() -> int:
             "reports_dir": str(reports_dir),
             "run_logs_dir": str(run_logs_dir),
             "summary_path": str(summary_path),
+            "runtime_config_lock_path": str(runtime_config_lock_path),
             "llm_metrics_summary_path": str(llm_metrics_summary_path),
             "results_dir": args.results_dir,
             "summaries_dir": args.summaries_dir,
@@ -1380,6 +1419,32 @@ def main() -> int:
         "phases": [],
         "error": None,
     }
+
+    runtime_config_lock = {
+        "generated_at": utc_now(),
+        "canonical_execution_branch": CANONICAL_EXECUTION_BRANCH,
+        "variant": args.variant,
+        "variant_policy": variant_policy,
+        "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
+        "override_sources": {
+            "cli_flags": {
+                "skip_classify": args.skip_classify,
+                "skip_dockerfile": args.skip_dockerfile,
+                "skip_validation_gate": args.skip_validation_gate,
+                "skip_repair": args.skip_repair,
+                "skip_install_guide": args.skip_install_guide,
+                "retrieval_strategy": args.retrieval_strategy,
+                "stateful_repair": args.stateful_repair,
+                "stateful_repair_tree": args.stateful_repair_tree,
+            },
+            "agent_config_path": str(agent_config_path) if agent_config_path is not None else None,
+            "agent_config_applied": agent_config_applied,
+            "validation_gate_contract_expected": expected_validation_gate_enabled,
+        },
+        "effective_runtime_controls": summary["effective_runtime_controls"],
+    }
+    write_summary(runtime_config_lock_path, runtime_config_lock)
+    log_info(f"Runtime config lock written to {runtime_config_lock_path}")
 
     try:
         if not phase_skips["classify"]:
