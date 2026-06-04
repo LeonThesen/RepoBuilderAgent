@@ -5,6 +5,7 @@ from langgraph.prebuilt import create_react_agent
 try:
     from RepoBuilderAgent.src.loops.tools import (
         build_fetch_file_context_tool,
+        build_hadolint_snippet_tool,
         build_list_selected_files_tool,
         build_search_selected_files_tool,
         build_think_tool,
@@ -12,6 +13,7 @@ try:
 except ImportError:
     from loops.tools import (
         build_fetch_file_context_tool,
+        build_hadolint_snippet_tool,
         build_list_selected_files_tool,
         build_search_selected_files_tool,
         build_think_tool,
@@ -98,13 +100,15 @@ async def run_l2_synthesis_loop(
     list_selected_files = build_list_selected_files_tool(selected_snapshot)
     search_selected_files = build_search_selected_files_tool(selected_snapshot)
     think = build_think_tool()
+    hadolint_check = build_hadolint_snippet_tool()
 
     synthesis_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context],
+        tools=[think, list_selected_files, search_selected_files, fetch_file_context, hadolint_check],
         prompt=(
             "You are the L2 synthesis ReAct agent. Use tools whenever evidence is missing. "
             "Use list_selected_files/search_selected_files to inspect available evidence before fetching file content. "
+            "If you draft a Dockerfile snippet as part of a hypothesis, call run_hadolint_on_snippet to lint it before finalizing. "
             "Use think for brief intent notes before/after key tool decisions. "
             "Return YAML-compatible fields only."
         ),

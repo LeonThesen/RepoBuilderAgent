@@ -1,3 +1,6 @@
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Callable
 
 import yaml
@@ -88,3 +91,71 @@ def build_think_tool() -> Callable[[str], str]:
         )
 
     return think
+
+
+def build_hadolint_snippet_tool() -> Callable[[str], str]:
+    @tool
+    def run_hadolint_on_snippet(dockerfile_text: str) -> str:
+        """Validate a Dockerfile snippet with hadolint and return pass/fail details."""
+        text = (dockerfile_text or "").strip()
+        if not text:
+            return yaml.dump(
+                {"available": True, "valid": False, "error": "empty_dockerfile_text"},
+                sort_keys=False,
+                allow_unicode=True,
+            )
+
+        hadolint_path = Path("/usr/local/bin/hadolint")
+        if not hadolint_path.exists():
+            return yaml.dump(
+                {
+                    "available": False,
+                    "valid": True,
+                    "error": "hadolint_not_installed",
+                },
+                sort_keys=False,
+                allow_unicode=True,
+            )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".Dockerfile", delete=True) as temp_file:
+            temp_file.write(text)
+            temp_file.flush()
+
+            command = [str(hadolint_path)]
+            repo_root = Path(__file__).resolve().parents[3]
+            hadolint_config = repo_root / ".hadolint.yaml"
+            if hadolint_config.exists():
+                command.extend(["--config", str(hadolint_config)])
+            command.append(temp_file.name)
+
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return yaml.dump(
+                    {
+                        "available": True,
+                        "valid": False,
+                        "error": "hadolint_timeout",
+                    },
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+
+        output = (result.stdout or "") + (result.stderr or "")
+        return yaml.dump(
+            {
+                "available": True,
+                "valid": result.returncode == 0,
+                "error_excerpt": output[:1200],
+            },
+            sort_keys=False,
+            allow_unicode=True,
+        )
+
+    return run_hadolint_on_snippet
