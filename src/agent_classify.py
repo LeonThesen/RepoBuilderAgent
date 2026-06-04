@@ -103,6 +103,24 @@ parser.add_argument(
     default=os.getenv("LLM_EMBEDDING_MODEL", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")),
     help="Embedding model used when --retrieval-strategy=neural_embedding.",
 )
+parser.add_argument(
+    "--react-max-steps",
+    type=int,
+    default=4,
+    help="Maximum selection iterations for --retrieval-strategy=iterative_react.",
+)
+parser.add_argument(
+    "--react-files-per-step",
+    type=int,
+    default=8,
+    help="Maximum files accepted from each iterative_react step.",
+)
+parser.add_argument(
+    "--react-max-total-files",
+    type=int,
+    default=24,
+    help="Maximum total files retained across iterative_react steps.",
+)
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
@@ -421,6 +439,183 @@ async def select_files_by_neural_embedding(repo_name: str, repo_path: Path, top_
 
     return select_files_by_local_embedding(query_text, candidates, top_k=top_k)
 
+
+def _parse_react_done(raw: str) -> bool:
+    try:
+        parsed = parse_llm_yaml(raw)
+    except Exception:
+        return False
+
+    if not isinstance(parsed, dict):
+        return False
+
+    for key in ("done", "is_done", "complete", "stop"):
+        value = parsed.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "done", "stop", "complete"}:
+                return True
+    return False
+
+
+def _build_react_selection_prompt(
+    repo_url: str,
+    structure_summary: str,
+    selected_files: list[str],
+    observation: str,
+    step_index: int,
+) -> str:
+    prior = "\n".join(f"- {item}" for item in selected_files) if selected_files else "- (none yet)"
+    react_instructions = (
+        "\n\n"
+        "ReAct retrieval loop instructions:\n"
+        f"- Current step: {step_index}.\n"
+        "- Think about missing evidence for install/build/verify.\n"
+        "- Select NEW file paths only (do not repeat already selected paths).\n"
+        "- Prefer high-signal manifests, build files, Dockerfiles, and workflows.\n"
+        "- Return YAML with keys: thought, selected_files, done.\n"
+        "- Set done=true only when additional files are unlikely to improve coverage.\n"
+        "\n"
+        "Already selected files:\n"
+        f"{prior}\n"
+        "\n"
+        "Latest observation:\n"
+        f"{observation}\n"
+    )
+    return (
+        SELECT_FILES_PROMPT_TEMPLATE
+        .replace("{{REPO_URL}}", repo_url)
+        .replace("{{STRUCTURE_CONTENT}}", structure_summary)
+        + react_instructions
+    )
+
+
+async def select_files_by_iterative_react(
+    *,
+    repo_url: str,
+    repo_name: str,
+    structure_summary: str,
+    default_selected_files: list[str],
+    llm_metrics: dict[str, Any],
+) -> tuple[list[str], int, list[dict[str, Any]], str]:
+    selected_files: list[str] = []
+    seen: set[str] = set()
+    step1_tokens_total = 0
+    react_trace: list[dict[str, Any]] = []
+    observation = "No prior observations."
+    stop_reason = "max_steps"
+
+    max_steps = max(1, int(args.react_max_steps))
+    per_step = max(1, int(args.react_files_per_step))
+    max_total = max(1, int(args.react_max_total_files))
+
+    for step_idx in range(1, max_steps + 1):
+        prompt = _build_react_selection_prompt(
+            repo_url=repo_url,
+            structure_summary=structure_summary,
+            selected_files=selected_files,
+            observation=observation,
+            step_index=step_idx,
+        )
+        step_tokens = estimate_tokens(prompt, args.model)
+        step1_tokens_total += step_tokens
+
+        raw_selection = ""
+        done_flag = False
+        parsed_selection: list[str] = []
+        new_files: list[str] = []
+        error_message = ""
+
+        try:
+            log_info(f"ReAct selection step {step_idx}/{max_steps} for {repo_url}...")
+            selection_response = await chat_completion_with_retries(
+                client=client,
+                model=args.model,
+                temperature=EFFECTIVE_TEMPERATURE,
+                messages=[{"role": "user", "content": prompt}],
+                repo_url=repo_url,
+                phase="classify-step1-selection-react",
+                metrics=llm_metrics,
+                timeout_seconds=args.selection_timeout,
+                max_retries=args.llm_max_retries,
+                retry_backoff_seconds=args.llm_retry_backoff_seconds,
+            )
+            raw_selection = (selection_response.choices[0].message.content or "").strip()
+            if selection_response.usage:
+                log_info(
+                    f"[TOKENS] {json.dumps({'phase': 'classify-step1-react', 'repo': repo_url, 'step': step_idx, 'prompt_tokens': selection_response.usage.prompt_tokens, 'completion_tokens': selection_response.usage.completion_tokens, 'total_tokens': selection_response.usage.total_tokens})}"
+                )
+            parsed_selection = extract_selected_files(raw_selection)
+            done_flag = _parse_react_done(raw_selection)
+        except httpx.HTTPError as e:
+            error_message = f"HTTP error: {e}"
+        except ssl.SSLError as e:
+            error_message = f"SSL error: {e}"
+        except APITimeoutError as e:
+            error_message = f"Timeout: {e}"
+        except APIError as e:
+            error_message = f"API error: {e}"
+
+        for path in parsed_selection:
+            if path in seen:
+                continue
+            seen.add(path)
+            new_files.append(path)
+            selected_files.append(path)
+            if len(new_files) >= per_step or len(selected_files) >= max_total:
+                break
+
+        react_trace.append(
+            {
+                "step": step_idx,
+                "prompt_tokens_estimate": step_tokens,
+                "suggested_files": parsed_selection,
+                "new_files": new_files,
+                "total_selected_count": len(selected_files),
+                "done": done_flag,
+                "error": error_message or None,
+            }
+        )
+
+        if error_message:
+            log_warn(f"ReAct selection step {step_idx} failed for {repo_url}: {error_message}")
+
+        if len(selected_files) >= max_total:
+            stop_reason = "max_total_files"
+            break
+
+        if done_flag:
+            stop_reason = "model_done"
+            break
+
+        if step_idx > 1 and len(new_files) == 0:
+            stop_reason = "converged_no_new_files"
+            break
+
+        observation = (
+            f"Step {step_idx}: added {len(new_files)} new files. "
+            f"Current total selected files: {len(selected_files)}."
+        )
+
+    if not selected_files:
+        selected_files = default_selected_files.copy()
+        stop_reason = "fallback_defaults"
+        react_trace.append(
+            {
+                "step": "fallback",
+                "prompt_tokens_estimate": 0,
+                "suggested_files": [],
+                "new_files": selected_files,
+                "total_selected_count": len(selected_files),
+                "done": True,
+                "error": "No files were selected by iterative_react; defaults applied.",
+            }
+        )
+
+    return selected_files, step1_tokens_total, react_trace, stop_reason
+
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
@@ -481,6 +676,8 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             selected_files = default_selected_files.copy()
             baseline_summary = ""
             step1_tokens = 0
+            react_trace: list[dict[str, Any]] = []
+            react_stop_reason = "not_applicable"
             if args.retrieval_strategy == "bm25":
                 selected_files = select_files_by_bm25(repo_path, build_bm25_query_terms(repo_name))
                 if not selected_files:
@@ -504,7 +701,40 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 )
                 selected_files = []
                 log_info(f"Using static repo fingerprint for {repo_name} via one-shot retrieval.")
+            elif args.retrieval_strategy == "iterative_react":
+                selected_files, step1_tokens, react_trace, react_stop_reason = await select_files_by_iterative_react(
+                    repo_url=repo_url,
+                    repo_name=repo_name,
+                    structure_summary=structure_summary,
+                    default_selected_files=default_selected_files,
+                    llm_metrics=llm_metrics,
+                )
+                log_info(
+                    f"Selected {len(selected_files)} files for {repo_name} via iterative ReAct retrieval "
+                    f"(stop_reason={react_stop_reason})."
+                )
             else:
+                log_warn(
+                    f"Unknown retrieval strategy '{args.retrieval_strategy}' for {repo_url}; using default file selection."
+                )
+                selected_files = default_selected_files.copy()
+
+            if args.retrieval_strategy == "iterative_react":
+                react_trace_path = summary_dir / f"{repo_name}.react-trace.yaml"
+                with open(react_trace_path, "w") as f:
+                    yaml.dump(
+                        {
+                            "retrieval_strategy": args.retrieval_strategy,
+                            "stop_reason": react_stop_reason,
+                            "steps": react_trace,
+                        },
+                        f,
+                        sort_keys=False,
+                        allow_unicode=True,
+                    )
+                log_info(f"ReAct retrieval trace saved at {react_trace_path}")
+
+            if args.retrieval_strategy not in {"bm25", "neural_embedding", "one_shot_fingerprint", "iterative_react"}:
                 selection_prompt = (
                     SELECT_FILES_PROMPT_TEMPLATE
                     .replace("{{REPO_URL}}", repo_url)
@@ -600,6 +830,10 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 "repo": repo_url,
                 "model": args.model,
                 "retrieval_strategy": args.retrieval_strategy,
+                "retrieval_trace": {
+                    "react_steps": len(react_trace),
+                    "react_stop_reason": react_stop_reason,
+                },
                 "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
                 "tokens": {
                     "baseline_full_classification": baseline_tokens,
