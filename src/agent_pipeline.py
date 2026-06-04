@@ -61,9 +61,9 @@ parser.add_argument(
     default=[],
     help="Run the pipeline for a specific repository URL (can be passed multiple times). Overrides --input-file when provided.",
 )
-parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
-parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
-parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
+parser.add_argument("--endpoint", default="", help="Custom API endpoint URL")
+parser.add_argument("--model", default="", help="Model name")
+parser.add_argument("--api-key", default="", help="API key")
 parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"), help="Prompt profile name from RepoBuilderAgent/config/prompt_profiles.yaml (supports alias P*)")
 parser.add_argument("--temperature", type=float, default=None, help="Temperature override for model calls; defaults to selected prompt profile value")
 parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
