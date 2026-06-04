@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timezone
+import json
 import os
 import subprocess
 import sys
@@ -7,17 +8,47 @@ import time
 from pathlib import Path
 
 try:
-    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.log_utils import log_error, log_info, set_trace_enabled
+    from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_trace_enabled
+    from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.core.prompt_profiles import (
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    import config as _config
-    from log_utils import log_error, log_info, set_trace_enabled
+    import core.config as _config
+    from core.log_utils import log_error, log_info, set_trace_enabled
+    from core.timeout_config import load_timeout_defaults
+    from core.prompt_profiles import (
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
     OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
 import yaml
+
+
+TIMEOUTS = load_timeout_defaults(
+    "agent_pipeline",
+    {
+        "timeout": 120,
+        "llm_max_retries": 2,
+        "llm_retry_backoff_seconds": 2.0,
+        "selection_timeout": 120,
+        "classification_timeout": 240,
+        "dockerfile_timeout": 240,
+        "verify_cmd_timeout": 180,
+        "repair_timeout": 240,
+        "verify_repair_timeout": 180,
+        "install_guide_timeout": 240,
+        "verify_timeout": 30,
+    },
+)
 
 
 parser = argparse.ArgumentParser(
@@ -33,17 +64,18 @@ parser.add_argument(
 parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
-parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for model calls")
-parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
-parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
-parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
-parser.add_argument("--selection-timeout", type=int, default=120, help="Timeout for classify step1 file-selection calls in seconds")
-parser.add_argument("--classification-timeout", type=int, default=240, help="Timeout for classify step2 classification calls in seconds")
-parser.add_argument("--dockerfile-timeout", type=int, default=240, help="Timeout for Dockerfile generation calls in seconds")
-parser.add_argument("--verify-cmd-timeout", type=int, default=180, help="Timeout for Dockerfile verification-command generation calls in seconds")
-parser.add_argument("--repair-timeout", type=int, default=240, help="Timeout for Dockerfile repair calls in seconds")
-parser.add_argument("--verify-repair-timeout", type=int, default=180, help="Timeout for verification-command repair calls in seconds")
-parser.add_argument("--install-guide-timeout", type=int, default=240, help="Timeout for install-guide generation calls in seconds")
+parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"), help="Prompt profile name from RepoBuilderAgent/config/prompt_profiles.yaml (supports alias P*)")
+parser.add_argument("--temperature", type=float, default=None, help="Temperature override for model calls; defaults to selected prompt profile value")
+parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--selection-timeout", type=int, default=int(TIMEOUTS["selection_timeout"]), help="Timeout for classify step1 file-selection calls in seconds")
+parser.add_argument("--classification-timeout", type=int, default=int(TIMEOUTS["classification_timeout"]), help="Timeout for classify step2 classification calls in seconds")
+parser.add_argument("--dockerfile-timeout", type=int, default=int(TIMEOUTS["dockerfile_timeout"]), help="Timeout for Dockerfile generation calls in seconds")
+parser.add_argument("--verify-cmd-timeout", type=int, default=int(TIMEOUTS["verify_cmd_timeout"]), help="Timeout for Dockerfile verification-command generation calls in seconds")
+parser.add_argument("--repair-timeout", type=int, default=int(TIMEOUTS["repair_timeout"]), help="Timeout for Dockerfile repair calls in seconds")
+parser.add_argument("--verify-repair-timeout", type=int, default=int(TIMEOUTS["verify_repair_timeout"]), help="Timeout for verification-command repair calls in seconds")
+parser.add_argument("--install-guide-timeout", type=int, default=int(TIMEOUTS["install_guide_timeout"]), help="Timeout for install-guide generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated artifacts where supported")
 parser.add_argument("--learn", action="store_true", help="Enable learning of new manifest file patterns during classification")
@@ -62,16 +94,147 @@ parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum nu
 parser.add_argument("--skip-delete-docs", action="store_true", help="Skip deleting documentation and CI/CD files from the build context before building")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint before docker build")
 parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside built images to verify the build produced working software")
-parser.add_argument("--verify-timeout", type=int, default=30, help="Timeout in seconds for build verification container execution")
+parser.add_argument("--verify-timeout", type=int, default=int(TIMEOUTS["verify_timeout"]), help="Timeout in seconds for build verification container execution")
+stateful_group = parser.add_mutually_exclusive_group()
+stateful_group.add_argument(
+    "--stateful-repair",
+    dest="stateful_repair",
+    action="store_true",
+    help="Enable stateful Dockerfile repair prompts that include compact summaries of previous repair attempts.",
+)
+stateful_group.add_argument(
+    "--no-stateful-repair",
+    dest="stateful_repair",
+    action="store_false",
+    help="Disable stateful Dockerfile repair prompts.",
+)
+parser.set_defaults(stateful_repair=False)
+parser.add_argument(
+    "--stateful-history-window",
+    type=int,
+    default=4,
+    help="When stateful repair is enabled, include at most this many recent repair attempts in prompt history.",
+)
+parser.add_argument(
+    "--stateful-history-max-chars",
+    type=int,
+    default=4000,
+    help="Maximum characters from serialized repair history included in each stateful repair prompt.",
+)
+stateful_tree_group = parser.add_mutually_exclusive_group()
+stateful_tree_group.add_argument(
+    "--stateful-repair-tree",
+    dest="stateful_repair_tree",
+    action="store_true",
+    help="When stateful repair is enabled, also include a compact decision-tree summary of prior attempts.",
+)
+stateful_tree_group.add_argument(
+    "--no-stateful-repair-tree",
+    dest="stateful_repair_tree",
+    action="store_false",
+    help="Disable decision-tree serialization for stateful repair prompts.",
+)
+parser.set_defaults(stateful_repair_tree=False)
+parser.add_argument(
+    "--stateful-tree-max-chars",
+    type=int,
+    default=2500,
+    help="Maximum characters from serialized stateful decision tree included in each repair prompt.",
+)
+parser.add_argument(
+    "--stateful-tree-max-children",
+    type=int,
+    default=5,
+    help="Maximum child branches retained per decision-tree node before pruning.",
+)
 parser.add_argument("--skip-classify", action="store_true", help="Skip the classification phase")
 parser.add_argument("--skip-dockerfile", action="store_true", help="Skip the Dockerfile generation phase")
+parser.add_argument("--skip-validation-gate", action="store_true", help="Skip the post-generation validation gate phase")
 parser.add_argument("--skip-repair", action="store_true", help="Skip the Dockerfile repair phase")
 parser.add_argument("--skip-install-guide", action="store_true", help="Skip the INSTALL.md generation phase")
+parser.add_argument(
+    "--variant",
+    default="flat_baseline",
+    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react", "one_shot_direct"],
+    help="Pipeline variant for ablation runs.",
+)
+parser.add_argument(
+    "--agent-config",
+    default="",
+    help="Optional JSON file with runtime architecture controls (phases/retrieval/ReAct/stateful repair).",
+)
+parser.add_argument(
+    "--retrieval-strategy",
+    default="",
+    choices=["iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint"],
+    help="Override classify retrieval strategy independently of --variant.",
+)
+parser.add_argument(
+    "--embedding-model",
+    default=os.getenv("LLM_EMBEDDING_MODEL", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")),
+    help="Embedding model passed to classify when retrieval strategy is neural_embedding.",
+)
+parser.add_argument(
+    "--react-max-steps",
+    type=int,
+    default=4,
+    help="Maximum retrieval iterations passed to classify for iterative_react strategy.",
+)
+parser.add_argument(
+    "--react-files-per-step",
+    type=int,
+    default=8,
+    help="Maximum files accepted per iterative_react step.",
+)
+parser.add_argument(
+    "--react-max-total-files",
+    type=int,
+    default=24,
+    help="Maximum total selected files across iterative_react steps.",
+)
+parser.add_argument(
+    "--react-final-cap",
+    type=int,
+    default=12,
+    help="Hard final cap on selected files after retrieval normalization/reranking.",
+)
+parser.add_argument(
+    "--step2-token-budget",
+    type=int,
+    default=12000,
+    help="Target token budget for Step 2 classification prompt (0 disables budget packing).",
+)
+parser.add_argument(
+    "--synthesis-react-max-steps",
+    type=int,
+    default=3,
+    help="Maximum L2 synthesis loop iterations passed to classify.",
+)
+parser.add_argument(
+    "--validation-react-max-steps",
+    type=int,
+    default=3,
+    help="Maximum L3 validation loop iterations passed to classify.",
+)
+parser.add_argument(
+    "--synthesis-subagents-enabled",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable parallel synthesis sub-agent passes in classify.",
+)
+parser.add_argument(
+    "--dockerfile-one-shot-direct",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override one-shot-direct Dockerfile generation mode without changing other phases.",
+)
 parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
 parser.add_argument("--pipeline-reports-dir", default="pipeline-reports", help="Directory where pipeline logs and summary are written")
 parser.add_argument("--pipeline-summary-path", default="", help="Optional explicit path for the pipeline summary YAML")
 parser.add_argument("--print-summary", action="store_true", help="Print planned pipeline summary and exit without running phases")
 args = parser.parse_args()
+PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 
 DEFAULT_RESULTS_DIR = "classification_results"
@@ -155,6 +318,24 @@ def _synchronize_llm_environment() -> None:
         os.environ["OPENAI_API_KEY"] = args.api_key
 
 
+def _resolve_workspace_root(src_dir: Path) -> Path:
+    repo_root = src_dir.parent.parent
+    input_path = Path(args.input_file).expanduser()
+
+    candidates: list[Path] = []
+    if input_path.is_absolute():
+        candidates.append(input_path)
+    else:
+        candidates.append((Path.cwd() / input_path).resolve())
+        candidates.append((repo_root / input_path).resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.parent if candidate.is_file() else candidate
+
+    return repo_root
+
+
 def sanitize_command(command: list[str]) -> list[str]:
     sanitized = command.copy()
     for index, part in enumerate(sanitized[:-1]):
@@ -168,14 +349,16 @@ def render_command(command: list[str]) -> str:
 
 
 def append_shared_model_args(command: list[str]) -> list[str]:
+    command.extend(["--prompt-profile", args.prompt_profile])
     if args.endpoint:
         command.extend(["--endpoint", args.endpoint])
     if args.model:
         command.extend(["--model", args.model])
     if args.api_key:
         command.extend(["--api-key", args.api_key])
+    if args.temperature is not None:
+        command.extend(["--temperature", str(args.temperature)])
     command.extend([
-        "--temperature", str(args.temperature),
         "--timeout", str(args.timeout),
         "--llm-max-retries", str(args.llm_max_retries),
         "--llm-retry-backoff-seconds", str(args.llm_retry_backoff_seconds),
@@ -221,6 +404,211 @@ def resolve_output_dir(workspace_root: Path, run_dir: Path, value: str, default_
     if not candidate.is_absolute():
         candidate = workspace_root / candidate
     return candidate
+
+
+def _resolve_agent_config_path(workspace_root: Path) -> Path | None:
+    if not args.agent_config:
+        return None
+
+    candidate = Path(args.agent_config).expanduser()
+    if not candidate.is_absolute():
+        candidate = (workspace_root / candidate).resolve()
+    return candidate
+
+
+def _load_agent_config(path: Path) -> dict:
+    if not path.exists():
+        raise ValueError(f"agent config not found: {path}")
+
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in agent config {path}: {exc}") from exc
+
+    if not isinstance(loaded, dict):
+        raise ValueError(f"agent config root must be a JSON object: {path}")
+
+    return loaded
+
+
+def _expect_bool(value, *, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"agent_config.{key} must be boolean")
+
+
+def _expect_int(value, *, key: str, min_value: int = 1) -> int:
+    if not isinstance(value, int):
+        raise ValueError(f"agent_config.{key} must be integer")
+    if value < min_value:
+        raise ValueError(f"agent_config.{key} must be >= {min_value}")
+    return value
+
+
+def _expect_str(value, *, key: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError(f"agent_config.{key} must be non-empty string")
+
+
+def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, bool]) -> dict:
+    applied: dict = {}
+
+    architecture_cfg = agent_config.get("architecture")
+    if architecture_cfg is not None:
+        if not isinstance(architecture_cfg, dict):
+            raise ValueError("agent_config.architecture must be an object")
+        if "exploration_enabled" in architecture_cfg:
+            args.arch_exploration_enabled = _expect_bool(
+                architecture_cfg["exploration_enabled"],
+                key="architecture.exploration_enabled",
+            )
+            applied.setdefault("architecture", {})["exploration_enabled"] = args.arch_exploration_enabled
+        if "synthesis_enabled" in architecture_cfg:
+            args.arch_synthesis_enabled = _expect_bool(
+                architecture_cfg["synthesis_enabled"],
+                key="architecture.synthesis_enabled",
+            )
+            applied.setdefault("architecture", {})["synthesis_enabled"] = args.arch_synthesis_enabled
+        if "validation_enabled" in architecture_cfg:
+            args.arch_validation_enabled = _expect_bool(
+                architecture_cfg["validation_enabled"],
+                key="architecture.validation_enabled",
+            )
+            applied.setdefault("architecture", {})["validation_enabled"] = args.arch_validation_enabled
+        if "scratchpads_enabled" in architecture_cfg:
+            args.arch_scratchpads_enabled = _expect_bool(
+                architecture_cfg["scratchpads_enabled"],
+                key="architecture.scratchpads_enabled",
+            )
+            applied.setdefault("architecture", {})["scratchpads_enabled"] = args.arch_scratchpads_enabled
+        if "synthesis_subagents_enabled" in architecture_cfg:
+            args.synthesis_subagents_enabled = _expect_bool(
+                architecture_cfg["synthesis_subagents_enabled"],
+                key="architecture.synthesis_subagents_enabled",
+            )
+            applied.setdefault("architecture", {})["synthesis_subagents_enabled"] = args.synthesis_subagents_enabled
+        if "synthesis_react_max_steps" in architecture_cfg:
+            args.synthesis_react_max_steps = _expect_int(
+                architecture_cfg["synthesis_react_max_steps"],
+                key="architecture.synthesis_react_max_steps",
+            )
+            applied.setdefault("architecture", {})["synthesis_react_max_steps"] = args.synthesis_react_max_steps
+        if "validation_react_max_steps" in architecture_cfg:
+            args.validation_react_max_steps = _expect_int(
+                architecture_cfg["validation_react_max_steps"],
+                key="architecture.validation_react_max_steps",
+            )
+            applied.setdefault("architecture", {})["validation_react_max_steps"] = args.validation_react_max_steps
+
+    phases_cfg = agent_config.get("phases")
+    if phases_cfg is not None:
+        if not isinstance(phases_cfg, dict):
+            raise ValueError("agent_config.phases must be an object")
+        phase_key_map = {
+            "classify": "skip_classify",
+            "dockerfile": "skip_dockerfile",
+            "validation_gate": "skip_validation_gate",
+            "repair": "skip_repair",
+            "install_guide": "skip_install_guide",
+        }
+        for phase_name, arg_name in phase_key_map.items():
+            if phase_name not in phases_cfg:
+                continue
+            enabled = _expect_bool(phases_cfg[phase_name], key=f"phases.{phase_name}")
+            phase_skips[phase_name] = not enabled
+            setattr(args, arg_name, not enabled)
+            applied.setdefault("phases", {})[phase_name] = enabled
+
+    classification_cfg = agent_config.get("classification")
+    if classification_cfg is not None:
+        if not isinstance(classification_cfg, dict):
+            raise ValueError("agent_config.classification must be an object")
+
+        if "retrieval_strategy" in classification_cfg:
+            retrieval_strategy = _expect_str(classification_cfg["retrieval_strategy"], key="classification.retrieval_strategy")
+            allowed = {"iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint"}
+            if retrieval_strategy not in allowed:
+                raise ValueError(
+                    "agent_config.classification.retrieval_strategy must be one of "
+                    + ", ".join(sorted(allowed))
+                )
+            args.retrieval_strategy = retrieval_strategy
+            applied.setdefault("classification", {})["retrieval_strategy"] = retrieval_strategy
+
+        if "embedding_model" in classification_cfg:
+            embedding_model = _expect_str(classification_cfg["embedding_model"], key="classification.embedding_model")
+            args.embedding_model = embedding_model
+            applied.setdefault("classification", {})["embedding_model"] = embedding_model
+
+        react_cfg = classification_cfg.get("react")
+        if react_cfg is not None:
+            if not isinstance(react_cfg, dict):
+                raise ValueError("agent_config.classification.react must be an object")
+
+            if "max_steps" in react_cfg:
+                args.react_max_steps = _expect_int(react_cfg["max_steps"], key="classification.react.max_steps")
+                applied.setdefault("classification", {}).setdefault("react", {})["max_steps"] = args.react_max_steps
+            if "files_per_step" in react_cfg:
+                args.react_files_per_step = _expect_int(react_cfg["files_per_step"], key="classification.react.files_per_step")
+                applied.setdefault("classification", {}).setdefault("react", {})["files_per_step"] = args.react_files_per_step
+            if "max_total_files" in react_cfg:
+                args.react_max_total_files = _expect_int(react_cfg["max_total_files"], key="classification.react.max_total_files")
+                applied.setdefault("classification", {}).setdefault("react", {})["max_total_files"] = args.react_max_total_files
+            if "final_cap" in react_cfg:
+                args.react_final_cap = _expect_int(react_cfg["final_cap"], key="classification.react.final_cap")
+                applied.setdefault("classification", {}).setdefault("react", {})["final_cap"] = args.react_final_cap
+
+        if "step2_token_budget" in classification_cfg:
+            args.step2_token_budget = _expect_int(
+                classification_cfg["step2_token_budget"],
+                key="classification.step2_token_budget",
+                min_value=0,
+            )
+            applied.setdefault("classification", {})["step2_token_budget"] = args.step2_token_budget
+
+    dockerfile_cfg = agent_config.get("dockerfile")
+    if dockerfile_cfg is not None:
+        if not isinstance(dockerfile_cfg, dict):
+            raise ValueError("agent_config.dockerfile must be an object")
+        if "one_shot_direct" in dockerfile_cfg:
+            args.dockerfile_one_shot_direct = _expect_bool(
+                dockerfile_cfg["one_shot_direct"],
+                key="dockerfile.one_shot_direct",
+            )
+            applied.setdefault("dockerfile", {})["one_shot_direct"] = args.dockerfile_one_shot_direct
+
+    repair_cfg = agent_config.get("repair")
+    if repair_cfg is not None:
+        if not isinstance(repair_cfg, dict):
+            raise ValueError("agent_config.repair must be an object")
+
+        if "stateful_repair" in repair_cfg:
+            args.stateful_repair = _expect_bool(repair_cfg["stateful_repair"], key="repair.stateful_repair")
+            applied.setdefault("repair", {})["stateful_repair"] = args.stateful_repair
+        if "stateful_repair_tree" in repair_cfg:
+            args.stateful_repair_tree = _expect_bool(repair_cfg["stateful_repair_tree"], key="repair.stateful_repair_tree")
+            applied.setdefault("repair", {})["stateful_repair_tree"] = args.stateful_repair_tree
+        if "history_window" in repair_cfg:
+            args.stateful_history_window = _expect_int(repair_cfg["history_window"], key="repair.history_window")
+            applied.setdefault("repair", {})["history_window"] = args.stateful_history_window
+        if "history_max_chars" in repair_cfg:
+            args.stateful_history_max_chars = _expect_int(
+                repair_cfg["history_max_chars"],
+                key="repair.history_max_chars",
+            )
+            applied.setdefault("repair", {})["history_max_chars"] = args.stateful_history_max_chars
+        if "tree_max_chars" in repair_cfg:
+            args.stateful_tree_max_chars = _expect_int(repair_cfg["tree_max_chars"], key="repair.tree_max_chars")
+            applied.setdefault("repair", {})["tree_max_chars"] = args.stateful_tree_max_chars
+        if "tree_max_children" in repair_cfg:
+            args.stateful_tree_max_children = _expect_int(
+                repair_cfg["tree_max_children"],
+                key="repair.tree_max_children",
+            )
+            applied.setdefault("repair", {})["tree_max_children"] = args.stateful_tree_max_children
+
+    return applied
 
 
 def run_step(name: str, command: list[str], log_path: Path) -> dict:
@@ -276,11 +664,26 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         "--deletion-patterns", args.deletion_patterns,
         "--selection-timeout", str(args.selection_timeout),
         "--classification-timeout", str(args.classification_timeout),
+        "--retrieval-strategy", resolve_classify_retrieval_strategy(),
+        "--embedding-model", args.embedding_model,
+        "--react-max-steps", str(args.react_max_steps),
+        "--react-files-per-step", str(args.react_files_per_step),
+        "--react-max-total-files", str(args.react_max_total_files),
+        "--react-final-cap", str(args.react_final_cap),
+        "--step2-token-budget", str(args.step2_token_budget),
+        "--synthesis-react-max-steps", str(args.synthesis_react_max_steps),
+        "--validation-react-max-steps", str(args.validation_react_max_steps),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
+        "--scratchpad-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
         "--analysis-dir", args.analysis_dir,
     ])
+    command.append("--synthesis-subagents-enabled" if args.synthesis_subagents_enabled else "--no-synthesis-subagents-enabled")
+    command.append("--exploration-enabled" if args.arch_exploration_enabled else "--no-exploration-enabled")
+    command.append("--synthesis-enabled" if args.arch_synthesis_enabled else "--no-synthesis-enabled")
+    command.append("--validation-enabled" if args.arch_validation_enabled else "--no-validation-enabled")
+    command.append("--scratchpads-enabled" if args.arch_scratchpads_enabled else "--no-scratchpads-enabled")
     command.append("--no-analysis")
     return command
 
@@ -289,6 +692,11 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
     command = build_agent_command(python_executable, script_path)
     if args.force:
         command.append("--force")
+    one_shot_direct = args.variant == "one_shot_direct"
+    if args.dockerfile_one_shot_direct is not None:
+        one_shot_direct = args.dockerfile_one_shot_direct
+    if one_shot_direct:
+        command.append("--one-shot-direct")
     command.extend([
         "--dockerfile-timeout", str(args.dockerfile_timeout),
         "--verify-cmd-timeout", str(args.verify_cmd_timeout),
@@ -321,6 +729,35 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
     command.extend([
         "--verify-command", args.verify_command,
         "--verify-timeout", str(args.verify_timeout),
+    ])
+    if args.stateful_repair:
+        command.append("--stateful-repair")
+    else:
+        command.append("--no-stateful-repair")
+    command.extend([
+        "--stateful-history-window", str(args.stateful_history_window),
+        "--stateful-history-max-chars", str(args.stateful_history_max_chars),
+    ])
+    if args.stateful_repair_tree:
+        command.append("--stateful-repair-tree")
+    else:
+        command.append("--no-stateful-repair-tree")
+    command.extend([
+        "--stateful-tree-max-chars", str(args.stateful_tree_max_chars),
+        "--stateful-tree-max-children", str(args.stateful_tree_max_children),
+    ])
+    return command
+
+
+def build_validation_gate_command(python_executable: str, script_path: Path) -> list[str]:
+    command = build_agent_command(python_executable, script_path, include_model_args=False)
+    if args.skip_hadolint:
+        command.append("--skip-hadolint-gate")
+    if args.trace:
+        command.append("--trace")
+    command.extend([
+        "--summaries-dir", args.summaries_dir,
+        "--dockerfiles-dir", args.dockerfiles_dir,
     ])
     return command
 
@@ -549,12 +986,221 @@ def print_planned_summary() -> None:
     print(summary_text, end="")
 
 
+def resolve_phase_skips() -> dict[str, bool]:
+    skips = {
+        "classify": args.skip_classify,
+        "dockerfile": args.skip_dockerfile,
+        "validation_gate": args.skip_validation_gate,
+        "repair": args.skip_repair,
+        "install_guide": args.skip_install_guide,
+    }
+    if args.variant == "one_shot_direct":
+        skips["classify"] = True
+        skips["validation_gate"] = True
+        skips["repair"] = True
+        skips["install_guide"] = True
+    return skips
+
+
+def resolve_classify_retrieval_strategy() -> str:
+    if args.retrieval_strategy:
+        return args.retrieval_strategy
+    if args.variant == "ab_retrieval_bm25":
+        return "bm25"
+    if args.variant == "ab_retrieval_neural_embedding":
+        return "neural_embedding"
+    if args.variant == "ab_retrieval_one_shot_fingerprint":
+        return "one_shot_fingerprint"
+    if args.variant == "ab_retrieval_iterative_react":
+        return "iterative_react"
+    return "iterative_react"
+
+
+def resolve_variant_policy() -> dict:
+    if args.variant == "ab_retrieval_iterative_react":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_react_retrieval",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "iterative_react",
+        }
+
+    if args.variant == "ab_retrieval_one_shot_fingerprint":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "one_shot_fingerprint_retrieval",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "one_shot_fingerprint",
+        }
+
+    if args.variant == "ab_retrieval_neural_embedding":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "neural_embedding_retrieval",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "neural_embedding",
+        }
+
+    if args.variant == "ab_retrieval_bm25":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "bm25_retrieval",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "bm25",
+        }
+
+    if args.variant == "ab_stateful_tree_off":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "iterative_exploration",
+            "stateful_repair_enabled": True,
+            "stateful_tree_enabled": False,
+            "prev_attempt_context_enabled": True,
+        }
+
+    if args.variant == "ab_stateful_tree_on":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "iterative_exploration",
+            "stateful_repair_enabled": True,
+            "stateful_tree_enabled": True,
+            "prev_attempt_context_enabled": True,
+        }
+
+    if args.variant == "ab_prev_attempt_ctx_on":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "iterative_exploration",
+            "stateful_repair_enabled": True,
+            "stateful_tree_enabled": False,
+            "prev_attempt_context_enabled": True,
+        }
+
+    if args.variant == "full_system":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": True,
+            "retrieval_strategy": "iterative_exploration",
+        }
+
+    if args.variant == "validation":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_synthesis_validation",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": True,
+            "scratchpads_enabled": False,
+            "retrieval_strategy": "iterative_exploration",
+        }
+
+    if args.variant == "synthesis":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration_plus_synthesis",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": True,
+            "validation_enabled": False,
+            "scratchpads_enabled": False,
+            "retrieval_strategy": "iterative_exploration",
+        }
+
+    if args.variant == "exploration":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "iterative_exploration",
+            "classification_required": True,
+            "repair_enabled": True,
+            "exploration_enabled": True,
+            "synthesis_enabled": False,
+            "validation_enabled": False,
+            "scratchpads_enabled": False,
+            "retrieval_strategy": "iterative_exploration",
+        }
+
+    if args.variant == "one_shot_direct":
+        return {
+            "phase2_anchor": False,
+            "repo_context_source": "static_fingerprint_only",
+            "classification_required": False,
+            "repair_enabled": False,
+            "exploration_enabled": False,
+            "synthesis_enabled": False,
+            "validation_enabled": False,
+            "scratchpads_enabled": False,
+            "retrieval_strategy": "none",
+        }
+
+    return {
+        "phase2_anchor": True,
+        "repo_context_source": "staged_pipeline",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
+        "retrieval_strategy": "baseline_one_shot_fingerprint",
+    }
+
+
 def main() -> int:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     pipeline_started_ts = time.perf_counter()
     pipeline_started_at = utc_now()
     src_dir = Path(__file__).resolve().parent
-    workspace_root = src_dir.parent.parent
+    workspace_root = _resolve_workspace_root(src_dir)
     _resolve_llm_arg_defaults(workspace_root)
     _synchronize_llm_environment()
     run_dir = workspace_root / "runs" / f"run-{run_id}"
@@ -575,17 +1221,80 @@ def main() -> int:
     classify_script = src_dir / "agent_classify.py"
     dockerfile_script = src_dir / "agent_dockerfile.py"
     repair_script = src_dir / "agent_dockerfile_repair.py"
+    validation_gate_script = src_dir / "agent_validation_gate.py"
     install_guide_script = src_dir / "agent_install_guide.py"
     analysis_script = src_dir / "parse_results.py"
+
+    phase_skips = resolve_phase_skips()
+    if args.variant in {"flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react"}:
+        if args.stateful_repair:
+            log_info(f"Variant {args.variant} selected: forcing stateful repair OFF for phase-2 ladder consistency.")
+        if args.stateful_repair_tree:
+            log_info(f"Variant {args.variant} selected: forcing stateful repair tree OFF for phase-2 ladder consistency.")
+        args.stateful_repair = False
+        args.stateful_repair_tree = False
+
+    if args.variant == "ab_stateful_tree_on":
+        if not args.stateful_repair:
+            log_info("Variant ab_stateful_tree_on selected: forcing stateful repair ON for AB-20A.")
+        if not args.stateful_repair_tree:
+            log_info("Variant ab_stateful_tree_on selected: forcing stateful repair tree ON for AB-20A isolation.")
+        args.stateful_repair = True
+        args.stateful_repair_tree = True
+
+    if args.variant == "ab_stateful_tree_off":
+        if not args.stateful_repair:
+            log_info("Variant ab_stateful_tree_off selected: forcing stateful repair ON for AB-20B.")
+        if args.stateful_repair_tree:
+            log_info("Variant ab_stateful_tree_off selected: forcing stateful repair tree OFF for AB-20B isolation.")
+        args.stateful_repair = True
+        args.stateful_repair_tree = False
+
+    base_variant_policy = resolve_variant_policy()
+    args.arch_exploration_enabled = bool(base_variant_policy.get("exploration_enabled", True))
+    args.arch_synthesis_enabled = bool(base_variant_policy.get("synthesis_enabled", True))
+    args.arch_validation_enabled = bool(base_variant_policy.get("validation_enabled", True))
+    args.arch_scratchpads_enabled = bool(base_variant_policy.get("scratchpads_enabled", True))
+
+    if args.variant == "ab_prev_attempt_ctx_on":
+        if not args.stateful_repair:
+            log_info("Variant ab_prev_attempt_ctx_on selected: forcing stateful repair ON for AB-19A.")
+        if args.stateful_repair_tree:
+            log_info("Variant ab_prev_attempt_ctx_on selected: forcing stateful repair tree OFF for AB-19A isolation.")
+        args.stateful_repair = True
+        args.stateful_repair_tree = False
+
+    agent_config_path = _resolve_agent_config_path(workspace_root)
+    agent_config_applied: dict = {}
+    if agent_config_path is not None:
+        try:
+            agent_config = _load_agent_config(agent_config_path)
+            agent_config_applied = _apply_agent_config_overrides(agent_config, phase_skips)
+            log_info(f"Applied runtime agent config: {agent_config_path}")
+        except ValueError as error:
+            log_error(str(error))
+            return 1
 
     if args.print_summary:
         print_planned_summary()
         return 0
 
-    phases_selected = not (args.skip_classify and args.skip_dockerfile and args.skip_repair and args.skip_install_guide)
+    phases_selected = not (
+        phase_skips["classify"]
+        and phase_skips["dockerfile"]
+        and phase_skips["validation_gate"]
+        and phase_skips["repair"]
+        and phase_skips["install_guide"]
+    )
     if not phases_selected and not args.run_analysis:
         log_error("Nothing to do. All pipeline phases were skipped and --run-analysis was not set.")
         return 1
+
+    if phase_skips["classify"] and args.run_analysis:
+        log_info("Classification is skipped: disabling --run-analysis because parse_results depends on classify outputs.")
+        args.run_analysis = False
+
+    variant_policy = resolve_variant_policy()
 
     summary: dict = {
         "run_id": run_id,
@@ -597,6 +1306,64 @@ def main() -> int:
             "enabled": args.trace,
             "forwarded_to_child_agents": args.trace,
         },
+        "variant": args.variant,
+        "variant_policy": variant_policy,
+        "agent_config": {
+            "path": str(agent_config_path) if agent_config_path is not None else None,
+            "applied_overrides": agent_config_applied,
+        },
+        "effective_runtime_controls": {
+            "phases": {
+                "classify": not phase_skips["classify"],
+                "dockerfile": not phase_skips["dockerfile"],
+                "validation_gate": not phase_skips["validation_gate"],
+                "repair": not phase_skips["repair"],
+                "install_guide": not phase_skips["install_guide"],
+            },
+            "classification": {
+                "retrieval_strategy": resolve_classify_retrieval_strategy(),
+                "embedding_model": args.embedding_model,
+                "architecture": {
+                    "exploration_enabled": args.arch_exploration_enabled,
+                    "synthesis_enabled": args.arch_synthesis_enabled,
+                    "validation_enabled": args.arch_validation_enabled,
+                    "scratchpads_enabled": args.arch_scratchpads_enabled,
+                    "synthesis_subagents_enabled": args.synthesis_subagents_enabled,
+                    "synthesis_react_max_steps": args.synthesis_react_max_steps,
+                    "validation_react_max_steps": args.validation_react_max_steps,
+                },
+                "artifact_patterns": {
+                    "exploration": str(Path(args.summaries_dir) / "<repo>.exploration.yaml"),
+                    "synthesis": str(Path(args.summaries_dir) / "<repo>.synthesis.yaml"),
+                    "validation": str(Path(args.summaries_dir) / "<repo>.validation.yaml"),
+                    "post_generation_validation": str(Path(args.summaries_dir) / "<repo>.postgen-validation.yaml"),
+                    "scratchpad": str(Path(args.summaries_dir) / "<repo>.architecture-scratchpad.yaml"),
+                },
+                "react": {
+                    "max_steps": args.react_max_steps,
+                    "files_per_step": args.react_files_per_step,
+                    "max_total_files": args.react_max_total_files,
+                    "final_cap": args.react_final_cap,
+                },
+                "step2_token_budget": args.step2_token_budget,
+            },
+            "dockerfile": {
+                "one_shot_direct": (
+                    args.variant == "one_shot_direct"
+                    if args.dockerfile_one_shot_direct is None
+                    else args.dockerfile_one_shot_direct
+                ),
+            },
+            "repair": {
+                "stateful_repair": args.stateful_repair,
+                "stateful_repair_tree": args.stateful_repair_tree,
+                "history_window": args.stateful_history_window,
+                "history_max_chars": args.stateful_history_max_chars,
+                "tree_max_chars": args.stateful_tree_max_chars,
+                "tree_max_children": args.stateful_tree_max_children,
+            },
+        },
+        "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
         "paths": {
             "run_dir": str(run_dir),
             "reports_dir": str(reports_dir),
@@ -615,7 +1382,7 @@ def main() -> int:
     }
 
     try:
-        if not args.skip_classify:
+        if not phase_skips["classify"]:
             summary["phases"].append(
                 run_step(
                     "classification",
@@ -633,7 +1400,7 @@ def main() -> int:
                 )
             )
 
-        if not args.skip_dockerfile:
+        if not phase_skips["dockerfile"]:
             summary["phases"].append(
                 run_step(
                     "dockerfile generation",
@@ -642,7 +1409,16 @@ def main() -> int:
                 )
             )
 
-        if not args.skip_repair:
+        if not phase_skips["validation_gate"]:
+            summary["phases"].append(
+                run_step(
+                    "post-generation validation gate",
+                    build_validation_gate_command(python_executable, validation_gate_script),
+                    run_logs_dir / "post-generation-validation-gate.log",
+                )
+            )
+
+        if not phase_skips["repair"]:
             summary["phases"].append(
                 run_step(
                     "dockerfile repair",
@@ -651,7 +1427,7 @@ def main() -> int:
                 )
             )
 
-        if not args.skip_install_guide:
+        if not phase_skips["install_guide"]:
             summary["phases"].append(
                 run_step(
                     "install guide generation",
@@ -674,7 +1450,7 @@ def main() -> int:
     if summary["status"] != "success":
         return 1
 
-    if not args.skip_repair:
+    if not phase_skips["repair"]:
         repair_outcomes = collect_repair_outcomes(Path(args.reports_dir))
         log_info(
             f"Build outcomes ({repair_outcomes['total_reports']} reports)"

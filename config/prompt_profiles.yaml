@@ -1,0 +1,27 @@
+default_profile: baseline_structured
+pstar_profile: baseline_structured
+
+profiles:
+  baseline_structured:
+    few_shot_count: 1
+    prompt_length_mode: detailed
+    reasoning_instruction: true
+    output_format_mode: structured
+    temperature: 0.0
+    role_framing: expert
+
+  concise_neutral:
+    few_shot_count: 0
+    prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  exploratory_expert:
+    few_shot_count: 3
+    prompt_length_mode: detailed
+    reasoning_instruction: true
+    output_format_mode: structured
+    temperature: 0.3
+    role_framing: expert

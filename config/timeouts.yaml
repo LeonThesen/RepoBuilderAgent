@@ -1,0 +1,33 @@
+# Timeout defaults for RepoBuilderAgent scripts.
+# Each script uses: common + script section (script values override common).
+
+common:
+  timeout: 120
+  llm_max_retries: 2
+  llm_retry_backoff_seconds: 2.0
+
+agent_classify:
+  selection_timeout: 120
+  classification_timeout: 240
+
+agent_dockerfile:
+  dockerfile_timeout: 240
+  verify_cmd_timeout: 180
+
+agent_dockerfile_repair:
+  repair_timeout: 240
+  verify_repair_timeout: 180
+  verify_timeout: 30
+
+agent_install_guide:
+  install_guide_timeout: 240
+
+agent_pipeline:
+  selection_timeout: 120
+  classification_timeout: 240
+  dockerfile_timeout: 240
+  verify_cmd_timeout: 180
+  repair_timeout: 240
+  verify_repair_timeout: 180
+  install_guide_timeout: 240
+  verify_timeout: 30

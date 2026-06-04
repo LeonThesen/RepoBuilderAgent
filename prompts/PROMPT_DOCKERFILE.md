@@ -33,6 +33,9 @@ Your task is to:
   5. Return only the completed Dockerfile contents. Do not wrap in Markdown fences.
 </system>
 
+{{PROMPT_PROFILE_DIRECTIVES}}
+{{PROMPT_PROFILE_FEWSHOT}}
+
 <base_template>
 {{BASE_TEMPLATE_CONTENT}}
 </base_template>

@@ -11,44 +11,80 @@ from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
 try:
-    from RepoBuilderAgent.src.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.common import (
+    from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
+    from RepoBuilderAgent.src.core.prompt_profiles import (
+        apply_prompt_profile,
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
+    from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
+        load_architecture_scratchpad,
+        load_shared_repository_state,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_shared_repository_state_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
+        upsert_shared_repository_state,
         update_progress,
     )
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    import config as _config
-    from log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from common import (
+    import core.config as _config
+    from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from core.timeout_config import load_timeout_defaults
+    from core.prompt_profiles import (
+        apply_prompt_profile,
+        prompt_profile_metadata,
+        resolve_prompt_profile,
+        resolve_prompt_temperature,
+    )
+    from core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
+        load_architecture_scratchpad,
+        load_shared_repository_state,
         load_repo_urls,
         load_summary,
         prompt_path,
         read_yaml_file,
+        render_architecture_scratchpad_for_prompt,
+        render_shared_repository_state_for_prompt,
+        render_validation_findings_for_prompt,
         render_yaml,
         repo_name_from_url,
         should_use_progress,
+        upsert_shared_repository_state,
         update_progress,
     )
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
     OPENAI_MODEL = getattr(_config, "OPENAI_MODEL", "gpt-4o")
+
+TIMEOUTS = load_timeout_defaults(
+    "agent_install_guide",
+    {
+        "timeout": 120,
+        "llm_max_retries": 2,
+        "llm_retry_backoff_seconds": 2.0,
+        "install_guide_timeout": 240,
+    },
+)
 
 
 parser = argparse.ArgumentParser(
@@ -64,11 +100,12 @@ parser.add_argument(
 parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
-parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
-parser.add_argument("--timeout", type=int, default=120, help="Timeout for API requests in seconds")
-parser.add_argument("--llm-max-retries", type=int, default=2, help="Maximum retries for transient LLM timeouts and retryable API errors")
-parser.add_argument("--llm-retry-backoff-seconds", type=float, default=2.0, help="Base exponential backoff delay in seconds for LLM retries")
-parser.add_argument("--install-guide-timeout", type=int, default=240, help="Timeout for INSTALL.md generation calls in seconds")
+parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"), help="Prompt profile name from RepoBuilderAgent/config/prompt_profiles.yaml (supports alias P*)")
+parser.add_argument("--temperature", type=float, default=None, help="Temperature override for the model; defaults to selected prompt profile value")
+parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
+parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
+parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
+parser.add_argument("--install-guide-timeout", type=int, default=int(TIMEOUTS["install_guide_timeout"]), help="Timeout for INSTALL.md generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated install guides")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
@@ -77,6 +114,8 @@ parser.add_argument("--repos-dir", default="repos", help="Directory containing c
 parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory containing generated Dockerfiles")
 parser.add_argument("--output-dir", default="install-guides", help="Directory where generated INSTALL.md files will be written")
 args = parser.parse_args()
+PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 
 # httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
@@ -92,7 +131,7 @@ client = AsyncOpenAI(
 )
 
 with open(prompt_path("PROMPT_INSTALL_GUIDE.md"), "r", encoding="utf-8") as prompt_file:
-    PROMPT_TEMPLATE = prompt_file.read()
+    PROMPT_TEMPLATE = apply_prompt_profile(prompt_file.read(), PROMPT_PROFILE, "install-guide")
 
 sem = asyncio.Semaphore(4)
 
@@ -138,6 +177,7 @@ async def generate_install_guide(
         output_path = output_dir / repo_name / "INSTALL.md"
         llm_metrics_path = output_dir / repo_name / "llm-metrics.yaml"
         llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
+        llm_metrics["prompt_profile"] = prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE)
 
         try:
             if output_path.exists() and not args.force:
@@ -164,6 +204,9 @@ async def generate_install_guide(
                 return
 
             summary = load_summary(repo_name, repo_path, summaries_dir)
+            architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
+            shared_repository_state = load_shared_repository_state(repo_name, summaries_dir)
+            validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
             dockerfile_content = dockerfile_path.read_text(encoding="utf-8")
             verify_command_path = dockerfiles_dir / f"{repo_name}.verify-command"
             verify_command = verify_command_path.read_text(encoding="utf-8").strip() if verify_command_path.exists() else ""
@@ -175,6 +218,9 @@ async def generate_install_guide(
                 .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
                 .replace("{{VERIFY_COMMAND}}", verify_command)
             )
+            prompt += render_validation_findings_for_prompt(validation_artifact)
+            prompt += render_architecture_scratchpad_for_prompt(architecture_scratchpad)
+            prompt += render_shared_repository_state_for_prompt(shared_repository_state)
 
             log_info(f"Generating INSTALL.md for {repo_url}...")
             install_guide_content = ""
@@ -183,7 +229,7 @@ async def generate_install_guide(
                 response = await chat_completion_with_retries(
                     client=client,
                     model=args.model,
-                    temperature=args.temperature,
+                    temperature=EFFECTIVE_TEMPERATURE,
                     messages=[{"role": "user", "content": generation_prompt}],
                     repo_url=repo_url,
                     phase="install-guide",
@@ -218,6 +264,17 @@ async def generate_install_guide(
 
             log_trace(f"INSTALL.md written for {repo_name} at {output_path}")
             log_info(f"Saved INSTALL.md to {output_path}")
+
+            upsert_shared_repository_state(
+                repo_name,
+                summaries_dir,
+                repo_url=repo_url,
+                stage_name="install_guide",
+                stage_update={
+                    "status": "completed",
+                    "install_guide_path": str(output_path),
+                },
+            )
 
             with open(llm_metrics_path, "w", encoding="utf-8") as metrics_file:
                 metrics_file.write(render_yaml(finalize_llm_metrics(llm_metrics)))

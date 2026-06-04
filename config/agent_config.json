@@ -1,0 +1,39 @@
+{
+  "phases": {
+    "classify": true,
+    "dockerfile": true,
+    "repair": true,
+    "install_guide": true
+  },
+  "architecture": {
+    "exploration_enabled": true,
+    "synthesis_enabled": true,
+    "validation_enabled": true,
+    "scratchpads_enabled": true,
+    "synthesis_subagents_enabled": true,
+    "synthesis_react_max_steps": 3,
+    "validation_react_max_steps": 3
+  },
+  "classification": {
+    "retrieval_strategy": "iterative_react",
+    "embedding_model": "text-embedding-3-small",
+    "step2_token_budget": 12000,
+    "react": {
+      "max_steps": 4,
+      "files_per_step": 8,
+      "max_total_files": 24,
+      "final_cap": 12
+    }
+  },
+  "dockerfile": {
+    "one_shot_direct": false
+  },
+  "repair": {
+    "stateful_repair": true,
+    "stateful_repair_tree": true,
+    "history_window": 4,
+    "history_max_chars": 4000,
+    "tree_max_chars": 2500,
+    "tree_max_children": 5
+  }
+}

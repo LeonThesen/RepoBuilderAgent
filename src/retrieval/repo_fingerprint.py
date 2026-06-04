@@ -7,16 +7,18 @@ for LLM-based analysis (build tools, runtime, language, CI, etc.)
 """
 
 import os
+import re
+import math
 import fnmatch
 import yaml
 from pathlib import Path
 from typing import Optional
 
 try:
-    from RepoBuilderAgent.src.log_utils import log_info, log_trace
+    from RepoBuilderAgent.src.core.log_utils import log_info, log_trace
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    from log_utils import log_info, log_trace
+    from core.log_utils import log_info, log_trace
 
 # ---------------------------------------------------------------------------
 # Config Loading
@@ -156,6 +158,114 @@ def _iter_selected_file_matches(root: Path, pattern: str):
             yield file_rel, file_path
 
 
+def collect_retrieval_candidates(root: Path, max_bytes: int = 4096) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
+    exact_names = {
+        "readme.md",
+        "readme.rst",
+        "readme.txt",
+        "install.md",
+        "install.txt",
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "go.mod",
+        "cargo.toml",
+        "dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "makefile",
+        "cmakelists.txt",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+        "gemfile",
+        "composer.json",
+        "setup.py",
+        "setup.cfg",
+        "pipfile",
+        "pipfile.lock",
+        ".env.example",
+    }
+    relevant_tokens = (
+        "readme",
+        "install",
+        "build",
+        "package",
+        "requirement",
+        "docker",
+        "workflow",
+        "cargo",
+        "gradle",
+        "maven",
+        "cmake",
+        "makefile",
+        "setup",
+        "pipfile",
+        "compose",
+    )
+    allowed_suffixes = {
+        ".md",
+        ".rst",
+        ".txt",
+        ".toml",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".cfg",
+        ".ini",
+        ".properties",
+        ".gradle",
+        ".kts",
+        ".mk",
+        ".sh",
+    }
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [dirname for dirname in dirnames if not should_skip_dir(dirname)]
+        current_dir = Path(dirpath)
+
+        for filename in sorted(filenames):
+            file_path = current_dir / filename
+            try:
+                if file_path.stat().st_size > MAX_FILE_SIZE:
+                    continue
+            except OSError:
+                continue
+
+            rel = str(file_path.relative_to(root).as_posix())
+            rel_lower = rel.lower()
+            basename = file_path.name.lower()
+            in_docs_dir = rel_lower.startswith("docs/") or "/docs/" in rel_lower
+
+            include_candidate = False
+            if basename in exact_names:
+                include_candidate = True
+            elif rel_lower.startswith(".github/workflows/"):
+                include_candidate = True
+            elif any(token in rel_lower for token in relevant_tokens):
+                include_candidate = True
+            elif file_path.suffix.lower() in allowed_suffixes and not in_docs_dir:
+                include_candidate = True
+
+            if in_docs_dir and not basename.startswith(("readme", "install")) and basename not in exact_names:
+                include_candidate = False
+
+            if not include_candidate:
+                continue
+
+            results.append((rel, read_file_safe(file_path, max_bytes=max_bytes)))
+
+    return results
+
+
 def collect_manifest_files(root: Path) -> list[tuple[str, str]]:
     """Walk repo and collect full-read manifest files (non-pattern)."""
     results: list[tuple[str, str]] = []
@@ -291,6 +401,115 @@ def collect_selected_files(root: Path, selected_files: list[str]) -> list[tuple[
             _append_file_result(results, seen, rel, file_path)
 
     return sorted(results, key=lambda x: x[0])
+
+
+def _tokenize_text(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", value.lower())
+
+
+def select_files_by_bm25(root: Path, query_terms: list[str], top_k: int = 12) -> list[str]:
+    """Rank manifest/config files using a lightweight BM25 scorer."""
+    candidates = collect_retrieval_candidates(root)
+    if not candidates:
+        return []
+
+    high_signal_names = {
+        "readme.md",
+        "readme.rst",
+        "readme.txt",
+        "install.md",
+        "install.txt",
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "go.mod",
+        "cargo.toml",
+        "dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "makefile",
+        "cmakelists.txt",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+        "gemfile",
+        "composer.json",
+        "setup.py",
+        "setup.cfg",
+        "pipfile",
+        "pipfile.lock",
+        ".env.example",
+    }
+
+    normalized_terms = []
+    seen_terms: set[str] = set()
+    for term in query_terms:
+        for token in _tokenize_text(term):
+            if token and token not in seen_terms:
+                seen_terms.add(token)
+                normalized_terms.append(token)
+
+    if not normalized_terms:
+        return [rel for rel, _ in candidates[:top_k]]
+
+    documents: list[tuple[str, list[str]]] = []
+    document_frequency: dict[str, int] = {}
+    total_length = 0
+
+    for rel, content in candidates:
+        tokens = _tokenize_text(f"{rel}\n{content}") or _tokenize_text(rel)
+        documents.append((rel, tokens))
+        total_length += len(tokens)
+        for token in set(tokens):
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+
+    avg_doc_length = total_length / len(documents) if documents else 0.0
+    k1 = 1.5
+    b = 0.75
+    ranked: list[tuple[float, str]] = []
+
+    for rel, tokens in documents:
+        if not tokens:
+            continue
+        token_counts: dict[str, int] = {}
+        for token in tokens:
+            token_counts[token] = token_counts.get(token, 0) + 1
+
+        doc_length = len(tokens)
+        norm = k1 * (1 - b + b * (doc_length / avg_doc_length)) if avg_doc_length else k1
+        score = 0.0
+
+        for term in normalized_terms:
+            term_frequency = token_counts.get(term, 0)
+            if term_frequency <= 0:
+                continue
+            matching_docs = document_frequency.get(term, 0)
+            inverse_doc_frequency = math.log(1 + ((len(documents) - matching_docs + 0.5) / (matching_docs + 0.5)))
+            score += inverse_doc_frequency * ((term_frequency * (k1 + 1)) / (term_frequency + norm))
+
+        rel_lower = rel.lower()
+        basename = Path(rel_lower).name
+        if basename in high_signal_names:
+            score += 2.5
+        elif basename.startswith(("readme", "install")):
+            score += 1.5
+        if rel_lower.startswith(".github/workflows/"):
+            score += 0.25
+
+        if score > 0:
+            ranked.append((score, rel))
+
+    if not ranked:
+        return [rel for rel, _ in candidates[:top_k]]
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [rel for _, rel in ranked[:top_k]]
 
 
 def collect_metadata(root: Path) -> dict:
