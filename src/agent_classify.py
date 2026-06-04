@@ -161,6 +161,12 @@ parser.add_argument(
     help="Maximum L2 synthesis loop iterations.",
 )
 parser.add_argument(
+    "--synthesis-review-rounds",
+    type=int,
+    default=1,
+    help="Number of L2.5 reviewer rounds to run after initial L2 generator output.",
+)
+parser.add_argument(
     "--validation-react-max-steps",
     type=int,
     default=3,
@@ -809,6 +815,7 @@ async def _run_architecture_state_graph(
         run_validation=args.validation_enabled,
         classification_timeout=args.classification_timeout,
         synthesis_react_max_steps=args.synthesis_react_max_steps,
+        synthesis_review_rounds=args.synthesis_review_rounds,
         validation_react_max_steps=args.validation_react_max_steps,
         synthesis_subagents_enabled=args.synthesis_subagents_enabled,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
@@ -881,6 +888,7 @@ async def _run_l2_synthesis_loop(
         file_context_by_path=file_context_by_path,
         classification_timeout=args.classification_timeout,
         synthesis_react_max_steps=args.synthesis_react_max_steps,
+        synthesis_review_rounds=args.synthesis_review_rounds,
         synthesis_subagents_enabled=args.synthesis_subagents_enabled,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         extract_agent_payload=_extract_agent_payload,

@@ -211,6 +211,12 @@ parser.add_argument(
     help="Maximum L2 synthesis loop iterations passed to classify.",
 )
 parser.add_argument(
+    "--synthesis-review-rounds",
+    type=int,
+    default=1,
+    help="Number of L2.5 reviewer rounds to run after generator output.",
+)
+parser.add_argument(
     "--validation-react-max-steps",
     type=int,
     default=3,
@@ -496,6 +502,12 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
                 key="architecture.synthesis_react_max_steps",
             )
             applied.setdefault("architecture", {})["synthesis_react_max_steps"] = args.synthesis_react_max_steps
+        if "synthesis_review_rounds" in architecture_cfg:
+            args.synthesis_review_rounds = _expect_int(
+                architecture_cfg["synthesis_review_rounds"],
+                key="architecture.synthesis_review_rounds",
+            )
+            applied.setdefault("architecture", {})["synthesis_review_rounds"] = args.synthesis_review_rounds
         if "validation_react_max_steps" in architecture_cfg:
             args.validation_react_max_steps = _expect_int(
                 architecture_cfg["validation_react_max_steps"],
@@ -674,6 +686,7 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         "--react-final-cap", str(args.react_final_cap),
         "--step2-token-budget", str(args.step2_token_budget),
         "--synthesis-react-max-steps", str(args.synthesis_react_max_steps),
+        "--synthesis-review-rounds", str(args.synthesis_review_rounds),
         "--validation-react-max-steps", str(args.validation_react_max_steps),
         "--results-dir", args.results_dir,
         "--summaries-dir", args.summaries_dir,
@@ -1368,6 +1381,7 @@ def main() -> int:
                     "scratchpads_enabled": args.arch_scratchpads_enabled,
                     "synthesis_subagents_enabled": args.synthesis_subagents_enabled,
                     "synthesis_react_max_steps": args.synthesis_react_max_steps,
+                    "synthesis_review_rounds": args.synthesis_review_rounds,
                     "validation_react_max_steps": args.validation_react_max_steps,
                 },
                 "artifact_patterns": {

@@ -21,61 +21,236 @@ except ImportError:
     )
 
 
-async def _build_signal_scan(selected_files: list[str]) -> dict[str, Any]:
-    await asyncio.sleep(0)
+def _deterministic_signal_scan(selected_files: list[str], markers: tuple[str, ...], limit: int = 8) -> list[str]:
+    return [path for path in selected_files if any(marker in path.lower() for marker in markers)][: max(1, int(limit))]
+
+
+async def _invoke_signal_subagent(
+    *,
+    name: str,
+    repo_name: str,
+    summary: str,
+    prompt_body: str,
+    deterministic_fallback: list[str],
+    classification_timeout: int,
+    new_prebuilt_chat_model: Callable[[int], Any],
+    extract_agent_payload: Callable[[dict[str, Any]], Any],
+    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
+    normalize_text_list: Callable[[Any], list[str]],
+    think,
+    list_selected_files,
+    search_selected_files,
+    fetch_file_context,
+) -> dict[str, Any]:
+    signal_agent = create_react_agent(
+        model=new_prebuilt_chat_model(classification_timeout),
+        tools=[think, list_selected_files, search_selected_files, fetch_file_context],
+        prompt=(
+            "You are a focused L2 signal sub-agent. "
+            "Use tools to find high-value evidence for your assigned signal type. "
+            "Return YAML-compatible fields only."
+        ),
+    )
+
+
+    subagent_prompt = (
+        f"Repository: {repo_name}\n"
+        f"Sub-agent: {name}\n"
+        + prompt_body
+        + "\n"
+        "Use think between major tool decisions.\n"
+        "Return keys: thought, signal (list), notes (list), done (bool).\n\n"
+        "SUMMARY_EVIDENCE:\n"
+        + summary
+    )
+
+    result = await signal_agent.ainvoke(
+        {"messages": [{"role": "user", "content": subagent_prompt}]},
+        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:{name}"}, "recursion_limit": 16},
+    )
+    payload = extract_agent_payload(result)
+    signal = normalize_text_list(payload.get("signal") if isinstance(payload, dict) else [])
+    notes = normalize_text_list(payload.get("notes") if isinstance(payload, dict) else [])
+    done_flag = bool(payload.get("done", False)) if isinstance(payload, dict) else False
+    trace = extract_agent_trace(result)
+
+    if not signal:
+        signal = deterministic_fallback
+
     return {
-        "name": "build-signal-scan",
-        "signal": [
-            path
-            for path in selected_files
-            if any(marker in path.lower() for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
-        ][:8],
+        "name": name,
+        "mode": "llm_subagent",
+        "signal": signal[:8],
+        "notes": notes[:8],
+        "steps": len(trace),
+        "stop_reason": "model_done" if done_flag else "agent_converged",
     }
 
 
-async def _runtime_signal_scan(selected_files: list[str]) -> dict[str, Any]:
-    await asyncio.sleep(0)
-    return {
-        "name": "runtime-signal-scan",
-        "signal": [
-            path
-            for path in selected_files
-            if any(marker in path.lower() for marker in ("dockerfile", "docker-compose", "runtime", "launch", "entrypoint"))
-        ][:8],
-    }
+async def _invoke_gap_subagent(
+    *,
+    repo_name: str,
+    summary: str,
+    selected_lower: list[str],
+    classification_timeout: int,
+    new_prebuilt_chat_model: Callable[[int], Any],
+    extract_agent_payload: Callable[[dict[str, Any]], Any],
+    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
+    normalize_text_list: Callable[[Any], list[str]],
+    think,
+    list_selected_files,
+    search_selected_files,
+    fetch_file_context,
+) -> dict[str, Any]:
+    gap_agent = create_react_agent(
+        model=new_prebuilt_chat_model(classification_timeout),
+        tools=[think, list_selected_files, search_selected_files, fetch_file_context],
+        prompt=(
+            "You are the L2 gap-check sub-agent. "
+            "Detect whether manifest, docker, and test evidence are present. "
+            "Return YAML-compatible fields only."
+        ),
+    )
 
+    gap_prompt = (
+        f"Repository: {repo_name}\n"
+        "Check evidence presence and return booleans.\n"
+        "Use think between major tool decisions.\n"
+        "Return keys: thought, has_manifest (bool), has_docker (bool), has_tests (bool), notes (list), done (bool).\n\n"
+        "SUMMARY_EVIDENCE:\n"
+        + summary
+    )
 
-async def _verification_signal_scan(selected_files: list[str]) -> dict[str, Any]:
-    await asyncio.sleep(0)
-    return {
-        "name": "verification-signal-scan",
-        "signal": [path for path in selected_files if any(marker in path.lower() for marker in ("test", "spec", ".github/workflows", "ci"))][:8],
-    }
+    result = await gap_agent.ainvoke(
+        {"messages": [{"role": "user", "content": gap_prompt}]},
+        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:gap-check"}, "recursion_limit": 16},
+    )
+    payload = extract_agent_payload(result)
+    trace = extract_agent_trace(result)
+    notes = normalize_text_list(payload.get("notes") if isinstance(payload, dict) else [])
+    done_flag = bool(payload.get("done", False)) if isinstance(payload, dict) else False
 
+    def _as_bool(field: str, fallback: bool) -> bool:
+        if not isinstance(payload, dict):
+            return fallback
+        value = payload.get(field)
+        return bool(value) if isinstance(value, bool) else fallback
 
-async def _gap_check_scan(selected_lower: list[str]) -> dict[str, Any]:
-    await asyncio.sleep(0)
+    fallback_manifest = any(
+        any(marker in path for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
+        for path in selected_lower
+    )
+    fallback_docker = any("dockerfile" in path or "docker-compose" in path for path in selected_lower)
+    fallback_tests = any("test" in path or "spec" in path for path in selected_lower)
+
     return {
         "name": "gap-check",
+        "mode": "llm_subagent",
         "signal": {
-            "has_manifest": any(
-                any(marker in path for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
-                for path in selected_lower
-            ),
-            "has_docker": any("dockerfile" in path or "docker-compose" in path for path in selected_lower),
-            "has_tests": any("test" in path or "spec" in path for path in selected_lower),
+            "has_manifest": _as_bool("has_manifest", fallback_manifest),
+            "has_docker": _as_bool("has_docker", fallback_docker),
+            "has_tests": _as_bool("has_tests", fallback_tests),
         },
+        "notes": notes[:8],
+        "steps": len(trace),
+        "stop_reason": "model_done" if done_flag else "agent_converged",
     }
 
 
-async def _run_synthesis_subagents(selected_files: list[str]) -> list[dict[str, Any]]:
+async def _run_synthesis_subagents(
+    *,
+    repo_name: str,
+    selected_files: list[str],
+    summary: str,
+    classification_timeout: int,
+    new_prebuilt_chat_model: Callable[[int], Any],
+    extract_agent_payload: Callable[[dict[str, Any]], Any],
+    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
+    normalize_text_list: Callable[[Any], list[str]],
+    think,
+    list_selected_files,
+    search_selected_files,
+    fetch_file_context,
+) -> list[dict[str, Any]]:
     selected_lower = [path.lower() for path in selected_files]
+
+    build_fallback = _deterministic_signal_scan(
+        selected_files,
+        ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"),
+    )
+    runtime_fallback = _deterministic_signal_scan(
+        selected_files,
+        ("dockerfile", "docker-compose", "runtime", "launch", "entrypoint"),
+    )
+    verification_fallback = _deterministic_signal_scan(
+        selected_files,
+        ("test", "spec", ".github/workflows", "ci"),
+    )
+
     return list(
         await asyncio.gather(
-            _build_signal_scan(selected_files),
-            _runtime_signal_scan(selected_files),
-            _verification_signal_scan(selected_files),
-            _gap_check_scan(selected_lower),
+            _invoke_signal_subagent(
+                name="build-signal-scan",
+                repo_name=repo_name,
+                summary=summary,
+                prompt_body="Identify top manifest/build-signal files relevant for installation/build planning.",
+                deterministic_fallback=build_fallback,
+                classification_timeout=classification_timeout,
+                new_prebuilt_chat_model=new_prebuilt_chat_model,
+                extract_agent_payload=extract_agent_payload,
+                extract_agent_trace=extract_agent_trace,
+                normalize_text_list=normalize_text_list,
+                think=think,
+                list_selected_files=list_selected_files,
+                search_selected_files=search_selected_files,
+                fetch_file_context=fetch_file_context,
+            ),
+            _invoke_signal_subagent(
+                name="runtime-signal-scan",
+                repo_name=repo_name,
+                summary=summary,
+                prompt_body="Identify top runtime/containerization-signal files relevant for execution behavior.",
+                deterministic_fallback=runtime_fallback,
+                classification_timeout=classification_timeout,
+                new_prebuilt_chat_model=new_prebuilt_chat_model,
+                extract_agent_payload=extract_agent_payload,
+                extract_agent_trace=extract_agent_trace,
+                normalize_text_list=normalize_text_list,
+                think=think,
+                list_selected_files=list_selected_files,
+                search_selected_files=search_selected_files,
+                fetch_file_context=fetch_file_context,
+            ),
+            _invoke_signal_subagent(
+                name="verification-signal-scan",
+                repo_name=repo_name,
+                summary=summary,
+                prompt_body="Identify top verification/test/CI signal files relevant for confidence and validation.",
+                deterministic_fallback=verification_fallback,
+                classification_timeout=classification_timeout,
+                new_prebuilt_chat_model=new_prebuilt_chat_model,
+                extract_agent_payload=extract_agent_payload,
+                extract_agent_trace=extract_agent_trace,
+                normalize_text_list=normalize_text_list,
+                think=think,
+                list_selected_files=list_selected_files,
+                search_selected_files=search_selected_files,
+                fetch_file_context=fetch_file_context,
+            ),
+            _invoke_gap_subagent(
+                repo_name=repo_name,
+                summary=summary,
+                selected_lower=selected_lower,
+                classification_timeout=classification_timeout,
+                new_prebuilt_chat_model=new_prebuilt_chat_model,
+                extract_agent_payload=extract_agent_payload,
+                extract_agent_trace=extract_agent_trace,
+                normalize_text_list=normalize_text_list,
+                think=think,
+                list_selected_files=list_selected_files,
+                search_selected_files=search_selected_files,
+                fetch_file_context=fetch_file_context,
+            ),
         )
     )
 
@@ -91,6 +266,7 @@ async def run_l2_synthesis_loop(
     classification_timeout: int,
     synthesis_react_max_steps: int,
     synthesis_subagents_enabled: bool,
+    synthesis_review_rounds: int,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -117,13 +293,30 @@ async def run_l2_synthesis_loop(
         "test_evidence_missing" if exploration_artifact["evidence_gaps"]["test_evidence_missing"] else None,
     ]
     risk_notes = [item for item in risk_notes if item]
-    subagent_outputs = await _run_synthesis_subagents(selected_snapshot) if synthesis_subagents_enabled else []
-
     fetch_file_context = build_fetch_file_context_tool(file_context_by_path)
     list_selected_files = build_list_selected_files_tool(selected_snapshot)
     search_selected_files = build_search_selected_files_tool(selected_snapshot)
     think = build_think_tool()
     hadolint_check = build_hadolint_snippet_tool()
+
+    subagent_outputs = (
+        await _run_synthesis_subagents(
+            repo_name=repo_name,
+            selected_files=selected_snapshot,
+            summary=summary,
+            classification_timeout=classification_timeout,
+            new_prebuilt_chat_model=new_prebuilt_chat_model,
+            extract_agent_payload=extract_agent_payload,
+            extract_agent_trace=extract_agent_trace,
+            normalize_text_list=normalize_text_list,
+            think=think,
+            list_selected_files=list_selected_files,
+            search_selected_files=search_selected_files,
+            fetch_file_context=fetch_file_context,
+        )
+        if synthesis_subagents_enabled
+        else []
+    )
 
     synthesis_generator = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
@@ -176,37 +369,60 @@ async def run_l2_synthesis_loop(
         ),
     )
 
-    reviewer_prompt = (
-        f"Repository: {repo_url}\n"
-        "Review and refine generated synthesis output.\n"
-        "Return keys: thought, accepted (bool), revised_hypotheses (list), revised_risks (list), critique_notes (list), done (bool).\n\n"
-        "GENERATOR_HYPOTHESES:\n"
-        + "\n".join(f"- {item}" for item in generated_hypotheses[:30])
-        + "\n\nGENERATOR_RISKS:\n"
-        + ("\n".join(f"- {item}" for item in generated_risks[:30]) if generated_risks else "- (none)")
-        + "\n\nSUBAGENT_SIGNALS:\n"
-        + str(subagent_outputs[:4])
-        + "\n\nSUMMARY_EVIDENCE:\n"
-        + summary
-    )
+    review_hypotheses = generated_hypotheses[:]
+    review_risks = generated_risks[:]
+    critique_notes: list[str] = []
+    reviewer_trace: list[dict[str, Any]] = []
+    review_accepted = False
+    review_done_flag = False
+    review_rounds_executed = 0
 
-    review_result = await synthesis_reviewer.ainvoke(
-        {"messages": [{"role": "user", "content": reviewer_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2-review"}, "recursion_limit": max(8, int(synthesis_react_max_steps) * 4)},
-    )
-    review_payload = extract_agent_payload(review_result)
-    revised_hypotheses = normalize_text_list(review_payload.get("revised_hypotheses") if isinstance(review_payload, dict) else [])
-    revised_risks = normalize_text_list(review_payload.get("revised_risks") if isinstance(review_payload, dict) else [])
-    critique_notes = normalize_text_list(review_payload.get("critique_notes") if isinstance(review_payload, dict) else [])
-    review_done_flag = bool(review_payload.get("done", False)) if isinstance(review_payload, dict) else False
-    review_accepted = bool(review_payload.get("accepted", False)) if isinstance(review_payload, dict) else False
+    for round_index in range(max(1, int(synthesis_review_rounds))):
+        reviewer_prompt = (
+            f"Repository: {repo_url}\n"
+            f"Review and refine generated synthesis output (round {round_index + 1}/{max(1, int(synthesis_review_rounds))}).\n"
+            "Return keys: thought, accepted (bool), revised_hypotheses (list), revised_risks (list), critique_notes (list), done (bool).\n\n"
+            "GENERATOR_HYPOTHESES:\n"
+            + "\n".join(f"- {item}" for item in review_hypotheses[:30])
+            + "\n\nGENERATOR_RISKS:\n"
+            + ("\n".join(f"- {item}" for item in review_risks[:30]) if review_risks else "- (none)")
+            + "\n\nSUBAGENT_SIGNALS:\n"
+            + str(subagent_outputs[:4])
+            + "\n\nSUMMARY_EVIDENCE:\n"
+            + summary
+        )
 
-    dedup_hypotheses = list(
-        dict.fromkeys(item.strip() for item in (revised_hypotheses or generated_hypotheses) if item and item.strip())
-    )
-    dedup_risks = list(dict.fromkeys(item.strip() for item in (revised_risks or generated_risks) if item and item.strip()))
+        review_result = await synthesis_reviewer.ainvoke(
+            {"messages": [{"role": "user", "content": reviewer_prompt}]},
+            config={
+                "configurable": {"thread_id": f"{repo_name}:l2-review:r{round_index + 1}"},
+                "recursion_limit": max(8, int(synthesis_react_max_steps) * 4),
+            },
+        )
+        review_rounds_executed += 1
+        review_payload = extract_agent_payload(review_result)
+        revised_hypotheses = normalize_text_list(review_payload.get("revised_hypotheses") if isinstance(review_payload, dict) else [])
+        revised_risks = normalize_text_list(review_payload.get("revised_risks") if isinstance(review_payload, dict) else [])
+        round_critique_notes = normalize_text_list(review_payload.get("critique_notes") if isinstance(review_payload, dict) else [])
+        critique_notes.extend(round_critique_notes)
+        review_done_flag = bool(review_payload.get("done", False)) if isinstance(review_payload, dict) else False
+        review_accepted = bool(review_payload.get("accepted", False)) if isinstance(review_payload, dict) else False
 
-    reviewer_trace = extract_agent_trace(review_result)
+        if revised_hypotheses:
+            review_hypotheses = revised_hypotheses
+        if revised_risks:
+            review_risks = revised_risks
+
+        round_trace = extract_agent_trace(review_result)
+        for event in round_trace:
+            if isinstance(event, dict):
+                reviewer_trace.append({"round": round_index + 1, **event})
+
+        if review_done_flag or review_accepted:
+            break
+
+    dedup_hypotheses = list(dict.fromkeys(item.strip() for item in review_hypotheses if item and item.strip()))
+    dedup_risks = list(dict.fromkeys(item.strip() for item in review_risks if item and item.strip()))
     loop_trace: list[dict[str, Any]] = []
     for event in generator_trace:
         if isinstance(event, dict):
@@ -250,11 +466,14 @@ async def run_l2_synthesis_loop(
             "generator_stop_reason": generator_stop_reason,
             "generator_steps": len(generator_trace),
             "reviewer_steps": len(reviewer_trace),
+            "review_rounds_requested": max(1, int(synthesis_review_rounds)),
+            "review_rounds_executed": review_rounds_executed,
         },
         "subagent_outputs": subagent_outputs,
         "review": {
             "enabled": True,
             "accepted": review_accepted,
+            "rounds": review_rounds_executed,
             "critique_notes": critique_notes[:30],
         },
         "loop_trace": loop_trace,
