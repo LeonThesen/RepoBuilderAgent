@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any, Callable
 
 from langgraph.prebuilt import create_react_agent
@@ -20,41 +21,63 @@ except ImportError:
     )
 
 
-def _run_synthesis_subagents(selected_files: list[str]) -> list[dict[str, Any]]:
+async def _build_signal_scan(selected_files: list[str]) -> dict[str, Any]:
+    await asyncio.sleep(0)
+    return {
+        "name": "build-signal-scan",
+        "signal": [
+            path
+            for path in selected_files
+            if any(marker in path.lower() for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
+        ][:8],
+    }
+
+
+async def _runtime_signal_scan(selected_files: list[str]) -> dict[str, Any]:
+    await asyncio.sleep(0)
+    return {
+        "name": "runtime-signal-scan",
+        "signal": [
+            path
+            for path in selected_files
+            if any(marker in path.lower() for marker in ("dockerfile", "docker-compose", "runtime", "launch", "entrypoint"))
+        ][:8],
+    }
+
+
+async def _verification_signal_scan(selected_files: list[str]) -> dict[str, Any]:
+    await asyncio.sleep(0)
+    return {
+        "name": "verification-signal-scan",
+        "signal": [path for path in selected_files if any(marker in path.lower() for marker in ("test", "spec", ".github/workflows", "ci"))][:8],
+    }
+
+
+async def _gap_check_scan(selected_lower: list[str]) -> dict[str, Any]:
+    await asyncio.sleep(0)
+    return {
+        "name": "gap-check",
+        "signal": {
+            "has_manifest": any(
+                any(marker in path for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
+                for path in selected_lower
+            ),
+            "has_docker": any("dockerfile" in path or "docker-compose" in path for path in selected_lower),
+            "has_tests": any("test" in path or "spec" in path for path in selected_lower),
+        },
+    }
+
+
+async def _run_synthesis_subagents(selected_files: list[str]) -> list[dict[str, Any]]:
     selected_lower = [path.lower() for path in selected_files]
-    return [
-        {
-            "name": "build-signal-scan",
-            "signal": [
-                path
-                for path in selected_files
-                if any(marker in path.lower() for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
-            ][:8],
-        },
-        {
-            "name": "runtime-signal-scan",
-            "signal": [
-                path
-                for path in selected_files
-                if any(marker in path.lower() for marker in ("dockerfile", "docker-compose", "runtime", "launch", "entrypoint"))
-            ][:8],
-        },
-        {
-            "name": "verification-signal-scan",
-            "signal": [path for path in selected_files if any(marker in path.lower() for marker in ("test", "spec", ".github/workflows", "ci"))][:8],
-        },
-        {
-            "name": "gap-check",
-            "signal": {
-                "has_manifest": any(
-                    any(marker in path for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
-                    for path in selected_lower
-                ),
-                "has_docker": any("dockerfile" in path or "docker-compose" in path for path in selected_lower),
-                "has_tests": any("test" in path or "spec" in path for path in selected_lower),
-            },
-        },
-    ]
+    return list(
+        await asyncio.gather(
+            _build_signal_scan(selected_files),
+            _runtime_signal_scan(selected_files),
+            _verification_signal_scan(selected_files),
+            _gap_check_scan(selected_lower),
+        )
+    )
 
 
 async def run_l2_synthesis_loop(
@@ -94,7 +117,7 @@ async def run_l2_synthesis_loop(
         "test_evidence_missing" if exploration_artifact["evidence_gaps"]["test_evidence_missing"] else None,
     ]
     risk_notes = [item for item in risk_notes if item]
-    subagent_outputs = _run_synthesis_subagents(selected_snapshot) if synthesis_subagents_enabled else []
+    subagent_outputs = await _run_synthesis_subagents(selected_snapshot) if synthesis_subagents_enabled else []
 
     fetch_file_context = build_fetch_file_context_tool(file_context_by_path)
     list_selected_files = build_list_selected_files_tool(selected_snapshot)
@@ -102,11 +125,11 @@ async def run_l2_synthesis_loop(
     think = build_think_tool()
     hadolint_check = build_hadolint_snippet_tool()
 
-    synthesis_agent = create_react_agent(
+    synthesis_generator = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context, hadolint_check],
         prompt=(
-            "You are the L2 synthesis ReAct agent. Use tools whenever evidence is missing. "
+            "You are the L2 synthesis generator agent. Use tools whenever evidence is missing. "
             "Use list_selected_files/search_selected_files to inspect available evidence before fetching file content. "
             "If you draft a Dockerfile snippet as part of a hypothesis, call run_hadolint_on_snippet to lint it before finalizing. "
             "Use think for brief intent notes before/after key tool decisions. "
@@ -129,19 +152,70 @@ async def run_l2_synthesis_loop(
         + summary
     )
 
-    result = await synthesis_agent.ainvoke(
+    generation_result = await synthesis_generator.ainvoke(
         {"messages": [{"role": "user", "content": synthesis_prompt}]},
         config={"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": max(8, int(synthesis_react_max_steps) * 4)},
     )
-    payload = extract_agent_payload(result)
-    updates = normalize_text_list(payload.get("hypothesis_updates") if isinstance(payload, dict) else [])
-    risk_updates = normalize_text_list(payload.get("risk_updates") if isinstance(payload, dict) else [])
-    done_flag = bool(payload.get("done", False)) if isinstance(payload, dict) else False
+    generation_payload = extract_agent_payload(generation_result)
+    updates = normalize_text_list(generation_payload.get("hypothesis_updates") if isinstance(generation_payload, dict) else [])
+    risk_updates = normalize_text_list(generation_payload.get("risk_updates") if isinstance(generation_payload, dict) else [])
+    done_flag = bool(generation_payload.get("done", False)) if isinstance(generation_payload, dict) else False
 
-    dedup_hypotheses = list(dict.fromkeys(item.strip() for item in (base_hypotheses + updates) if item and item.strip()))
-    dedup_risks = list(dict.fromkeys(item.strip() for item in (risk_notes + risk_updates) if item and item.strip()))
-    loop_trace = extract_agent_trace(result)
-    stop_reason = "model_done" if done_flag else "agent_converged"
+    generated_hypotheses = list(dict.fromkeys(item.strip() for item in (base_hypotheses + updates) if item and item.strip()))
+    generated_risks = list(dict.fromkeys(item.strip() for item in (risk_notes + risk_updates) if item and item.strip()))
+    generator_trace = extract_agent_trace(generation_result)
+    generator_stop_reason = "model_done" if done_flag else "agent_converged"
+
+    synthesis_reviewer = create_react_agent(
+        model=new_prebuilt_chat_model(classification_timeout),
+        tools=[think, list_selected_files, search_selected_files, fetch_file_context, hadolint_check],
+        prompt=(
+            "You are the L2 synthesis reviewer agent. Critique the generator output for missing evidence and weak assumptions. "
+            "Use tools to verify claims, and use run_hadolint_on_snippet when Dockerfile snippets appear in hypotheses. "
+            "Return YAML-compatible fields only."
+        ),
+    )
+
+    reviewer_prompt = (
+        f"Repository: {repo_url}\n"
+        "Review and refine generated synthesis output.\n"
+        "Return keys: thought, accepted (bool), revised_hypotheses (list), revised_risks (list), critique_notes (list), done (bool).\n\n"
+        "GENERATOR_HYPOTHESES:\n"
+        + "\n".join(f"- {item}" for item in generated_hypotheses[:30])
+        + "\n\nGENERATOR_RISKS:\n"
+        + ("\n".join(f"- {item}" for item in generated_risks[:30]) if generated_risks else "- (none)")
+        + "\n\nSUBAGENT_SIGNALS:\n"
+        + str(subagent_outputs[:4])
+        + "\n\nSUMMARY_EVIDENCE:\n"
+        + summary
+    )
+
+    review_result = await synthesis_reviewer.ainvoke(
+        {"messages": [{"role": "user", "content": reviewer_prompt}]},
+        config={"configurable": {"thread_id": f"{repo_name}:l2-review"}, "recursion_limit": max(8, int(synthesis_react_max_steps) * 4)},
+    )
+    review_payload = extract_agent_payload(review_result)
+    revised_hypotheses = normalize_text_list(review_payload.get("revised_hypotheses") if isinstance(review_payload, dict) else [])
+    revised_risks = normalize_text_list(review_payload.get("revised_risks") if isinstance(review_payload, dict) else [])
+    critique_notes = normalize_text_list(review_payload.get("critique_notes") if isinstance(review_payload, dict) else [])
+    review_done_flag = bool(review_payload.get("done", False)) if isinstance(review_payload, dict) else False
+    review_accepted = bool(review_payload.get("accepted", False)) if isinstance(review_payload, dict) else False
+
+    dedup_hypotheses = list(
+        dict.fromkeys(item.strip() for item in (revised_hypotheses or generated_hypotheses) if item and item.strip())
+    )
+    dedup_risks = list(dict.fromkeys(item.strip() for item in (revised_risks or generated_risks) if item and item.strip()))
+
+    reviewer_trace = extract_agent_trace(review_result)
+    loop_trace: list[dict[str, Any]] = []
+    for event in generator_trace:
+        if isinstance(event, dict):
+            loop_trace.append({"phase": "l2_generator", **event})
+    for event in reviewer_trace:
+        if isinstance(event, dict):
+            loop_trace.append({"phase": "l2_reviewer", **event})
+
+    stop_reason = "reviewer_done" if review_done_flag else "reviewer_converged"
 
     has_manifest = any(
         any(marker in path for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
@@ -173,8 +247,16 @@ async def run_l2_synthesis_loop(
             "stop_reason": stop_reason,
             "subagents_enabled": synthesis_subagents_enabled,
             "subagent_count": len(subagent_outputs),
+            "generator_stop_reason": generator_stop_reason,
+            "generator_steps": len(generator_trace),
+            "reviewer_steps": len(reviewer_trace),
         },
         "subagent_outputs": subagent_outputs,
+        "review": {
+            "enabled": True,
+            "accepted": review_accepted,
+            "critique_notes": critique_notes[:30],
+        },
         "loop_trace": loop_trace,
         "loop_checkpoint": {
             "stage": "l2_synthesis",
