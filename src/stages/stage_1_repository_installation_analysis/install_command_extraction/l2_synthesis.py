@@ -1,10 +1,10 @@
-import asyncio
 from typing import Any, Callable
 
+from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 
 try:
-    from RepoBuilderAgent.src.loops.tools import (
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
         build_hadolint_snippet_tool,
         build_list_selected_files_tool,
@@ -12,7 +12,7 @@ try:
         build_think_tool,
     )
 except ImportError:
-    from loops.tools import (
+    from agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
         build_hadolint_snippet_tool,
         build_list_selected_files_tool,
@@ -172,6 +172,9 @@ async def _run_synthesis_subagents(
     search_selected_files,
     fetch_file_context,
 ) -> list[dict[str, Any]]:
+    class SignalSubagentState(dict):
+        pass
+
     selected_lower = [path.lower() for path in selected_files]
 
     build_fallback = _deterministic_signal_scan(
@@ -187,9 +190,9 @@ async def _run_synthesis_subagents(
         ("test", "spec", ".github/workflows", "ci"),
     )
 
-    return list(
-        await asyncio.gather(
-            _invoke_signal_subagent(
+    async def build_node(_: SignalSubagentState) -> dict[str, Any]:
+        return {
+            "build": await _invoke_signal_subagent(
                 name="build-signal-scan",
                 repo_name=repo_name,
                 summary=summary,
@@ -204,8 +207,12 @@ async def _run_synthesis_subagents(
                 list_selected_files=list_selected_files,
                 search_selected_files=search_selected_files,
                 fetch_file_context=fetch_file_context,
-            ),
-            _invoke_signal_subagent(
+            )
+        }
+
+    async def runtime_node(_: SignalSubagentState) -> dict[str, Any]:
+        return {
+            "runtime": await _invoke_signal_subagent(
                 name="runtime-signal-scan",
                 repo_name=repo_name,
                 summary=summary,
@@ -220,8 +227,12 @@ async def _run_synthesis_subagents(
                 list_selected_files=list_selected_files,
                 search_selected_files=search_selected_files,
                 fetch_file_context=fetch_file_context,
-            ),
-            _invoke_signal_subagent(
+            )
+        }
+
+    async def verification_node(_: SignalSubagentState) -> dict[str, Any]:
+        return {
+            "verification": await _invoke_signal_subagent(
                 name="verification-signal-scan",
                 repo_name=repo_name,
                 summary=summary,
@@ -236,8 +247,12 @@ async def _run_synthesis_subagents(
                 list_selected_files=list_selected_files,
                 search_selected_files=search_selected_files,
                 fetch_file_context=fetch_file_context,
-            ),
-            _invoke_gap_subagent(
+            )
+        }
+
+    async def gap_node(_: SignalSubagentState) -> dict[str, Any]:
+        return {
+            "gap": await _invoke_gap_subagent(
                 repo_name=repo_name,
                 summary=summary,
                 selected_lower=selected_lower,
@@ -250,9 +265,29 @@ async def _run_synthesis_subagents(
                 list_selected_files=list_selected_files,
                 search_selected_files=search_selected_files,
                 fetch_file_context=fetch_file_context,
-            ),
-        )
+            )
+        }
+
+    subgraph = StateGraph(SignalSubagentState)
+    subgraph.add_node("build", build_node)
+    subgraph.add_node("runtime", runtime_node)
+    subgraph.add_node("verification", verification_node)
+    subgraph.add_node("gap", gap_node)
+    subgraph.add_edge(START, "build")
+    subgraph.add_edge(START, "runtime")
+    subgraph.add_edge(START, "verification")
+    subgraph.add_edge(START, "gap")
+    subgraph.add_edge("build", END)
+    subgraph.add_edge("runtime", END)
+    subgraph.add_edge("verification", END)
+    subgraph.add_edge("gap", END)
+    compiled = subgraph.compile()
+
+    results = await compiled.ainvoke(
+        {},
+        config={"configurable": {"thread_id": f"{repo_name}:l2-signals"}},
     )
+    return [results["build"], results["runtime"], results["verification"], results["gap"]]
 
 
 async def run_l2_synthesis_loop(
@@ -443,7 +478,7 @@ async def run_l2_synthesis_loop(
     coverage_hits = sum(1 for hit in (has_manifest, has_docker, has_tests, has_ci) if hit)
     gap_penalty = sum(1 for flag in exploration_artifact.get("evidence_gaps", {}).values() if flag)
     confidence = max(0.0, min(1.0, 0.35 + coverage_hits * 0.15 - gap_penalty * 0.08))
-    run_l3 = bool(gap_penalty > 0 or confidence < 0.78 or dedup_risks)
+    run_classify_validation = bool(gap_penalty > 0 or confidence < 0.78 or dedup_risks)
     transition_reasons: list[str] = []
     if gap_penalty > 0:
         transition_reasons.append("unresolved_evidence_gaps")
@@ -480,16 +515,16 @@ async def run_l2_synthesis_loop(
         "loop_checkpoint": {
             "stage": "l2_synthesis",
             "completed": True,
-            "next_stage": "l3_validation" if run_l3 else "terminal",
+            "next_stage": "classify_validation" if run_classify_validation else "terminal",
         },
         "abstraction_l2": {
             "confidence": round(confidence, 4),
-            "complete": not run_l3,
-            "run_l3": run_l3,
+            "complete": not run_classify_validation,
+            "run_classify_validation": run_classify_validation,
             "reasons": transition_reasons,
         },
         "transition_policy": {
-            "run_l3": run_l3,
+            "run_classify_validation": run_classify_validation,
             "threshold": 0.78,
             "confidence": round(confidence, 4),
             "reasons": transition_reasons,

@@ -220,7 +220,7 @@ parser.add_argument(
     "--validation-react-max-steps",
     type=int,
     default=3,
-    help="Maximum L3 validation loop iterations passed to classify.",
+    help="Maximum classify validation ReAct loop iterations passed to classify.",
 )
 parser.add_argument(
     "--synthesis-subagents-enabled",
@@ -1268,8 +1268,8 @@ def main() -> int:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     pipeline_started_ts = time.perf_counter()
     pipeline_started_at = utc_now()
-    src_dir = Path(__file__).resolve().parent
-    workspace_root = _resolve_workspace_root(src_dir)
+    src_root = Path(__file__).resolve().parents[2]
+    workspace_root = _resolve_workspace_root(src_root)
     _resolve_llm_arg_defaults(workspace_root)
     _synchronize_llm_environment()
     run_dir = workspace_root / "runs" / f"run-{run_id}"
@@ -1288,11 +1288,11 @@ def main() -> int:
     llm_metrics_summary_path = reports_dir / f"llm-metrics-summary-{run_id}.yaml"
     runtime_config_lock_path = run_dir / "runtime-config-lock.yaml"
 
-    classify_script = src_dir / "agent_classify.py"
-    dockerfile_script = src_dir / "agent_dockerfile.py"
-    repair_script = src_dir / "agent_dockerfile_repair.py"
-    validation_gate_script = src_dir / "agent_validation_gate.py"
-    install_guide_script = src_dir / "agent_install_guide.py"
+    classify_script = src_root / "stages" / "stage_1_repository_installation_analysis" / "agent_classify.py"
+    dockerfile_script = src_root / "stages" / "stage_2_dockerfile_generation" / "agent_dockerfile.py"
+    repair_script = src_root / "stages" / "stage_3_iterative_dockerfile_repair" / "agent_dockerfile_repair.py"
+    validation_gate_script = src_root / "stages" / "stage_2_dockerfile_generation" / "agent_validation_gate.py"
+    install_guide_script = src_root / "stages" / "stage_4_install_guide" / "agent_install_guide.py"
     analysis_script = src_dir / "parse_results.py"
 
     phase_skips = resolve_phase_skips()

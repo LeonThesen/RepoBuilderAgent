@@ -5,9 +5,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
 try:
-    from RepoBuilderAgent.src.loops.tools import build_search_structure_paths_tool, build_select_default_files_tool, build_think_tool
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_search_structure_paths_tool, build_select_default_files_tool, build_think_tool
 except ImportError:
-    from loops.tools import build_search_structure_paths_tool, build_select_default_files_tool, build_think_tool
+    from agent_tools.react_loop_tools import build_search_structure_paths_tool, build_select_default_files_tool, build_think_tool
 
 
 def _hard_cap_selected_files(candidates: list[str], default_selected_files: list[str], cap: int) -> list[str]:

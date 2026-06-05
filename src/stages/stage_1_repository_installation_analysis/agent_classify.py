@@ -22,11 +22,11 @@ from langchain_openai import ChatOpenAI
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.loops.l1 import select_files_by_iterative_react
-    from RepoBuilderAgent.src.loops.l2 import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from RepoBuilderAgent.src.loops.l3 import run_l3_validation_loop as _run_l3_validation_loop_impl
-    from RepoBuilderAgent.src.loops.graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from RepoBuilderAgent.src.loops.scratchpads import build_architecture_scratchpad_payload
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.relevant_file_discovery.l1_iterative_react import select_files_by_iterative_react
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.install_command_extraction.l2_synthesis import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.validation_evidence.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.orchestration.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.architecture_artifacts.scratchpad_payloads import build_architecture_scratchpad_payload
     from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -47,11 +47,11 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from loops.l1 import select_files_by_iterative_react
-    from loops.l2 import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from loops.l3 import run_l3_validation_loop as _run_l3_validation_loop_impl
-    from loops.graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from loops.scratchpads import build_architecture_scratchpad_payload
+    from stages.stage_1_repository_installation_analysis.relevant_file_discovery.l1_iterative_react import select_files_by_iterative_react
+    from stages.stage_1_repository_installation_analysis.install_command_extraction.l2_synthesis import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
+    from stages.stage_1_repository_installation_analysis.validation_evidence.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
+    from stages.stage_1_repository_installation_analysis.orchestration.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
+    from stages.stage_1_repository_installation_analysis.architecture_artifacts.scratchpad_payloads import build_architecture_scratchpad_payload
     from core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -170,7 +170,7 @@ parser.add_argument(
     "--validation-react-max-steps",
     type=int,
     default=3,
-    help="Maximum L3 validation loop iterations.",
+    help="Maximum classify validation ReAct loop iterations.",
 )
 parser.add_argument(
     "--step2-token-budget",
@@ -897,7 +897,7 @@ async def _run_l2_synthesis_loop(
     )
 
 
-async def _run_l3_validation_loop(
+async def _run_classify_validation_loop(
     *,
     repo_url: str,
     summary: str,
@@ -906,7 +906,7 @@ async def _run_l3_validation_loop(
     file_context_by_path: dict[str, str],
     llm_metrics: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    return await _run_l3_validation_loop_impl(
+    return await _run_classify_validation_loop_impl(
         repo_url=repo_url,
         summary=summary,
         synthesis_artifact=synthesis_artifact,
@@ -1643,7 +1643,7 @@ async def main():
 
     # Run analysis script to aggregate results and generate metrics, unless --no-analysis is specified.
     if not args.no_analysis:
-        analysis_script = Path(__file__).parent / "parse_results.py"
+        analysis_script = Path(__file__).resolve().parents[2] / "metrics" / "parse_results.py"
         log_info("Running analysis script...")
         subprocess.run(
             [

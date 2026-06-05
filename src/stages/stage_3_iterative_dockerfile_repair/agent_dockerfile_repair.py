@@ -10,12 +10,16 @@ import ssl
 from pathlib import Path
 
 import httpx
+import yaml
 from openai import APIError, APITimeoutError, AsyncOpenAI
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 from tqdm import tqdm
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -24,7 +28,6 @@ try:
         resolve_prompt_temperature,
     )
     from RepoBuilderAgent.src.core.common import (
-        chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
@@ -49,6 +52,7 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -57,7 +61,6 @@ except ImportError:
         resolve_prompt_temperature,
     )
     from core.common import (
-        chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
@@ -181,6 +184,12 @@ parser.add_argument(
     default=5,
     help="Maximum child nodes retained per decision-tree node before pruning low-frequency branches.",
 )
+parser.add_argument(
+    "--l3-react-max-steps",
+    type=int,
+    default=6,
+    help="Maximum built-in ReAct steps for Loop 3 Dockerfile repair decisions.",
+)
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
@@ -298,9 +307,69 @@ def extract_dockerfile(raw: str) -> str:
     return content.strip() + "\n"
 
 
+def _new_prebuilt_chat_model(timeout_seconds: int) -> ChatOpenAI:
+    kwargs = {
+        "model": args.model,
+        "temperature": EFFECTIVE_TEMPERATURE,
+        "api_key": args.api_key,
+        "base_url": args.endpoint,
+        "timeout": timeout_seconds,
+        "max_retries": args.llm_max_retries,
+        "http_async_client": _http_client,
+    }
+    return ChatOpenAI(**kwargs)
+
+
+def _extract_react_payload(result: dict) -> dict:
+    messages = result.get("messages") or []
+    if not messages:
+        return {}
+    last = messages[-1]
+    content = getattr(last, "content", "")
+    if not isinstance(content, str) or not content.strip():
+        return {}
+    match = re.search(r"```(?:yaml)?\\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
+    yaml_text = match.group(1) if match else content
+    try:
+        parsed = yaml.safe_load(yaml_text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_react_command(result: dict, candidate_keys: list[str]) -> str:
+    payload = _extract_react_payload(result)
+    if isinstance(payload, dict):
+        for key in candidate_keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+        else:
+            text = ""
+    else:
+        text = ""
+
+    if not text:
+        messages = result.get("messages") or []
+        if messages:
+            last_content = getattr(messages[-1], "content", "")
+            if isinstance(last_content, str) and last_content.strip():
+                text = last_content.strip()
+
+    if not text:
+        return ""
+
+    match = re.search(r"```(?:bash|sh)?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        text = match.group(1).strip()
+
+    return text.strip().strip("`")
+
+
 def get_base_template(classification: dict) -> str:
     """Select and load the appropriate base template based on programming language."""
-    subrepo_templates_dir = Path(__file__).resolve().parent.parent / "templates"
+    subrepo_templates_dir = Path(__file__).resolve().parents[3] / "templates"
 
     languages = classification.get("categories", {}).get("programming_language", {}).get("value", [])
     if not languages:
@@ -872,21 +941,54 @@ async def request_repair(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    response = await chat_completion_with_retries(
-        client=client,
-        model=args.model,
-        temperature=EFFECTIVE_TEMPERATURE,
-        messages=[{"role": "user", "content": prompt}],
-        repo_url=repo_url,
-        phase="repair",
-        metrics=llm_metrics,
-        timeout_seconds=args.repair_timeout,
-        max_retries=args.llm_max_retries,
-        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+    think = build_think_tool()
+    hadolint_tool = build_hadolint_snippet_tool()
+    repair_agent = create_react_agent(
+        model=_new_prebuilt_chat_model(args.repair_timeout),
+        tools=[think, hadolint_tool],
+        prompt=(
+            "You are Loop 3 (L3) Dockerfile Repair ReAct agent. "
+            "L3 is exclusively responsible for Dockerfile repair decisions. "
+            "Use think before major edits and use run_hadolint_on_snippet to validate candidate Dockerfile text. "
+            "Return YAML with keys: thought, repaired_dockerfile, done, stop_reason."
+        ),
     )
-    if response.usage:
-        log_info(f"[TOKENS] {json.dumps({'phase': 'repair', 'repo': repo_url, 'attempt': attempt_number, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return extract_dockerfile((response.choices[0].message.content or "").strip())
+
+    result = await repair_agent.ainvoke(
+        {"messages": [{"role": "user", "content": prompt}]},
+        config={
+            "configurable": {"thread_id": f"{repo_url}:l3-repair:{attempt_number}"},
+            "recursion_limit": max(8, int(args.l3_react_max_steps) * 4),
+        },
+    )
+
+    payload = _extract_react_payload(result)
+    repaired = ""
+    if isinstance(payload, dict):
+        candidate = payload.get("repaired_dockerfile")
+        if isinstance(candidate, str) and candidate.strip():
+            repaired = extract_dockerfile(candidate.strip())
+
+    if not repaired:
+        messages = result.get("messages") or []
+        if messages:
+            last_content = getattr(messages[-1], "content", "")
+            if isinstance(last_content, str) and last_content.strip():
+                repaired = extract_dockerfile(last_content.strip())
+
+    if not repaired:
+        log_warn(f"L3 ReAct repair agent returned empty content for {repo_url} attempt {attempt_number}")
+        return ""
+
+    llm_metrics.setdefault("l3_react", {}).update(
+        {
+            "enabled": True,
+            "max_steps": int(args.l3_react_max_steps),
+            "last_attempt": attempt_number,
+            "trace_steps": len(result.get("messages") or []),
+        }
+    )
+    return repaired
 
 
 async def request_verification_command_repair(
@@ -925,21 +1027,42 @@ async def request_verification_command_repair(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    response = await chat_completion_with_retries(
-        client=client,
-        model=args.model,
-        temperature=EFFECTIVE_TEMPERATURE,
-        messages=[{"role": "user", "content": prompt}],
-        repo_url=repo_url,
-        phase="verify-repair",
-        metrics=llm_metrics,
-        timeout_seconds=args.verify_repair_timeout,
-        max_retries=args.llm_max_retries,
-        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+    think = build_think_tool()
+    verify_repair_agent = create_react_agent(
+        model=_new_prebuilt_chat_model(args.verify_repair_timeout),
+        tools=[think],
+        prompt=(
+            "You are Loop 3 (L3) verification-command repair ReAct agent. "
+            "Use think before major command changes and return only YAML-compatible output. "
+            "Return keys: thought, verification_command, done, stop_reason."
+        ),
     )
-    if response.usage:
-        log_info(f"[TOKENS] {json.dumps({'phase': 'verify-repair', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return (response.choices[0].message.content or "").strip().strip("`")
+
+    result = await verify_repair_agent.ainvoke(
+        {"messages": [{"role": "user", "content": prompt}]},
+        config={
+            "configurable": {"thread_id": f"{repo_url}:l3-verify-repair"},
+            "recursion_limit": max(8, int(args.l3_react_max_steps) * 4),
+        },
+    )
+
+    command = _extract_react_command(
+        result,
+        candidate_keys=["verification_command", "verify_command", "repaired_verification_command", "command"],
+    )
+    if not command:
+        log_warn(f"L3 ReAct verify-repair agent returned empty command for {repo_url}")
+        return ""
+
+    l3_metrics = llm_metrics.setdefault("l3_react", {})
+    l3_metrics.update(
+        {
+            "verify_repair_enabled": True,
+            "verify_repair_trace_steps": len(result.get("messages") or []),
+            "verify_repair_max_steps": int(args.l3_react_max_steps),
+        }
+    )
+    return command
 
 
 async def request_verification_command_refresh(
@@ -969,21 +1092,42 @@ async def request_verification_command_refresh(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    response = await chat_completion_with_retries(
-        client=client,
-        model=args.model,
-        temperature=EFFECTIVE_TEMPERATURE,
-        messages=[{"role": "user", "content": prompt}],
-        repo_url=repo_url,
-        phase="verify-refresh",
-        metrics=llm_metrics,
-        timeout_seconds=args.verify_repair_timeout,
-        max_retries=args.llm_max_retries,
-        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+    think = build_think_tool()
+    verify_refresh_agent = create_react_agent(
+        model=_new_prebuilt_chat_model(args.verify_repair_timeout),
+        tools=[think],
+        prompt=(
+            "You are Loop 3 (L3) verification-command refresh ReAct agent. "
+            "Use think before major command changes and return only YAML-compatible output. "
+            "Return keys: thought, verification_command, done, stop_reason."
+        ),
     )
-    if response.usage:
-        log_info(f"[TOKENS] {json.dumps({'phase': 'verify-refresh', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return (response.choices[0].message.content or "").strip().strip("`")
+
+    result = await verify_refresh_agent.ainvoke(
+        {"messages": [{"role": "user", "content": prompt}]},
+        config={
+            "configurable": {"thread_id": f"{repo_url}:l3-verify-refresh"},
+            "recursion_limit": max(8, int(args.l3_react_max_steps) * 4),
+        },
+    )
+
+    command = _extract_react_command(
+        result,
+        candidate_keys=["verification_command", "verify_command", "refreshed_verification_command", "command"],
+    )
+    if not command:
+        log_warn(f"L3 ReAct verify-refresh agent returned empty command for {repo_url}")
+        return ""
+
+    l3_metrics = llm_metrics.setdefault("l3_react", {})
+    l3_metrics.update(
+        {
+            "verify_refresh_enabled": True,
+            "verify_refresh_trace_steps": len(result.get("messages") or []),
+            "verify_refresh_max_steps": int(args.l3_react_max_steps),
+        }
+    )
+    return command
 
 
 async def repair_repository(

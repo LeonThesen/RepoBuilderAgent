@@ -159,7 +159,7 @@ def extract_dockerfile(raw: str) -> str:
 
 def get_base_template(classification: dict) -> str:
     """Select and load the appropriate base template based on programming language."""
-    subrepo_templates_dir = Path(__file__).resolve().parent.parent / "templates"
+    subrepo_templates_dir = Path(__file__).resolve().parents[3] / "templates"
 
     languages = classification.get("categories", {}).get("programming_language", {}).get("value", [])
     if not languages:
