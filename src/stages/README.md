@@ -5,9 +5,9 @@ This directory mirrors the thesis problem statement exactly.
 ## Schritt 1
 
 - 1.1 Suche nach fuer die Installation relevanten Dateien im Repository
-  - Package: `stages/stage_1_repository_installation_analysis/relevant_file_discovery/`
+  - Module: `stages/stage_1_repository_installation_analysis/l1_relevant_file_discovery.py`
 - 1.2 Extraktion von Installationsbefehlen aus den relevanten Dateien
-  - Package: `stages/stage_1_repository_installation_analysis/install_command_extraction/`
+  - Module: `stages/stage_1_repository_installation_analysis/l2_install_command_extraction.py`
 
 ## Schritt 2
 
@@ -32,11 +32,11 @@ This directory mirrors the thesis problem statement exactly.
 ## Current Script Mapping
 
 - Step 1.1 and 1.2: `stages/stage_1_repository_installation_analysis/agent_classify.py`
-  - L1 module (relevant file discovery): `stages/stage_1_repository_installation_analysis/relevant_file_discovery/l1_iterative_react.py`
-  - L2 module (install command extraction / synthesis): `stages/stage_1_repository_installation_analysis/install_command_extraction/l2_synthesis.py`
-  - Classify validation module: `stages/stage_1_repository_installation_analysis/validation_evidence/classify_validation_loop.py`
-  - Architecture orchestration graph: `stages/stage_1_repository_installation_analysis/orchestration/architecture_state_graph.py`
-  - Architecture scratchpad payloads: `stages/stage_1_repository_installation_analysis/architecture_artifacts/scratchpad_payloads.py`
+  - L1 module (relevant file discovery): `stages/stage_1_repository_installation_analysis/l1_relevant_file_discovery.py`
+  - L2 module (install command extraction / synthesis): `stages/stage_1_repository_installation_analysis/l2_install_command_extraction.py`
+  - Classify validation module: `stages/stage_1_repository_installation_analysis/classify_validation_loop.py`
+  - Architecture orchestration graph: `stages/stage_1_repository_installation_analysis/architecture_state_graph.py`
+  - Architecture scratchpad payloads: `stages/stage_1_repository_installation_analysis/scratchpad_payloads.py`
 - Step 2: `stages/stage_2_dockerfile_generation/agent_dockerfile.py`
 - Step 3: `stages/stage_3_iterative_dockerfile_repair/agent_dockerfile_repair.py`
 - Pipeline: `stages/pipeline_orchestration/agent_pipeline.py`

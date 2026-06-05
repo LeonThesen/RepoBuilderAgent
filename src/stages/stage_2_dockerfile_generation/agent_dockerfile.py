@@ -13,6 +13,7 @@ from tqdm import tqdm
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -47,6 +48,7 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from core.dockerfile_utils import extract_dockerfile, get_base_template
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -148,48 +150,6 @@ with open(prompt_path("PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as
 sem = asyncio.Semaphore(4)
 
 set_trace_enabled(args.trace)
-
-
-
-def extract_dockerfile(raw: str) -> str:
-    match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
-    content = match.group(1) if match else raw
-    return content.strip() + "\n"
-
-
-def get_base_template(classification: dict) -> str:
-    """Select and load the appropriate base template based on programming language."""
-    subrepo_templates_dir = Path(__file__).resolve().parents[3] / "templates"
-
-    languages = classification.get("categories", {}).get("programming_language", {}).get("value", [])
-    if not languages:
-        log_warn("No programming language detected in classification; defaulting to C template")
-        template_name = "Dockerfile.base-c"
-    else:
-        lang = languages[0].lower()
-        if "python" in lang:
-            template_name = "Dockerfile.base-python"
-        elif "c++" in lang or "cpp" in lang:
-            template_name = "Dockerfile.base-cpp"
-        elif "c" in lang and "c++" not in lang:
-            template_name = "Dockerfile.base-c"
-        elif "typescript" in lang or "javascript" in lang:
-            template_name = "Dockerfile.base-typescript"
-        elif "rust" in lang:
-            template_name = "Dockerfile.base-rust"
-        elif "java" in lang or "kotlin" in lang:
-            template_name = "Dockerfile.base-java"
-        else:
-            log_warn(f"Unknown language {lang}; defaulting to C template")
-            template_name = "Dockerfile.base-c"
-
-    template_path = subrepo_templates_dir / template_name
-    if template_path.exists():
-        with open(template_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    log_error(f"Base template not found at {template_path}")
-    return ""
 
 
 def infer_language_from_repo(repo_path: Path) -> str:
@@ -374,7 +334,12 @@ async def generate_dockerfile(
             synthesis_artifact = read_yaml_file(summaries_dir / f"{repo_name}.synthesis.yaml")
             validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
 
-            base_template = get_base_template(classification)
+            base_template = get_base_template(
+                classification,
+                Path(__file__).resolve().parents[3] / "templates",
+                log_warn=log_warn,
+                log_error=log_error,
+            )
 
             # Regenerate until Hadolint accepts the Dockerfile. These retries do not
             # count as build attempts because no project build has run yet.

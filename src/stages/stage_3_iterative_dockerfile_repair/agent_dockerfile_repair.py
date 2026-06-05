@@ -5,21 +5,26 @@ import json
 import os
 import re
 import shlex
-import shutil
 import ssl
 from pathlib import Path
 
 import httpx
 import yaml
 from openai import APIError, APITimeoutError, AsyncOpenAI
-from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 from tqdm import tqdm
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
+    from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
+    from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
+    from RepoBuilderAgent.src.core.file_io import write_text
+    from RepoBuilderAgent.src.core.repo_cleanup import delete_docs_build_context
+    from RepoBuilderAgent.src.stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
+        run_l3_dockerfile_repair_react,
+        run_l3_verification_command_react,
+    )
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -53,6 +58,14 @@ except ImportError:
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
     from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
+    from core.chat_model_factory import make_prebuilt_chat_model_factory
+    from core.dockerfile_utils import extract_dockerfile, get_base_template
+    from core.file_io import write_text
+    from core.repo_cleanup import delete_docs_build_context
+    from stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
+        run_l3_dockerfile_repair_react,
+        run_l3_verification_command_react,
+    )
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -219,187 +232,14 @@ sem = asyncio.Semaphore(1)
 set_trace_enabled(args.trace)
 
 
-# Files/directories to remove from the repo before docker build so the build
-# context is free of documentation and CI/CD configuration that can't affect
-# an installation and may only inflate the context or mislead the build.
-# Intentionally exhaustive: agents must not be able to read pre-existing docs
-# or build instructions from the repo context.
-_DELETE_DOCS_EXTENSIONS: tuple[str, ...] = (
-    # Markup documentation
-    ".md", ".rst", ".adoc", ".asciidoc", ".textile", ".wiki",
-    # Office / print documents
-    ".pdf", ".doc", ".docx", ".odt", ".rtf",
-    # Other doc formats (avoid man-page style sources like .1-.8 that can be build inputs)
-    ".tex", ".pod", ".man",
-    # Notebook / presentation
-    ".ipynb", ".pptx", ".ppt",
+_new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
+    model=args.model,
+    temperature=EFFECTIVE_TEMPERATURE,
+    api_key=args.api_key,
+    base_url=args.endpoint,
+    max_retries=args.llm_max_retries,
+    http_async_client=_http_client,
 )
-_DELETE_DOCS_FILE_NAMES: frozenset[str] = frozenset({
-    # CI/CD pipeline files
-    "Jenkinsfile",
-    ".travis.yml", ".travis.yaml",
-    ".gitlab-ci.yml", ".gitlab-ci.yaml",
-    "appveyor.yml", "appveyor.yaml",
-    "azure-pipelines.yml", "azure-pipelines.yaml",
-    ".drone.yml", ".drone.yaml",
-    "bitbucket-pipelines.yml", "bitbucket-pipelines.yaml",
-    "CODEOWNERS",
-})
-_DELETE_DOCS_DIR_NAMES: frozenset[str] = frozenset({
-    # CI/CD directories
-    ".github", ".gitlab", ".circleci", ".buildkite", ".drone",
-    ".woodpecker", ".jenkins", ".azure-pipelines",
-    # Documentation directories
-    "docs", "doc", "documentation",
-    "website", "site", "gh-pages",
-    "wiki",
-    "javadoc", "apidoc", "apidocs",
-    "man", "manpages",
-    "sphinx", "docsrc",
-})
-
-
-def delete_docs_build_context(repo_path: Path, repo_name: str) -> None:
-    """Remove documentation and CI/CD files from repo_path before building."""
-    log_info(f"[delete-docs {repo_name}] Starting docs/CI deletion in {repo_path}")
-
-    removed_files: list[str] = []
-    removed_dirs: list[str] = []
-
-    for item in list(repo_path.rglob("*")):
-        if not item.exists():
-            # Already deleted as part of a parent directory removal
-            continue
-
-        if item.is_dir():
-            if item.name in _DELETE_DOCS_DIR_NAMES:
-                rel = item.relative_to(repo_path)
-                # Only delete top-level or second-level doc directories.
-                # Deeper directories named "doc" may be source modules (e.g., Rust crate submodules).
-                if len(rel.parts) <= 2:
-                    log_trace(f"[delete-docs {repo_name}] Removing CI/CD directory: {rel}")
-                    shutil.rmtree(item)
-                    removed_dirs.append(str(rel))
-                else:
-                    log_trace(f"[delete-docs {repo_name}] Skipping deep source dir: {rel}")
-        elif item.is_file():
-            if item.suffix.lower() in _DELETE_DOCS_EXTENSIONS:
-                rel = item.relative_to(repo_path)
-                log_trace(f"[delete-docs {repo_name}] Removing doc file: {rel}")
-                item.unlink()
-                removed_files.append(str(rel))
-            elif item.name in _DELETE_DOCS_FILE_NAMES:
-                rel = item.relative_to(repo_path)
-                log_trace(f"[delete-docs {repo_name}] Removing CI/CD file: {rel}")
-                item.unlink()
-                removed_files.append(str(rel))
-
-    log_info(
-        f"[delete-docs {repo_name}] Done — removed {len(removed_files)} file(s), "
-        f"{len(removed_dirs)} director{'ies' if len(removed_dirs) != 1 else 'y'}"
-    )
-
-
-
-def extract_dockerfile(raw: str) -> str:
-    match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
-    content = match.group(1) if match else raw
-    return content.strip() + "\n"
-
-
-def _new_prebuilt_chat_model(timeout_seconds: int) -> ChatOpenAI:
-    kwargs = {
-        "model": args.model,
-        "temperature": EFFECTIVE_TEMPERATURE,
-        "api_key": args.api_key,
-        "base_url": args.endpoint,
-        "timeout": timeout_seconds,
-        "max_retries": args.llm_max_retries,
-        "http_async_client": _http_client,
-    }
-    return ChatOpenAI(**kwargs)
-
-
-def _extract_react_payload(result: dict) -> dict:
-    messages = result.get("messages") or []
-    if not messages:
-        return {}
-    last = messages[-1]
-    content = getattr(last, "content", "")
-    if not isinstance(content, str) or not content.strip():
-        return {}
-    match = re.search(r"```(?:yaml)?\\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
-    yaml_text = match.group(1) if match else content
-    try:
-        parsed = yaml.safe_load(yaml_text)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _extract_react_command(result: dict, candidate_keys: list[str]) -> str:
-    payload = _extract_react_payload(result)
-    if isinstance(payload, dict):
-        for key in candidate_keys:
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                text = value.strip()
-                break
-        else:
-            text = ""
-    else:
-        text = ""
-
-    if not text:
-        messages = result.get("messages") or []
-        if messages:
-            last_content = getattr(messages[-1], "content", "")
-            if isinstance(last_content, str) and last_content.strip():
-                text = last_content.strip()
-
-    if not text:
-        return ""
-
-    match = re.search(r"```(?:bash|sh)?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if match:
-        text = match.group(1).strip()
-
-    return text.strip().strip("`")
-
-
-def get_base_template(classification: dict) -> str:
-    """Select and load the appropriate base template based on programming language."""
-    subrepo_templates_dir = Path(__file__).resolve().parents[3] / "templates"
-
-    languages = classification.get("categories", {}).get("programming_language", {}).get("value", [])
-    if not languages:
-        log_warn("No programming language detected in classification; defaulting to C template")
-        template_name = "Dockerfile.base-c"
-    else:
-        lang = languages[0].lower()
-        if "python" in lang:
-            template_name = "Dockerfile.base-python"
-        elif "c++" in lang or "cpp" in lang:
-            template_name = "Dockerfile.base-cpp"
-        elif "c" in lang and "c++" not in lang:
-            template_name = "Dockerfile.base-c"
-        elif "typescript" in lang or "javascript" in lang:
-            template_name = "Dockerfile.base-typescript"
-        elif "rust" in lang:
-            template_name = "Dockerfile.base-rust"
-        elif "java" in lang or "kotlin" in lang:
-            template_name = "Dockerfile.base-java"
-        else:
-            log_warn(f"Unknown language {lang}; defaulting to C template")
-            template_name = "Dockerfile.base-c"
-
-    template_path = subrepo_templates_dir / template_name
-    if template_path.exists():
-        with open(template_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    log_error(f"Base template not found at {template_path}")
-    return ""
 
 
 def sanitize_image_tag(value: str) -> str:
@@ -657,12 +497,6 @@ def render_stateful_decision_tree_for_prompt(repair_history: list[dict]) -> str:
     return rendered
 
 
-def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as output_file:
-        output_file.write(content)
-
-
 def normalize_verify_command(command: str) -> str:
     sanitized_command = command.strip()
     if not sanitized_command:
@@ -905,7 +739,12 @@ async def request_repair(
     repair_history: list[dict] | None = None,
     architecture_scratchpad_context: str = "",
 ) -> str:
-    base_template = get_base_template(classification)
+    base_template = get_base_template(
+        classification,
+        Path(__file__).resolve().parents[3] / "templates",
+        log_warn=log_warn,
+        log_error=log_error,
+    )
     prompt = (
         PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
         .replace("{{ATTEMPT_NUMBER}}", str(attempt_number))
@@ -941,40 +780,17 @@ async def request_repair(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    think = build_think_tool()
-    hadolint_tool = build_hadolint_snippet_tool()
-    repair_agent = create_react_agent(
-        model=_new_prebuilt_chat_model(args.repair_timeout),
-        tools=[think, hadolint_tool],
-        prompt=(
-            "You are Loop 3 (L3) Dockerfile Repair ReAct agent. "
-            "L3 is exclusively responsible for Dockerfile repair decisions. "
-            "Use think before major edits and use run_hadolint_on_snippet to validate candidate Dockerfile text. "
-            "Return YAML with keys: thought, repaired_dockerfile, done, stop_reason."
-        ),
+    repaired, trace_steps = await run_l3_dockerfile_repair_react(
+        repo_url=repo_url,
+        attempt_number=attempt_number,
+        prompt=prompt,
+        repair_timeout=args.repair_timeout,
+        l3_react_max_steps=args.l3_react_max_steps,
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        build_think_tool=build_think_tool,
+        build_hadolint_snippet_tool=build_hadolint_snippet_tool,
+        extract_dockerfile=extract_dockerfile,
     )
-
-    result = await repair_agent.ainvoke(
-        {"messages": [{"role": "user", "content": prompt}]},
-        config={
-            "configurable": {"thread_id": f"{repo_url}:l3-repair:{attempt_number}"},
-            "recursion_limit": max(8, int(args.l3_react_max_steps) * 4),
-        },
-    )
-
-    payload = _extract_react_payload(result)
-    repaired = ""
-    if isinstance(payload, dict):
-        candidate = payload.get("repaired_dockerfile")
-        if isinstance(candidate, str) and candidate.strip():
-            repaired = extract_dockerfile(candidate.strip())
-
-    if not repaired:
-        messages = result.get("messages") or []
-        if messages:
-            last_content = getattr(messages[-1], "content", "")
-            if isinstance(last_content, str) and last_content.strip():
-                repaired = extract_dockerfile(last_content.strip())
 
     if not repaired:
         log_warn(f"L3 ReAct repair agent returned empty content for {repo_url} attempt {attempt_number}")
@@ -985,7 +801,7 @@ async def request_repair(
             "enabled": True,
             "max_steps": int(args.l3_react_max_steps),
             "last_attempt": attempt_number,
-            "trace_steps": len(result.get("messages") or []),
+            "trace_steps": trace_steps,
         }
     )
     return repaired
@@ -1027,28 +843,20 @@ async def request_verification_command_repair(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    think = build_think_tool()
-    verify_repair_agent = create_react_agent(
-        model=_new_prebuilt_chat_model(args.verify_repair_timeout),
-        tools=[think],
-        prompt=(
+    command, trace_steps = await run_l3_verification_command_react(
+        repo_url=repo_url,
+        prompt=prompt,
+        verify_timeout=args.verify_repair_timeout,
+        l3_react_max_steps=args.l3_react_max_steps,
+        thread_suffix="l3-verify-repair",
+        system_prompt=(
             "You are Loop 3 (L3) verification-command repair ReAct agent. "
             "Use think before major command changes and return only YAML-compatible output. "
             "Return keys: thought, verification_command, done, stop_reason."
         ),
-    )
-
-    result = await verify_repair_agent.ainvoke(
-        {"messages": [{"role": "user", "content": prompt}]},
-        config={
-            "configurable": {"thread_id": f"{repo_url}:l3-verify-repair"},
-            "recursion_limit": max(8, int(args.l3_react_max_steps) * 4),
-        },
-    )
-
-    command = _extract_react_command(
-        result,
         candidate_keys=["verification_command", "verify_command", "repaired_verification_command", "command"],
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        build_think_tool=build_think_tool,
     )
     if not command:
         log_warn(f"L3 ReAct verify-repair agent returned empty command for {repo_url}")
@@ -1058,7 +866,7 @@ async def request_verification_command_repair(
     l3_metrics.update(
         {
             "verify_repair_enabled": True,
-            "verify_repair_trace_steps": len(result.get("messages") or []),
+            "verify_repair_trace_steps": trace_steps,
             "verify_repair_max_steps": int(args.l3_react_max_steps),
         }
     )
@@ -1092,28 +900,20 @@ async def request_verification_command_refresh(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    think = build_think_tool()
-    verify_refresh_agent = create_react_agent(
-        model=_new_prebuilt_chat_model(args.verify_repair_timeout),
-        tools=[think],
-        prompt=(
+    command, trace_steps = await run_l3_verification_command_react(
+        repo_url=repo_url,
+        prompt=prompt,
+        verify_timeout=args.verify_repair_timeout,
+        l3_react_max_steps=args.l3_react_max_steps,
+        thread_suffix="l3-verify-refresh",
+        system_prompt=(
             "You are Loop 3 (L3) verification-command refresh ReAct agent. "
             "Use think before major command changes and return only YAML-compatible output. "
             "Return keys: thought, verification_command, done, stop_reason."
         ),
-    )
-
-    result = await verify_refresh_agent.ainvoke(
-        {"messages": [{"role": "user", "content": prompt}]},
-        config={
-            "configurable": {"thread_id": f"{repo_url}:l3-verify-refresh"},
-            "recursion_limit": max(8, int(args.l3_react_max_steps) * 4),
-        },
-    )
-
-    command = _extract_react_command(
-        result,
         candidate_keys=["verification_command", "verify_command", "refreshed_verification_command", "command"],
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        build_think_tool=build_think_tool,
     )
     if not command:
         log_warn(f"L3 ReAct verify-refresh agent returned empty command for {repo_url}")
@@ -1123,7 +923,7 @@ async def request_verification_command_refresh(
     l3_metrics.update(
         {
             "verify_refresh_enabled": True,
-            "verify_refresh_trace_steps": len(result.get("messages") or []),
+            "verify_refresh_trace_steps": trace_steps,
             "verify_refresh_max_steps": int(args.l3_react_max_steps),
         }
     )

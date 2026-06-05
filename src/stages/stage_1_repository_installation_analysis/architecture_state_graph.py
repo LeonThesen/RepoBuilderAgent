@@ -6,11 +6,11 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.graph import END, START, StateGraph
 
 try:
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.install_command_extraction.l2_synthesis import run_l2_synthesis_loop
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.validation_evidence.classify_validation_loop import run_classify_validation_loop
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
 except ImportError:
-    from stages.stage_1_repository_installation_analysis.install_command_extraction.l2_synthesis import run_l2_synthesis_loop
-    from stages.stage_1_repository_installation_analysis.validation_evidence.classify_validation_loop import run_classify_validation_loop
+    from stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
+    from stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
 
 
 class ArchitectureLoopState(TypedDict):

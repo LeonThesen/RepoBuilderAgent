@@ -13,20 +13,16 @@ import sys
 import yaml
 import math
 from tqdm import tqdm
-import glob
-import shutil
 from typing import Any, cast
 from typing_extensions import TypedDict
 
-from langchain_openai import ChatOpenAI
-
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.relevant_file_discovery.l1_iterative_react import select_files_by_iterative_react
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.install_command_extraction.l2_synthesis import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.validation_evidence.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.orchestration.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.architecture_artifacts.scratchpad_payloads import build_architecture_scratchpad_payload
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
     from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -34,7 +30,9 @@ try:
         load_shared_repository_state,
         upsert_shared_repository_state,
         prompt_path,
+        should_use_progress,
     )
+    from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -44,14 +42,15 @@ try:
     )
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+    from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from stages.stage_1_repository_installation_analysis.relevant_file_discovery.l1_iterative_react import select_files_by_iterative_react
-    from stages.stage_1_repository_installation_analysis.install_command_extraction.l2_synthesis import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from stages.stage_1_repository_installation_analysis.validation_evidence.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
-    from stages.stage_1_repository_installation_analysis.orchestration.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from stages.stage_1_repository_installation_analysis.architecture_artifacts.scratchpad_payloads import build_architecture_scratchpad_payload
+    from stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
+    from stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
+    from stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
+    from stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
+    from stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
     from core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -59,7 +58,9 @@ except ImportError:
         load_shared_repository_state,
         upsert_shared_repository_state,
         prompt_path,
+        should_use_progress,
     )
+    from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -69,6 +70,7 @@ except ImportError:
     )
     from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+    from core.repo_cleanup import preprocess_repository
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -212,8 +214,14 @@ sem = asyncio.Semaphore(4)
 set_trace_enabled(args.trace)
 
 
-def should_use_progress(total_repos: int) -> bool:
-    return total_repos > 1 and sys.stderr.isatty() and not args.trace
+_new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
+    model=args.model,
+    temperature=EFFECTIVE_TEMPERATURE,
+    api_key=args.api_key,
+    base_url=args.endpoint,
+    max_retries=args.llm_max_retries,
+    http_async_client=_http_client,
+)
 
 def estimate_tokens(string: str, model_name: str) -> int:
     """Returns the number of tokens in a text string."""
@@ -230,67 +238,6 @@ def pct(part: int, whole: int) -> float:
     if whole <= 0:
         return 0.0
     return round((part / whole) * 100.0, 3)
-
-
-def preprocess_repository(repo_path: Path, deletion_patterns_file: str) -> None:
-    """Remove docs and unnecessary files from repository based on deletion patterns config."""
-    
-    if not Path(deletion_patterns_file).exists():
-        log_warn(f"Deletion patterns file not found: {deletion_patterns_file}. Skipping preprocessing.")
-        return
-    
-    with open(deletion_patterns_file, "r") as f:
-        patterns_config = yaml.safe_load(f)
-    
-    if not patterns_config:
-        log_warn("Deletion patterns config is empty. Skipping preprocessing.")
-        return
-    
-    deleted_count = 0
-    
-    # Delete files matching extension patterns
-    extension_patterns = patterns_config.get("extension_patterns", [])
-    for ext_pattern in extension_patterns:
-        # Convert extension pattern (e.g., "*.o") to glob pattern
-        glob_pattern = f"**/{ext_pattern}"
-        matches = glob.glob(str(repo_path / glob_pattern), recursive=True)
-        for file_path in matches:
-            try:
-                if Path(file_path).is_file():
-                    Path(file_path).unlink()
-                    deleted_count += 1
-                    log_trace(f"Deleted file: {file_path}")
-            except Exception as e:
-                log_warn(f"Failed to delete file {file_path}: {e}")
-    
-    # Delete files matching file patterns
-    file_patterns = patterns_config.get("file_patterns", [])
-    for pattern in file_patterns:
-        matches = glob.glob(str(repo_path / pattern), recursive=True)
-        for file_path in matches:
-            try:
-                if Path(file_path).is_file():
-                    Path(file_path).unlink()
-                    deleted_count += 1
-                    log_trace(f"Deleted file: {file_path}")
-            except Exception as e:
-                log_warn(f"Failed to delete file {file_path}: {e}")
-    
-    # Delete directories matching directory patterns
-    directory_patterns = patterns_config.get("directory_patterns", [])
-    for pattern in directory_patterns:
-        matches = glob.glob(str(repo_path / pattern), recursive=True)
-        for dir_path in matches:
-            try:
-                if Path(dir_path).is_dir():
-                    shutil.rmtree(dir_path)
-                    deleted_count += 1
-                    log_trace(f"Deleted directory: {dir_path}")
-            except Exception as e:
-                log_warn(f"Failed to delete directory {dir_path}: {e}")
-    
-    if deleted_count > 0:
-        log_info(f"Preprocessing complete: deleted {deleted_count} files/directories from {repo_path.name}")
 
 
 async def update_progress(progress_state: dict, repo_name: str) -> None:
@@ -564,19 +511,6 @@ class AgentPayload(TypedDict, total=False):
     checks: dict[str, dict[str, str]]
     warnings: list[str]
     done: bool
-
-
-def _new_prebuilt_chat_model(timeout_seconds: int) -> ChatOpenAI:
-    kwargs: dict[str, Any] = {
-        "model": args.model,
-        "temperature": EFFECTIVE_TEMPERATURE,
-        "api_key": args.api_key,
-        "base_url": args.endpoint,
-        "timeout": timeout_seconds,
-        "max_retries": args.llm_max_retries,
-        "http_async_client": _http_client,
-    }
-    return ChatOpenAI(**kwargs)
 
 
 def _extract_agent_payload(result: dict[str, Any]) -> AgentPayload:
@@ -1613,7 +1547,7 @@ async def main():
 
     # Run all analyses concurrently
     progress_bar = None
-    if should_use_progress(len(repos)):
+    if should_use_progress(len(repos), args.trace):
         progress_bar = tqdm(total=len(repos), desc="Analyzing repos", unit="repo", dynamic_ncols=True)
 
     progress_state = {

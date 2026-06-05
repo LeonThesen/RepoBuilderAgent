@@ -22,6 +22,11 @@ from typing import Any
 from jinja2 import Environment, select_autoescape
 import yaml
 
+try:
+    from RepoBuilderAgent.src.core.file_io import write_text
+except ImportError:
+    from core.file_io import write_text
+
 
 def load_yaml(path: Path) -> tuple[Any, str | None]:
     try:
@@ -272,12 +277,6 @@ def write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(payload, f, sort_keys=False, allow_unicode=True)
-
-
-def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
 
 
 def _fmt_top_rows(rows: list[dict[str, Any]], limit: int = 10) -> str:
