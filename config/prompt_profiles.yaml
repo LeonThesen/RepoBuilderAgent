@@ -18,6 +18,14 @@ profiles:
     temperature: 0.0
     role_framing: neutral
 
+  phase1_fewshot_0:
+    few_shot_count: 0
+    prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
   phase1_fewshot_1:
     few_shot_count: 1
     prompt_length_mode: concise

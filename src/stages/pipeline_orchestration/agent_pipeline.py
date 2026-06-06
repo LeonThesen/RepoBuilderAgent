@@ -155,7 +155,7 @@ parser.add_argument("--skip-install-guide", action="store_true", help="Skip the 
 parser.add_argument(
     "--variant",
     default="flat_baseline",
-    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react", "one_shot_direct"],
+    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_prev_attempt_ctx_off", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react", "one_shot_direct"],
     help="Pipeline variant for ablation runs.",
 )
 parser.add_argument(
@@ -1030,6 +1030,7 @@ def _expected_validation_gate_enabled_for_variant(variant: str) -> bool | None:
         "ab_retrieval_one_shot_fingerprint": True,
         "ab_retrieval_iterative_react": True,
         "ab_prev_attempt_ctx_on": True,
+        "ab_prev_attempt_ctx_off": True,
         "ab_stateful_tree_on": True,
         "ab_stateful_tree_off": True,
     }
@@ -1160,6 +1161,20 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "stateful_tree_enabled": False,
         "prev_attempt_context_enabled": True,
     },
+    "ab_prev_attempt_ctx_off": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_exploration",
+        "stateful_repair_enabled": True,
+        "stateful_tree_enabled": False,
+        "prev_attempt_context_enabled": False,
+    },
     "full_system": {
         "phase2_anchor": False,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
@@ -1247,6 +1262,7 @@ def apply_stateful_contract_by_variant() -> None:
         "ab_retrieval_one_shot_fingerprint": (False, False),
         "ab_retrieval_iterative_react": (False, False),
         "ab_prev_attempt_ctx_on": (True, False),
+        "ab_prev_attempt_ctx_off": (True, False),
         "ab_stateful_tree_on": (True, True),
         "ab_stateful_tree_off": (True, False),
     }
