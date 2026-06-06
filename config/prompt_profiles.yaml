@@ -18,6 +18,54 @@ profiles:
     temperature: 0.0
     role_framing: neutral
 
+  phase1_fewshot_1:
+    few_shot_count: 1
+    prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  phase1_fewshot_3:
+    few_shot_count: 3
+    prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  phase1_prompt_detailed:
+    few_shot_count: 3
+    prompt_length_mode: detailed
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  phase1_reasoning_on:
+    few_shot_count: 3
+    prompt_length_mode: detailed
+    reasoning_instruction: true
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  phase1_structured_output:
+    few_shot_count: 3
+    prompt_length_mode: detailed
+    reasoning_instruction: true
+    output_format_mode: structured
+    temperature: 0.0
+    role_framing: neutral
+
+  phase1_role_expert:
+    few_shot_count: 3
+    prompt_length_mode: detailed
+    reasoning_instruction: true
+    output_format_mode: structured
+    temperature: 0.0
+    role_framing: expert
+
   exploratory_expert:
     few_shot_count: 3
     prompt_length_mode: detailed
