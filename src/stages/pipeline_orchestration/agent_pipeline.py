@@ -9,6 +9,7 @@ from pathlib import Path
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
@@ -19,6 +20,7 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
+    from core.common import upsert_shared_repository_state
     from core.log_utils import log_error, log_info, set_trace_enabled
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
@@ -179,12 +181,6 @@ parser.add_argument(
     type=int,
     default=4,
     help="Maximum retrieval iterations passed to classify for iterative_react strategy.",
-)
-parser.add_argument(
-    "--react-files-per-step",
-    type=int,
-    default=8,
-    help="Maximum files accepted per iterative_react step.",
 )
 parser.add_argument(
     "--react-max-total-files",
@@ -356,7 +352,7 @@ def render_command(command: list[str]) -> str:
     return " ".join(sanitize_command(command))
 
 
-def append_shared_model_args(command: list[str]) -> list[str]:
+def append_shared_model_args(command: list[str], *, include_retry_backoff: bool = True) -> list[str]:
     command.extend(["--prompt-profile", args.prompt_profile])
     if args.endpoint:
         command.extend(["--endpoint", args.endpoint])
@@ -369,8 +365,9 @@ def append_shared_model_args(command: list[str]) -> list[str]:
     command.extend([
         "--timeout", str(args.timeout),
         "--llm-max-retries", str(args.llm_max_retries),
-        "--llm-retry-backoff-seconds", str(args.llm_retry_backoff_seconds),
     ])
+    if include_retry_backoff:
+        command.extend(["--llm-retry-backoff-seconds", str(args.llm_retry_backoff_seconds)])
     if args.trace:
         command.append("--trace")
     return command
@@ -383,11 +380,17 @@ def append_repo_selection_args(command: list[str]) -> list[str]:
     return command
 
 
-def build_agent_command(python_executable: str, script_path: Path, *, include_model_args: bool = True) -> list[str]:
+def build_agent_command(
+    python_executable: str,
+    script_path: Path,
+    *,
+    include_model_args: bool = True,
+    include_retry_backoff: bool = True,
+) -> list[str]:
     command = [python_executable, str(script_path)]
     append_repo_selection_args(command)
     if include_model_args:
-        append_shared_model_args(command)
+        append_shared_model_args(command, include_retry_backoff=include_retry_backoff)
     return command
 
 
@@ -457,6 +460,89 @@ def _expect_str(value, *, key: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     raise ValueError(f"agent_config.{key} must be non-empty string")
+
+
+def _expect_object(value, *, key: str) -> dict:
+    if isinstance(value, dict):
+        return value
+    raise ValueError(f"agent_config.{key} must be an object")
+
+
+def _repo_name_from_url(repo_url: str) -> str:
+    return repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+
+
+def _resolve_repo_urls_for_run(workspace_root: Path) -> list[str]:
+    if args.repo_url:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in args.repo_url:
+            normalized = value.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    input_path = Path(args.input_file)
+    candidates: list[Path] = []
+    if input_path.is_absolute():
+        candidates.append(input_path)
+    else:
+        candidates.append((workspace_root / input_path).resolve())
+        candidates.append((Path.cwd() / input_path).resolve())
+
+    selected: Path | None = None
+    for candidate in candidates:
+        if candidate.exists():
+            selected = candidate
+            break
+
+    if selected is None:
+        raise ValueError(f"input file not found for user-constraint seeding: {args.input_file}")
+
+    try:
+        loaded = json.loads(selected.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in input file {selected}: {exc}") from exc
+
+    if not isinstance(loaded, list):
+        raise ValueError(f"input file must contain a JSON array: {selected}")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in loaded:
+        repo_url = ""
+        if isinstance(item, dict):
+            repo_url = str(item.get("url", "")).strip()
+        elif isinstance(item, str):
+            repo_url = item.strip()
+        if not repo_url or repo_url in seen:
+            continue
+        seen.add(repo_url)
+        deduped.append(repo_url)
+    return deduped
+
+
+def _seed_user_constraints(repo_urls: list[str], summaries_dir: Path, user_constraints: dict) -> int:
+    if not user_constraints:
+        return 0
+
+    seeded = 0
+    for repo_url in repo_urls:
+        repo_name = _repo_name_from_url(repo_url)
+        upsert_shared_repository_state(
+            repo_name,
+            summaries_dir,
+            repo_url=repo_url,
+            stage_name="pipeline",
+            stage_update={
+                "user_constraints": user_constraints,
+                "source": "agent_config.user_constraints",
+            },
+        )
+        seeded += 1
+    return seeded
 
 
 def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, bool]) -> dict:
@@ -563,9 +649,6 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
             if "max_steps" in react_cfg:
                 args.react_max_steps = _expect_int(react_cfg["max_steps"], key="classification.react.max_steps")
                 applied.setdefault("classification", {}).setdefault("react", {})["max_steps"] = args.react_max_steps
-            if "files_per_step" in react_cfg:
-                args.react_files_per_step = _expect_int(react_cfg["files_per_step"], key="classification.react.files_per_step")
-                applied.setdefault("classification", {}).setdefault("react", {})["files_per_step"] = args.react_files_per_step
             if "max_total_files" in react_cfg:
                 args.react_max_total_files = _expect_int(react_cfg["max_total_files"], key="classification.react.max_total_files")
                 applied.setdefault("classification", {}).setdefault("react", {})["max_total_files"] = args.react_max_total_files
@@ -621,6 +704,13 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
                 key="repair.tree_max_children",
             )
             applied.setdefault("repair", {})["tree_max_children"] = args.stateful_tree_max_children
+
+    user_constraints_cfg = agent_config.get("user_constraints")
+    if user_constraints_cfg is not None:
+        applied["user_constraints"] = _expect_object(
+            user_constraints_cfg,
+            key="user_constraints",
+        )
 
     return applied
 
@@ -681,7 +771,6 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         "--retrieval-strategy", resolve_classify_retrieval_strategy(),
         "--embedding-model", args.embedding_model,
         "--react-max-steps", str(args.react_max_steps),
-        "--react-files-per-step", str(args.react_files_per_step),
         "--react-max-total-files", str(args.react_max_total_files),
         "--react-final-cap", str(args.react_final_cap),
         "--step2-token-budget", str(args.step2_token_budget),
@@ -724,7 +813,7 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
 
 
 def build_repair_command(python_executable: str, script_path: Path) -> list[str]:
-    command = build_agent_command(python_executable, script_path)
+    command = build_agent_command(python_executable, script_path, include_retry_backoff=False)
     command.extend([
         "--repair-timeout", str(args.repair_timeout),
         "--verify-repair-timeout", str(args.verify_repair_timeout),
@@ -1409,7 +1498,6 @@ def main() -> int:
                 },
                 "react": {
                     "max_steps": args.react_max_steps,
-                    "files_per_step": args.react_files_per_step,
                     "max_total_files": args.react_max_total_files,
                     "final_cap": args.react_final_cap,
                 },
@@ -1430,6 +1518,7 @@ def main() -> int:
                 "tree_max_chars": args.stateful_tree_max_chars,
                 "tree_max_children": args.stateful_tree_max_children,
             },
+            "user_constraints": agent_config_applied.get("user_constraints", {}),
         },
         "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
         "paths": {
@@ -1475,6 +1564,20 @@ def main() -> int:
     }
     write_summary(runtime_config_lock_path, runtime_config_lock)
     log_info(f"Runtime config lock written to {runtime_config_lock_path}")
+
+    try:
+        repo_urls_for_run = _resolve_repo_urls_for_run(workspace_root)
+    except ValueError as error:
+        log_error(str(error))
+        return 1
+
+    constraints_seeded = _seed_user_constraints(
+        repo_urls_for_run,
+        Path(args.summaries_dir),
+        agent_config_applied.get("user_constraints", {}),
+    )
+    if constraints_seeded:
+        log_info(f"Seeded user constraints into shared state for {constraints_seeded} repositories")
 
     try:
         if not phase_skips["classify"]:

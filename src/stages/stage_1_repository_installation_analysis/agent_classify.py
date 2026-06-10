@@ -95,7 +95,6 @@ parser.add_argument(
     default=[],
     help="Analyze a specific repository URL (can be passed multiple times). Overrides --input-file when provided.",
 )
-parser.add_argument("--schema", default="schemas/schema.yaml", help="Path to the schema .yaml file")
 parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
@@ -137,12 +136,6 @@ parser.add_argument(
     type=int,
     default=4,
     help="Maximum selection iterations for --retrieval-strategy=iterative_react.",
-)
-parser.add_argument(
-    "--react-files-per-step",
-    type=int,
-    default=8,
-    help="Maximum files accepted from each iterative_react step.",
 )
 parser.add_argument(
     "--react-max-total-files",
@@ -343,15 +336,40 @@ def build_prior_failure_retrieval_hints(shared_state: dict | None) -> tuple[list
     if not isinstance(shared_state, dict):
         return [], ""
 
-    signals = shared_state.get("signals")
-    if not isinstance(signals, dict):
-        return [], ""
-    failure_hints = signals.get("failure_hints")
-    if not isinstance(failure_hints, list) or not failure_hints:
-        return [], ""
-
     terms: list[str] = []
     summary_lines: list[str] = []
+
+    stages = shared_state.get("stages")
+    if isinstance(stages, dict):
+        pipeline_stage = stages.get("pipeline")
+        if isinstance(pipeline_stage, dict):
+            user_constraints = pipeline_stage.get("user_constraints")
+            if isinstance(user_constraints, dict) and user_constraints:
+                constraints_blob = yaml.dump(user_constraints, sort_keys=False, allow_unicode=True)
+                terms.extend(re.findall(r"[a-z0-9_\-]+", constraints_blob.lower()))
+                summary_lines.append("- user_constraints present (pipeline contract)")
+
+    signals = shared_state.get("signals")
+    if not isinstance(signals, dict):
+        dedup_terms: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            if len(term) < 3 or term in seen:
+                continue
+            seen.add(term)
+            dedup_terms.append(term)
+        return dedup_terms[:20], "\n".join(summary_lines[:8])
+
+    failure_hints = signals.get("failure_hints")
+    if not isinstance(failure_hints, list) or not failure_hints:
+        dedup_terms: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            if len(term) < 3 or term in seen:
+                continue
+            seen.add(term)
+            dedup_terms.append(term)
+        return dedup_terms[:20], "\n".join(summary_lines[:8])
     for hint in failure_hints[-8:]:
         if not isinstance(hint, dict):
             continue
