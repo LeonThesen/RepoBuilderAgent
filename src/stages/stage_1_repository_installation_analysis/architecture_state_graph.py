@@ -6,11 +6,11 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.graph import END, START, StateGraph
 
 try:
-    from RepoBuilderAgent.src.loops.l2 import run_l2_synthesis_loop
-    from RepoBuilderAgent.src.loops.l3 import run_l3_validation_loop
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
 except ImportError:
-    from loops.l2 import run_l2_synthesis_loop
-    from loops.l3 import run_l3_validation_loop
+    from stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
+    from stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
 
 
 class ArchitectureLoopState(TypedDict):
@@ -26,7 +26,7 @@ class ArchitectureLoopState(TypedDict):
     validation_artifact: NotRequired[dict[str, Any]]
     validation_loop_trace: NotRequired[list[dict[str, Any]]]
     validation_stop_reason: NotRequired[str]
-    l2_to_l3_route_reason: NotRequired[str]
+    l2_to_classify_validation_route_reason: NotRequired[str]
     run_validation: bool
 
 
@@ -41,6 +41,7 @@ async def run_architecture_state_graph(
     run_validation: bool,
     classification_timeout: int,
     synthesis_react_max_steps: int,
+    synthesis_review_rounds: int,
     validation_react_max_steps: int,
     synthesis_subagents_enabled: bool,
     new_prebuilt_chat_model: Callable[[int], Any],
@@ -61,6 +62,7 @@ async def run_architecture_state_graph(
             file_context_by_path=state["file_context_by_path"],
             classification_timeout=classification_timeout,
             synthesis_react_max_steps=synthesis_react_max_steps,
+            synthesis_review_rounds=synthesis_review_rounds,
             synthesis_subagents_enabled=synthesis_subagents_enabled,
             new_prebuilt_chat_model=new_prebuilt_chat_model,
             extract_agent_payload=extract_agent_payload,
@@ -69,20 +71,21 @@ async def run_architecture_state_graph(
         )
         transition_policy = cast(dict[str, Any], synthesis_artifact.get("transition_policy", {}))
         route_reason = "policy_default"
-        if transition_policy.get("run_l3") is False:
+        run_validation_flag = transition_policy.get("run_classify_validation")
+        if run_validation_flag is False:
             route_reason = "l2_confident_terminal"
-        elif transition_policy.get("run_l3") is True:
+        elif run_validation_flag is True:
             route_reason = "l2_requires_validation"
         return {
             "synthesis_artifact": synthesis_artifact,
             "synthesis_loop_trace": synthesis_loop_trace,
             "synthesis_stop_reason": synthesis_stop_reason,
-            "l2_to_l3_route_reason": route_reason,
+            "l2_to_classify_validation_route_reason": route_reason,
         }
 
-    async def l3_node(state: ArchitectureLoopState) -> dict[str, Any]:
+    async def classify_validation_node(state: ArchitectureLoopState) -> dict[str, Any]:
         synthesis_artifact = cast(dict[str, Any], state.get("synthesis_artifact", {}))
-        validation_artifact, validation_loop_trace, validation_stop_reason = await run_l3_validation_loop(
+        validation_artifact, validation_loop_trace, validation_stop_reason = await run_classify_validation_loop(
             repo_url=state["repo_url"],
             summary=state["summary"],
             synthesis_artifact=synthesis_artifact,
@@ -107,15 +110,16 @@ async def run_architecture_state_graph(
             return END
         synthesis_artifact = cast(dict[str, Any], state.get("synthesis_artifact", {}))
         transition_policy = cast(dict[str, Any], synthesis_artifact.get("transition_policy", {}))
-        if transition_policy.get("run_l3") is False:
+        run_validation_flag = transition_policy.get("run_classify_validation")
+        if run_validation_flag is False:
             return END
-        return "l3_validation"
+        return "classify_validation"
 
     graph.add_node("l2_synthesis", l2_node)
-    graph.add_node("l3_validation", l3_node)
+    graph.add_node("classify_validation", classify_validation_node)
     graph.add_edge(START, "l2_synthesis")
-    graph.add_conditional_edges("l2_synthesis", route_after_l2, {"l3_validation": "l3_validation", END: END})
-    graph.add_edge("l3_validation", END)
+    graph.add_conditional_edges("l2_synthesis", route_after_l2, {"classify_validation": "classify_validation", END: END})
+    graph.add_edge("classify_validation", END)
 
     compiled = graph.compile(checkpointer=InMemorySaver(), store=InMemoryStore())
     result = await compiled.ainvoke(

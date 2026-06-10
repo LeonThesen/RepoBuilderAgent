@@ -575,6 +575,12 @@ def render_yaml(data: dict) -> str:
 
 
 def prompts_dir() -> Path:
+    # Preferred layout: RepoBuilderAgent/prompts
+    root_prompts = Path(__file__).resolve().parents[2] / "prompts"
+    if root_prompts.exists():
+        return root_prompts
+
+    # Backward-compatible fallback for older layouts.
     return Path(__file__).resolve().parent.parent / "prompts"
 
 

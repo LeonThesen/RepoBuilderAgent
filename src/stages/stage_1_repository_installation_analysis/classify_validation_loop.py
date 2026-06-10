@@ -4,14 +4,14 @@ import yaml
 from langgraph.prebuilt import create_react_agent
 
 try:
-    from RepoBuilderAgent.src.loops.tools import (
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
         build_list_selected_files_tool,
         build_search_selected_files_tool,
         build_think_tool,
     )
 except ImportError:
-    from loops.tools import (
+    from agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
         build_list_selected_files_tool,
         build_search_selected_files_tool,
@@ -38,7 +38,7 @@ def _compact_synthesis_for_validation(synthesis_artifact: dict[str, Any]) -> dic
     }
 
 
-async def run_l3_validation_loop(
+async def run_classify_validation_loop(
     *,
     repo_url: str,
     summary: str,
@@ -94,7 +94,7 @@ async def run_l3_validation_loop(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context],
         prompt=(
-            "You are the L3 validation ReAct agent. Use tools whenever evidence is missing. "
+            "You are the classify validation ReAct agent (quality checks for classify stage, not dockerfile repair loop). "
             "Use list_selected_files/search_selected_files to inspect available evidence before fetching file content. "
             "Use think for brief intent notes before/after key tool decisions. "
             "Return YAML-compatible fields only."
@@ -120,7 +120,7 @@ async def run_l3_validation_loop(
 
     result = await validation_agent.ainvoke(
         {"messages": [{"role": "user", "content": validation_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_url}:l3"}, "recursion_limit": max(8, int(validation_react_max_steps) * 4)},
+        config={"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": max(8, int(validation_react_max_steps) * 4)},
     )
     payload = extract_agent_payload(result)
     parsed_checks = normalize_validation_checks(payload.get("checks") if isinstance(payload, dict) else {})
@@ -161,11 +161,11 @@ async def run_l3_validation_loop(
             "stop_reason": stop_reason,
         },
         "loop_checkpoint": {
-            "stage": "l3_validation",
+            "stage": "classify_validation",
             "completed": True,
             "terminal_state": outcome_state,
         },
-        "abstraction_l3": {
+        "abstraction_classify_validation": {
             "confidence": round(confidence, 4),
             "outcome_state": outcome_state,
             "fail_count": fail_count,

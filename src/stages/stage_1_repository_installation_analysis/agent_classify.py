@@ -13,20 +13,16 @@ import sys
 import yaml
 import math
 from tqdm import tqdm
-import glob
-import shutil
 from typing import Any, cast
 from typing_extensions import TypedDict
 
-from langchain_openai import ChatOpenAI
-
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.loops.l1 import select_files_by_iterative_react
-    from RepoBuilderAgent.src.loops.l2 import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from RepoBuilderAgent.src.loops.l3 import run_l3_validation_loop as _run_l3_validation_loop_impl
-    from RepoBuilderAgent.src.loops.graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from RepoBuilderAgent.src.loops.scratchpads import build_architecture_scratchpad_payload
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
     from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -34,7 +30,9 @@ try:
         load_shared_repository_state,
         upsert_shared_repository_state,
         prompt_path,
+        should_use_progress,
     )
+    from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -44,14 +42,15 @@ try:
     )
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+    from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from loops.l1 import select_files_by_iterative_react
-    from loops.l2 import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from loops.l3 import run_l3_validation_loop as _run_l3_validation_loop_impl
-    from loops.graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from loops.scratchpads import build_architecture_scratchpad_payload
+    from stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
+    from stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
+    from stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
+    from stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
+    from stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
     from core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -59,7 +58,9 @@ except ImportError:
         load_shared_repository_state,
         upsert_shared_repository_state,
         prompt_path,
+        should_use_progress,
     )
+    from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -69,6 +70,7 @@ except ImportError:
     )
     from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+    from core.repo_cleanup import preprocess_repository
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -93,7 +95,6 @@ parser.add_argument(
     default=[],
     help="Analyze a specific repository URL (can be passed multiple times). Overrides --input-file when provided.",
 )
-parser.add_argument("--schema", default="schemas/schema.yaml", help="Path to the schema .yaml file")
 parser.add_argument("--endpoint", default=os.getenv("LLM_ENDPOINT", OPENAI_BASE_URL), help="Custom API endpoint URL")
 parser.add_argument("--model", default=os.getenv("LLM_MODEL", OPENAI_MODEL), help="Model name")
 parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", OPENAI_API_KEY), help="API key")
@@ -137,12 +138,6 @@ parser.add_argument(
     help="Maximum selection iterations for --retrieval-strategy=iterative_react.",
 )
 parser.add_argument(
-    "--react-files-per-step",
-    type=int,
-    default=8,
-    help="Maximum files accepted from each iterative_react step.",
-)
-parser.add_argument(
     "--react-max-total-files",
     type=int,
     default=24,
@@ -161,10 +156,16 @@ parser.add_argument(
     help="Maximum L2 synthesis loop iterations.",
 )
 parser.add_argument(
+    "--synthesis-review-rounds",
+    type=int,
+    default=1,
+    help="Number of L2.5 reviewer rounds to run after initial L2 generator output.",
+)
+parser.add_argument(
     "--validation-react-max-steps",
     type=int,
     default=3,
-    help="Maximum L3 validation loop iterations.",
+    help="Maximum classify validation ReAct loop iterations.",
 )
 parser.add_argument(
     "--step2-token-budget",
@@ -206,8 +207,14 @@ sem = asyncio.Semaphore(4)
 set_trace_enabled(args.trace)
 
 
-def should_use_progress(total_repos: int) -> bool:
-    return total_repos > 1 and sys.stderr.isatty() and not args.trace
+_new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
+    model=args.model,
+    temperature=EFFECTIVE_TEMPERATURE,
+    api_key=args.api_key,
+    base_url=args.endpoint,
+    max_retries=args.llm_max_retries,
+    http_async_client=_http_client,
+)
 
 def estimate_tokens(string: str, model_name: str) -> int:
     """Returns the number of tokens in a text string."""
@@ -224,67 +231,6 @@ def pct(part: int, whole: int) -> float:
     if whole <= 0:
         return 0.0
     return round((part / whole) * 100.0, 3)
-
-
-def preprocess_repository(repo_path: Path, deletion_patterns_file: str) -> None:
-    """Remove docs and unnecessary files from repository based on deletion patterns config."""
-    
-    if not Path(deletion_patterns_file).exists():
-        log_warn(f"Deletion patterns file not found: {deletion_patterns_file}. Skipping preprocessing.")
-        return
-    
-    with open(deletion_patterns_file, "r") as f:
-        patterns_config = yaml.safe_load(f)
-    
-    if not patterns_config:
-        log_warn("Deletion patterns config is empty. Skipping preprocessing.")
-        return
-    
-    deleted_count = 0
-    
-    # Delete files matching extension patterns
-    extension_patterns = patterns_config.get("extension_patterns", [])
-    for ext_pattern in extension_patterns:
-        # Convert extension pattern (e.g., "*.o") to glob pattern
-        glob_pattern = f"**/{ext_pattern}"
-        matches = glob.glob(str(repo_path / glob_pattern), recursive=True)
-        for file_path in matches:
-            try:
-                if Path(file_path).is_file():
-                    Path(file_path).unlink()
-                    deleted_count += 1
-                    log_trace(f"Deleted file: {file_path}")
-            except Exception as e:
-                log_warn(f"Failed to delete file {file_path}: {e}")
-    
-    # Delete files matching file patterns
-    file_patterns = patterns_config.get("file_patterns", [])
-    for pattern in file_patterns:
-        matches = glob.glob(str(repo_path / pattern), recursive=True)
-        for file_path in matches:
-            try:
-                if Path(file_path).is_file():
-                    Path(file_path).unlink()
-                    deleted_count += 1
-                    log_trace(f"Deleted file: {file_path}")
-            except Exception as e:
-                log_warn(f"Failed to delete file {file_path}: {e}")
-    
-    # Delete directories matching directory patterns
-    directory_patterns = patterns_config.get("directory_patterns", [])
-    for pattern in directory_patterns:
-        matches = glob.glob(str(repo_path / pattern), recursive=True)
-        for dir_path in matches:
-            try:
-                if Path(dir_path).is_dir():
-                    shutil.rmtree(dir_path)
-                    deleted_count += 1
-                    log_trace(f"Deleted directory: {dir_path}")
-            except Exception as e:
-                log_warn(f"Failed to delete directory {dir_path}: {e}")
-    
-    if deleted_count > 0:
-        log_info(f"Preprocessing complete: deleted {deleted_count} files/directories from {repo_path.name}")
 
 
 async def update_progress(progress_state: dict, repo_name: str) -> None:
@@ -390,15 +336,40 @@ def build_prior_failure_retrieval_hints(shared_state: dict | None) -> tuple[list
     if not isinstance(shared_state, dict):
         return [], ""
 
-    signals = shared_state.get("signals")
-    if not isinstance(signals, dict):
-        return [], ""
-    failure_hints = signals.get("failure_hints")
-    if not isinstance(failure_hints, list) or not failure_hints:
-        return [], ""
-
     terms: list[str] = []
     summary_lines: list[str] = []
+
+    stages = shared_state.get("stages")
+    if isinstance(stages, dict):
+        pipeline_stage = stages.get("pipeline")
+        if isinstance(pipeline_stage, dict):
+            user_constraints = pipeline_stage.get("user_constraints")
+            if isinstance(user_constraints, dict) and user_constraints:
+                constraints_blob = yaml.dump(user_constraints, sort_keys=False, allow_unicode=True)
+                terms.extend(re.findall(r"[a-z0-9_\-]+", constraints_blob.lower()))
+                summary_lines.append("- user_constraints present (pipeline contract)")
+
+    signals = shared_state.get("signals")
+    if not isinstance(signals, dict):
+        dedup_terms: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            if len(term) < 3 or term in seen:
+                continue
+            seen.add(term)
+            dedup_terms.append(term)
+        return dedup_terms[:20], "\n".join(summary_lines[:8])
+
+    failure_hints = signals.get("failure_hints")
+    if not isinstance(failure_hints, list) or not failure_hints:
+        dedup_terms: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            if len(term) < 3 or term in seen:
+                continue
+            seen.add(term)
+            dedup_terms.append(term)
+        return dedup_terms[:20], "\n".join(summary_lines[:8])
     for hint in failure_hints[-8:]:
         if not isinstance(hint, dict):
             continue
@@ -558,19 +529,6 @@ class AgentPayload(TypedDict, total=False):
     checks: dict[str, dict[str, str]]
     warnings: list[str]
     done: bool
-
-
-def _new_prebuilt_chat_model(timeout_seconds: int) -> ChatOpenAI:
-    kwargs: dict[str, Any] = {
-        "model": args.model,
-        "temperature": EFFECTIVE_TEMPERATURE,
-        "api_key": args.api_key,
-        "base_url": args.endpoint,
-        "timeout": timeout_seconds,
-        "max_retries": args.llm_max_retries,
-        "http_async_client": _http_client,
-    }
-    return ChatOpenAI(**kwargs)
 
 
 def _extract_agent_payload(result: dict[str, Any]) -> AgentPayload:
@@ -809,6 +767,7 @@ async def _run_architecture_state_graph(
         run_validation=args.validation_enabled,
         classification_timeout=args.classification_timeout,
         synthesis_react_max_steps=args.synthesis_react_max_steps,
+        synthesis_review_rounds=args.synthesis_review_rounds,
         validation_react_max_steps=args.validation_react_max_steps,
         synthesis_subagents_enabled=args.synthesis_subagents_enabled,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
@@ -881,6 +840,7 @@ async def _run_l2_synthesis_loop(
         file_context_by_path=file_context_by_path,
         classification_timeout=args.classification_timeout,
         synthesis_react_max_steps=args.synthesis_react_max_steps,
+        synthesis_review_rounds=args.synthesis_review_rounds,
         synthesis_subagents_enabled=args.synthesis_subagents_enabled,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         extract_agent_payload=_extract_agent_payload,
@@ -889,7 +849,7 @@ async def _run_l2_synthesis_loop(
     )
 
 
-async def _run_l3_validation_loop(
+async def _run_classify_validation_loop(
     *,
     repo_url: str,
     summary: str,
@@ -898,7 +858,7 @@ async def _run_l3_validation_loop(
     file_context_by_path: dict[str, str],
     llm_metrics: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    return await _run_l3_validation_loop_impl(
+    return await _run_classify_validation_loop_impl(
         repo_url=repo_url,
         summary=summary,
         synthesis_artifact=synthesis_artifact,
@@ -1605,7 +1565,7 @@ async def main():
 
     # Run all analyses concurrently
     progress_bar = None
-    if should_use_progress(len(repos)):
+    if should_use_progress(len(repos), args.trace):
         progress_bar = tqdm(total=len(repos), desc="Analyzing repos", unit="repo", dynamic_ncols=True)
 
     progress_state = {
@@ -1635,7 +1595,7 @@ async def main():
 
     # Run analysis script to aggregate results and generate metrics, unless --no-analysis is specified.
     if not args.no_analysis:
-        analysis_script = Path(__file__).parent / "parse_results.py"
+        analysis_script = Path(__file__).resolve().parents[2] / "metrics" / "parse_results.py"
         log_info("Running analysis script...")
         subprocess.run(
             [

@@ -73,7 +73,7 @@ def build_architecture_scratchpad_payload(
                 "validation_artifact_path": str(validation_path) if validation_path else None,
                 "react_steps": len(validation_loop_trace),
                 "react_stop_reason": validation_stop_reason,
-                "abstraction": validation_artifact.get("abstraction_l3", {}),
+                "abstraction": validation_artifact.get("abstraction_classify_validation", {}),
                 "outcome_state": validation_artifact.get("outcome_state", "unknown"),
                 "loop_checkpoint": validation_artifact.get("loop_checkpoint", {}),
                 "react_trace": validation_loop_trace,

@@ -5,17 +5,26 @@ import json
 import os
 import re
 import shlex
-import shutil
 import ssl
 from pathlib import Path
 
 import httpx
+import yaml
 from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
+    from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
+    from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
+    from RepoBuilderAgent.src.core.file_io import write_text
+    from RepoBuilderAgent.src.core.repo_cleanup import delete_docs_build_context
+    from RepoBuilderAgent.src.stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
+        run_l3_dockerfile_repair_react,
+        run_l3_verification_command_react,
+    )
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -24,7 +33,6 @@ try:
         resolve_prompt_temperature,
     )
     from RepoBuilderAgent.src.core.common import (
-        chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
@@ -49,6 +57,15 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
+    from core.chat_model_factory import make_prebuilt_chat_model_factory
+    from core.dockerfile_utils import extract_dockerfile, get_base_template
+    from core.file_io import write_text
+    from core.repo_cleanup import delete_docs_build_context
+    from stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
+        run_l3_dockerfile_repair_react,
+        run_l3_verification_command_react,
+    )
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -57,7 +74,6 @@ except ImportError:
         resolve_prompt_temperature,
     )
     from core.common import (
-        chat_completion_with_retries,
         ensure_repo_checkout,
         finalize_llm_metrics,
         init_llm_metrics,
@@ -113,7 +129,6 @@ parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"
 parser.add_argument("--temperature", type=float, default=None, help="Temperature override for the model; defaults to selected prompt profile value")
 parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
 parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
-parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
 parser.add_argument("--repair-timeout", type=int, default=int(TIMEOUTS["repair_timeout"]), help="Timeout for Dockerfile repair LLM calls in seconds")
 parser.add_argument("--verify-repair-timeout", type=int, default=int(TIMEOUTS["verify_repair_timeout"]), help="Timeout for verification-command repair LLM calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
@@ -181,6 +196,12 @@ parser.add_argument(
     default=5,
     help="Maximum child nodes retained per decision-tree node before pruning low-frequency branches.",
 )
+parser.add_argument(
+    "--l3-react-max-steps",
+    type=int,
+    default=6,
+    help="Maximum built-in ReAct steps for Loop 3 Dockerfile repair decisions.",
+)
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
@@ -210,127 +231,14 @@ sem = asyncio.Semaphore(1)
 set_trace_enabled(args.trace)
 
 
-# Files/directories to remove from the repo before docker build so the build
-# context is free of documentation and CI/CD configuration that can't affect
-# an installation and may only inflate the context or mislead the build.
-# Intentionally exhaustive: agents must not be able to read pre-existing docs
-# or build instructions from the repo context.
-_DELETE_DOCS_EXTENSIONS: tuple[str, ...] = (
-    # Markup documentation
-    ".md", ".rst", ".adoc", ".asciidoc", ".textile", ".wiki",
-    # Office / print documents
-    ".pdf", ".doc", ".docx", ".odt", ".rtf",
-    # Other doc formats (avoid man-page style sources like .1-.8 that can be build inputs)
-    ".tex", ".pod", ".man",
-    # Notebook / presentation
-    ".ipynb", ".pptx", ".ppt",
+_new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
+    model=args.model,
+    temperature=EFFECTIVE_TEMPERATURE,
+    api_key=args.api_key,
+    base_url=args.endpoint,
+    max_retries=args.llm_max_retries,
+    http_async_client=_http_client,
 )
-_DELETE_DOCS_FILE_NAMES: frozenset[str] = frozenset({
-    # CI/CD pipeline files
-    "Jenkinsfile",
-    ".travis.yml", ".travis.yaml",
-    ".gitlab-ci.yml", ".gitlab-ci.yaml",
-    "appveyor.yml", "appveyor.yaml",
-    "azure-pipelines.yml", "azure-pipelines.yaml",
-    ".drone.yml", ".drone.yaml",
-    "bitbucket-pipelines.yml", "bitbucket-pipelines.yaml",
-    "CODEOWNERS",
-})
-_DELETE_DOCS_DIR_NAMES: frozenset[str] = frozenset({
-    # CI/CD directories
-    ".github", ".gitlab", ".circleci", ".buildkite", ".drone",
-    ".woodpecker", ".jenkins", ".azure-pipelines",
-    # Documentation directories
-    "docs", "doc", "documentation",
-    "website", "site", "gh-pages",
-    "wiki",
-    "javadoc", "apidoc", "apidocs",
-    "man", "manpages",
-    "sphinx", "docsrc",
-})
-
-
-def delete_docs_build_context(repo_path: Path, repo_name: str) -> None:
-    """Remove documentation and CI/CD files from repo_path before building."""
-    log_info(f"[delete-docs {repo_name}] Starting docs/CI deletion in {repo_path}")
-
-    removed_files: list[str] = []
-    removed_dirs: list[str] = []
-
-    for item in list(repo_path.rglob("*")):
-        if not item.exists():
-            # Already deleted as part of a parent directory removal
-            continue
-
-        if item.is_dir():
-            if item.name in _DELETE_DOCS_DIR_NAMES:
-                rel = item.relative_to(repo_path)
-                # Only delete top-level or second-level doc directories.
-                # Deeper directories named "doc" may be source modules (e.g., Rust crate submodules).
-                if len(rel.parts) <= 2:
-                    log_trace(f"[delete-docs {repo_name}] Removing CI/CD directory: {rel}")
-                    shutil.rmtree(item)
-                    removed_dirs.append(str(rel))
-                else:
-                    log_trace(f"[delete-docs {repo_name}] Skipping deep source dir: {rel}")
-        elif item.is_file():
-            if item.suffix.lower() in _DELETE_DOCS_EXTENSIONS:
-                rel = item.relative_to(repo_path)
-                log_trace(f"[delete-docs {repo_name}] Removing doc file: {rel}")
-                item.unlink()
-                removed_files.append(str(rel))
-            elif item.name in _DELETE_DOCS_FILE_NAMES:
-                rel = item.relative_to(repo_path)
-                log_trace(f"[delete-docs {repo_name}] Removing CI/CD file: {rel}")
-                item.unlink()
-                removed_files.append(str(rel))
-
-    log_info(
-        f"[delete-docs {repo_name}] Done — removed {len(removed_files)} file(s), "
-        f"{len(removed_dirs)} director{'ies' if len(removed_dirs) != 1 else 'y'}"
-    )
-
-
-
-def extract_dockerfile(raw: str) -> str:
-    match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
-    content = match.group(1) if match else raw
-    return content.strip() + "\n"
-
-
-def get_base_template(classification: dict) -> str:
-    """Select and load the appropriate base template based on programming language."""
-    subrepo_templates_dir = Path(__file__).resolve().parent.parent / "templates"
-
-    languages = classification.get("categories", {}).get("programming_language", {}).get("value", [])
-    if not languages:
-        log_warn("No programming language detected in classification; defaulting to C template")
-        template_name = "Dockerfile.base-c"
-    else:
-        lang = languages[0].lower()
-        if "python" in lang:
-            template_name = "Dockerfile.base-python"
-        elif "c++" in lang or "cpp" in lang:
-            template_name = "Dockerfile.base-cpp"
-        elif "c" in lang and "c++" not in lang:
-            template_name = "Dockerfile.base-c"
-        elif "typescript" in lang or "javascript" in lang:
-            template_name = "Dockerfile.base-typescript"
-        elif "rust" in lang:
-            template_name = "Dockerfile.base-rust"
-        elif "java" in lang or "kotlin" in lang:
-            template_name = "Dockerfile.base-java"
-        else:
-            log_warn(f"Unknown language {lang}; defaulting to C template")
-            template_name = "Dockerfile.base-c"
-
-    template_path = subrepo_templates_dir / template_name
-    if template_path.exists():
-        with open(template_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    log_error(f"Base template not found at {template_path}")
-    return ""
 
 
 def sanitize_image_tag(value: str) -> str:
@@ -588,12 +496,6 @@ def render_stateful_decision_tree_for_prompt(repair_history: list[dict]) -> str:
     return rendered
 
 
-def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as output_file:
-        output_file.write(content)
-
-
 def normalize_verify_command(command: str) -> str:
     sanitized_command = command.strip()
     if not sanitized_command:
@@ -836,7 +738,12 @@ async def request_repair(
     repair_history: list[dict] | None = None,
     architecture_scratchpad_context: str = "",
 ) -> str:
-    base_template = get_base_template(classification)
+    base_template = get_base_template(
+        classification,
+        Path(__file__).resolve().parents[3] / "templates",
+        log_warn=log_warn,
+        log_error=log_error,
+    )
     prompt = (
         PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
         .replace("{{ATTEMPT_NUMBER}}", str(attempt_number))
@@ -872,21 +779,31 @@ async def request_repair(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    response = await chat_completion_with_retries(
-        client=client,
-        model=args.model,
-        temperature=EFFECTIVE_TEMPERATURE,
-        messages=[{"role": "user", "content": prompt}],
+    repaired, trace_steps = await run_l3_dockerfile_repair_react(
         repo_url=repo_url,
-        phase="repair",
-        metrics=llm_metrics,
-        timeout_seconds=args.repair_timeout,
-        max_retries=args.llm_max_retries,
-        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+        attempt_number=attempt_number,
+        prompt=prompt,
+        repair_timeout=args.repair_timeout,
+        l3_react_max_steps=args.l3_react_max_steps,
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        build_think_tool=build_think_tool,
+        build_hadolint_snippet_tool=build_hadolint_snippet_tool,
+        extract_dockerfile=extract_dockerfile,
     )
-    if response.usage:
-        log_info(f"[TOKENS] {json.dumps({'phase': 'repair', 'repo': repo_url, 'attempt': attempt_number, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return extract_dockerfile((response.choices[0].message.content or "").strip())
+
+    if not repaired:
+        log_warn(f"L3 ReAct repair agent returned empty content for {repo_url} attempt {attempt_number}")
+        return ""
+
+    llm_metrics.setdefault("l3_react", {}).update(
+        {
+            "enabled": True,
+            "max_steps": int(args.l3_react_max_steps),
+            "last_attempt": attempt_number,
+            "trace_steps": trace_steps,
+        }
+    )
+    return repaired
 
 
 async def request_verification_command_repair(
@@ -925,21 +842,34 @@ async def request_verification_command_repair(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    response = await chat_completion_with_retries(
-        client=client,
-        model=args.model,
-        temperature=EFFECTIVE_TEMPERATURE,
-        messages=[{"role": "user", "content": prompt}],
+    command, trace_steps = await run_l3_verification_command_react(
         repo_url=repo_url,
-        phase="verify-repair",
-        metrics=llm_metrics,
-        timeout_seconds=args.verify_repair_timeout,
-        max_retries=args.llm_max_retries,
-        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+        prompt=prompt,
+        verify_timeout=args.verify_repair_timeout,
+        l3_react_max_steps=args.l3_react_max_steps,
+        thread_suffix="l3-verify-repair",
+        system_prompt=(
+            "You are Loop 3 (L3) verification-command repair ReAct agent. "
+            "Use think before major command changes and return only YAML-compatible output. "
+            "Return keys: thought, verification_command, done, stop_reason."
+        ),
+        candidate_keys=["verification_command", "verify_command", "repaired_verification_command", "command"],
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        build_think_tool=build_think_tool,
     )
-    if response.usage:
-        log_info(f"[TOKENS] {json.dumps({'phase': 'verify-repair', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return (response.choices[0].message.content or "").strip().strip("`")
+    if not command:
+        log_warn(f"L3 ReAct verify-repair agent returned empty command for {repo_url}")
+        return ""
+
+    l3_metrics = llm_metrics.setdefault("l3_react", {})
+    l3_metrics.update(
+        {
+            "verify_repair_enabled": True,
+            "verify_repair_trace_steps": trace_steps,
+            "verify_repair_max_steps": int(args.l3_react_max_steps),
+        }
+    )
+    return command
 
 
 async def request_verification_command_refresh(
@@ -969,21 +899,34 @@ async def request_verification_command_refresh(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    response = await chat_completion_with_retries(
-        client=client,
-        model=args.model,
-        temperature=EFFECTIVE_TEMPERATURE,
-        messages=[{"role": "user", "content": prompt}],
+    command, trace_steps = await run_l3_verification_command_react(
         repo_url=repo_url,
-        phase="verify-refresh",
-        metrics=llm_metrics,
-        timeout_seconds=args.verify_repair_timeout,
-        max_retries=args.llm_max_retries,
-        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+        prompt=prompt,
+        verify_timeout=args.verify_repair_timeout,
+        l3_react_max_steps=args.l3_react_max_steps,
+        thread_suffix="l3-verify-refresh",
+        system_prompt=(
+            "You are Loop 3 (L3) verification-command refresh ReAct agent. "
+            "Use think before major command changes and return only YAML-compatible output. "
+            "Return keys: thought, verification_command, done, stop_reason."
+        ),
+        candidate_keys=["verification_command", "verify_command", "refreshed_verification_command", "command"],
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        build_think_tool=build_think_tool,
     )
-    if response.usage:
-        log_info(f"[TOKENS] {json.dumps({'phase': 'verify-refresh', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
-    return (response.choices[0].message.content or "").strip().strip("`")
+    if not command:
+        log_warn(f"L3 ReAct verify-refresh agent returned empty command for {repo_url}")
+        return ""
+
+    l3_metrics = llm_metrics.setdefault("l3_react", {})
+    l3_metrics.update(
+        {
+            "verify_refresh_enabled": True,
+            "verify_refresh_trace_steps": trace_steps,
+            "verify_refresh_max_steps": int(args.l3_react_max_steps),
+        }
+    )
+    return command
 
 
 async def repair_repository(
