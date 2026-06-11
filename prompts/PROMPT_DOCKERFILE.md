@@ -4,7 +4,7 @@ Your task is to extend a base Dockerfile template to build the target repository
 
 DO NOT start from scratch. Use the provided base template as the starting point.
 The base template already includes:
-  - Debian trixie-slim base image
+  - Debian forky-slim base image
   - CA certificate bootstrap (including MANUALREPOS_CA_CERT_B64 decoding)
   - Standard build toolchain for the ecosystem (e.g., build-essential for C/C++, Python for Python projects)
   - Non-root user (manualrepos) with working directory set to /home/manualrepos/repo

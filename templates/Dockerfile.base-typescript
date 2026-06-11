@@ -1,7 +1,7 @@
 # Base Dockerfile for TypeScript/Node.js projects
 # Includes: Debian, CA bootstrap, Node.js from Debian repos (NOT NodeSource), npm/pnpm, build-essential
 
-FROM debian:trixie-slim
+FROM debian:forky-slim
 
 # Install CA certificates and corporate CA if provided
 RUN apt-get update && apt-get install -y --no-install-recommends \

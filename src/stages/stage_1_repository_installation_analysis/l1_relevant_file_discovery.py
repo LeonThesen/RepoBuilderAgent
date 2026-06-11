@@ -5,9 +5,29 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
 try:
-    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_search_structure_paths_tool, build_select_default_files_tool, build_think_tool
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
+        build_list_tree_tool,
+        build_read_file_tool,
+        build_read_gitlog_tool,
+        build_search_commits_tool,
+        build_search_pattern_tool,
+        build_search_structure_paths_tool,
+        build_select_default_files_tool,
+        build_think_tool,
+    )
+    from RepoBuilderAgent.src.core.common import prompt_path
 except ImportError:
-    from agent_tools.react_loop_tools import build_search_structure_paths_tool, build_select_default_files_tool, build_think_tool
+    from agent_tools.react_loop_tools import (
+        build_list_tree_tool,
+        build_read_file_tool,
+        build_read_gitlog_tool,
+        build_search_commits_tool,
+        build_search_pattern_tool,
+        build_search_structure_paths_tool,
+        build_select_default_files_tool,
+        build_think_tool,
+    )
+    from core.common import prompt_path
 
 
 def _hard_cap_selected_files(candidates: list[str], default_selected_files: list[str], cap: int) -> list[str]:
@@ -52,6 +72,7 @@ async def select_files_by_iterative_react(
     *,
     repo_url: str,
     repo_name: str,
+    repo_path: "Path",
     structure_summary: str,
     default_selected_files: list[str],
     model_name: str,
@@ -65,29 +86,31 @@ async def select_files_by_iterative_react(
     normalize_text_list: Callable[[Any], list[str]],
     estimate_tokens: Callable[[str, str], int],
 ) -> tuple[list[str], int, list[dict[str, Any]], str]:
+    from pathlib import Path as _Path
+    _repo_path = _Path(repo_path).resolve()
+
     max_total = max(1, int(react_max_total_files))
     step1_prompt = (
-        "Repository: " + repo_url + "\n"
-        "Use tools to inspect likely high-signal files and return YAML keys: thought, selected_files, done.\n"
-        "Before each decisive tool call, use the think tool with a brief intent note.\n"
-        "selected_files must contain only repository-relative paths.\n"
-        "Keep at most " + str(max_total) + " files and set done=true when sufficient evidence exists for install/build/verify coverage.\n\n"
-        "STRUCTURE_SUMMARY:\n" + structure_summary
+        prompt_path("PROMPT_L1_TASK.md").read_text(encoding="utf-8")
+        .replace("{{REPO_URL}}", repo_url)
+        .replace("{{MAX_FILES}}", str(max_total))
+        .replace("{{STRUCTURE_SUMMARY}}", structure_summary)
     )
     step1_tokens_total = estimate_tokens(step1_prompt, model_name)
 
     search_structure_paths = build_search_structure_paths_tool(structure_summary)
     select_default_files = build_select_default_files_tool(default_selected_files)
     think = build_think_tool()
+    read_file = build_read_file_tool(_repo_path)
+    list_tree = build_list_tree_tool(_repo_path)
+    search_pattern = build_search_pattern_tool(_repo_path)
+    read_gitlog = build_read_gitlog_tool(_repo_path)
+    search_commits = build_search_commits_tool(_repo_path)
 
     retrieval_agent = create_agent(
         model=new_prebuilt_chat_model(selection_timeout),
-        tools=[think, search_structure_paths, select_default_files],
-        system_prompt=(
-            "You are the repository exploration agent. Use tools before answering. "
-            "Use think for concise planning notes between tool decisions. "
-            "Return only YAML-compatible fields in your final answer."
-        ),
+        tools=[think, list_tree, search_pattern, read_file, read_gitlog, search_commits, search_structure_paths, select_default_files],
+        system_prompt=prompt_path("PROMPT_L1_SYSTEM.md").read_text(encoding="utf-8").strip(),
         checkpointer=InMemorySaver(),
         store=InMemoryStore(),
         name="l1_retrieval_agent",
@@ -95,7 +118,7 @@ async def select_files_by_iterative_react(
 
     result = await retrieval_agent.ainvoke(
         {"messages": [{"role": "user", "content": step1_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l1"}, "recursion_limit": max(8, int(react_max_steps) * 4)},
+        config={"configurable": {"thread_id": f"{repo_name}:l1"}, "recursion_limit": max(12, int(react_max_steps) * 6)},
     )
     payload = extract_agent_payload(result)
     raw_selected = payload.get("selected_files") if isinstance(payload, dict) else []

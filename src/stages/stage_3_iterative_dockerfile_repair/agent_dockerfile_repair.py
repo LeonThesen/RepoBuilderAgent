@@ -16,7 +16,8 @@ from tqdm import tqdm
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool
+    from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
     from RepoBuilderAgent.src.core.file_io import write_text
@@ -57,7 +58,8 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_think_tool
+    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool
+    from metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.dockerfile_utils import extract_dockerfile, get_base_template
     from core.file_io import write_text
@@ -137,6 +139,7 @@ parser.add_argument("--summaries-dir", default="summaries", help="Directory cont
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
 parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory containing generated Dockerfiles")
 parser.add_argument("--reports-dir", default="repair-reports", help="Directory where repair attempt logs and reports will be written")
+parser.add_argument("--dataset-dir", default=None, help="Path to RepoBuilderDataset directory; enables GT verify command injection and binary metrics collection")
 parser.add_argument("--container-cli", default="docker", help="Container CLI to use for builds")
 parser.add_argument("--max-attempts", type=int, default=3, help="Maximum number of build and repair attempts per repository")
 parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum number of build log characters to send to the model")
@@ -202,6 +205,12 @@ parser.add_argument(
     default=6,
     help="Maximum built-in ReAct steps for Loop 3 Dockerfile repair decisions.",
 )
+parser.add_argument(
+    "--snippet-tools",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable Dockerfile snippet tools (get_dockerfile_snippet) in the L3 repair agent.",
+)
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
@@ -225,6 +234,9 @@ with open(prompt_path("PROMPT_DOCKERFILE_REPAIR.md"), "r", encoding="utf-8") as 
 
 with open(prompt_path("PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as prompt_file:
     VERIFY_PROMPT_TEMPLATE = prompt_file.read()
+
+VERIFY_REPAIR_SYSTEM_PROMPT = prompt_path("PROMPT_L3_VERIFY_REPAIR_SYSTEM.md").read_text(encoding="utf-8").strip()
+VERIFY_REFRESH_SYSTEM_PROMPT = prompt_path("PROMPT_L3_VERIFY_REFRESH_SYSTEM.md").read_text(encoding="utf-8").strip()
 
 sem = asyncio.Semaphore(1)
 
@@ -726,6 +738,76 @@ async def run_build_verification(image_tag: str, repo_name: str, attempt: int, s
     return 127, output, command, False
 
 
+async def measure_binary_in_image(
+    image_tag: str,
+    artifact_path: str,
+    workdir: str,
+    gt_size_bytes: Optional[int],
+    gt_digest: Optional[str],
+) -> dict:
+    """Measure size and xxh64 hash of a produced binary inside a Docker image."""
+    if artifact_path.startswith("/"):
+        abs_path = artifact_path
+    else:
+        base = workdir.rstrip("/") if workdir else "/home/manualrepos/repo"
+        abs_path = f"{base}/{artifact_path.lstrip('./')}"
+
+    result: dict = {
+        "gt_binary_path": artifact_path,
+        "gt_binary_size_bytes": gt_size_bytes,
+        "gt_binary_hash": gt_digest,
+        "measured_size_bytes": None,
+        "binary_size_plausible": None,
+        "binary_hash_match": None,
+    }
+
+    # Measure file size via stat
+    size_cmd = [
+        args.container_cli, "run", "--rm",
+        "--entrypoint", "/bin/sh",
+        image_tag, "-c", f"stat -c '%s' {shlex.quote(abs_path)}",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *size_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            result["measured_size_bytes"] = int(stdout.decode("utf-8", errors="replace").strip())
+    except Exception:
+        pass
+
+    if result["measured_size_bytes"] is not None and gt_size_bytes and gt_size_bytes > 0:
+        ratio = result["measured_size_bytes"] / gt_size_bytes
+        result["binary_size_plausible"] = 0.5 <= ratio <= 2.0
+
+    # Measure xxh64 hash if GT stores one (informational only)
+    if gt_digest and gt_digest.startswith("xxh64:"):
+        hash_cmd = [
+            args.container_cli, "run", "--rm",
+            "--entrypoint", "/bin/sh",
+            image_tag, "-c",
+            f"xxhsum -H64 {shlex.quote(abs_path)} 2>/dev/null | cut -d' ' -f1",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *hash_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0:
+                measured_hex = stdout.decode("utf-8", errors="replace").strip().lower()
+                if measured_hex:
+                    result["binary_hash_match"] = (f"xxh64:{measured_hex}" == gt_digest.lower())
+        except Exception:
+            pass
+
+    return result
+
+
 async def request_repair(
     repo_url: str,
     attempt_number: int,
@@ -789,6 +871,7 @@ async def request_repair(
         build_think_tool=build_think_tool,
         build_hadolint_snippet_tool=build_hadolint_snippet_tool,
         extract_dockerfile=extract_dockerfile,
+        build_snippet_tool=build_get_dockerfile_snippet_tool if args.snippet_tools else None,
     )
 
     if not repaired:
@@ -848,11 +931,7 @@ async def request_verification_command_repair(
         verify_timeout=args.verify_repair_timeout,
         l3_react_max_steps=args.l3_react_max_steps,
         thread_suffix="l3-verify-repair",
-        system_prompt=(
-            "You are Loop 3 (L3) verification-command repair ReAct agent. "
-            "Use think before major command changes and return only YAML-compatible output. "
-            "Return keys: thought, verification_command, done, stop_reason."
-        ),
+        system_prompt=VERIFY_REPAIR_SYSTEM_PROMPT,
         candidate_keys=["verification_command", "verify_command", "repaired_verification_command", "command"],
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         build_think_tool=build_think_tool,
@@ -905,11 +984,7 @@ async def request_verification_command_refresh(
         verify_timeout=args.verify_repair_timeout,
         l3_react_max_steps=args.l3_react_max_steps,
         thread_suffix="l3-verify-refresh",
-        system_prompt=(
-            "You are Loop 3 (L3) verification-command refresh ReAct agent. "
-            "Use think before major command changes and return only YAML-compatible output. "
-            "Return keys: thought, verification_command, done, stop_reason."
-        ),
+        system_prompt=VERIFY_REFRESH_SYSTEM_PROMPT,
         candidate_keys=["verification_command", "verify_command", "refreshed_verification_command", "command"],
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         build_think_tool=build_think_tool,
@@ -979,6 +1054,16 @@ async def repair_repository(
                 )
                 return
 
+            # Load ground truth doc for this repo (enables GT verify injection and binary metrics).
+            gt_doc: Optional[dict] = None
+            gt_verify_commands: list[str] = []
+            if args.dataset_dir:
+                gt_doc = load_gt_for_repo(Path(args.dataset_dir), repo_url)
+                if gt_doc:
+                    gt_verify_commands = get_gt_verify_commands(gt_doc)
+                    if gt_verify_commands:
+                        log_info(f"[gt {repo_name}] Loaded {len(gt_verify_commands)} GT verify command(s) from dataset")
+
             # Resume: skip repair if a successful report already exists and --force is not set.
             if not args.force and report_path.exists():
                 existing_report = read_yaml_file(report_path)
@@ -1008,9 +1093,14 @@ async def repair_repository(
             else:
                 log_info(f"[delete-docs {repo_name}] Skipping docs/CI deletion (--skip-delete-docs set)")
 
-            # Load the build verification command: prefer LLM-generated sidecar, fall back to CLI arg.
+            # Load the build verification command: GT dataset > LLM-generated sidecar > CLI arg.
             verify_command_path = dockerfiles_dir / f"{repo_name}.verify-command"
-            if verify_command_path.exists():
+            if gt_verify_commands:
+                gt_joined = " && ".join(gt_verify_commands)
+                verify_command_to_use = normalize_verify_command(gt_joined)
+                report["gt_verify_commands"] = gt_verify_commands
+                log_info(f"[verify {repo_name}] Using GT dataset verification commands: {verify_command_to_use}")
+            elif verify_command_path.exists():
                 verify_command_to_use = normalize_verify_command(verify_command_path.read_text(encoding="utf-8"))
                 log_info(f"[verify {repo_name}] Using generated verification command from {verify_command_path}: {verify_command_to_use}")
             else:
@@ -1149,6 +1239,23 @@ async def repair_repository(
                     if verify_exit_code == 0:
                         report["success"] = True
                         report["successful_attempt"] = attempt
+                        if gt_doc:
+                            gt_artifact = get_gt_key_artifact(gt_doc, gt_verify_commands)
+                            if gt_artifact:
+                                _, workdir = await get_image_runtime_context(image_tag)
+                                binary_metrics = await measure_binary_in_image(
+                                    image_tag,
+                                    gt_artifact["path"],
+                                    workdir,
+                                    gt_artifact.get("size_bytes"),
+                                    gt_artifact.get("digest"),
+                                )
+                                report["binary_metrics"] = binary_metrics
+                                log_info(
+                                    f"[binary {repo_name}] size={binary_metrics.get('measured_size_bytes')}, "
+                                    f"plausible={binary_metrics.get('binary_size_plausible')}, "
+                                    f"hash_match={binary_metrics.get('binary_hash_match')}"
+                                )
                         log_info(
                             f"Build and verification succeeded for {repo_url} on attempt {attempt}; image tag: {image_tag}; build log: {build_log_path}; verify log: {verify_log_path}"
                         )
@@ -1242,6 +1349,18 @@ async def repair_repository(
                     if retry_exit_code == 0:
                         report["success"] = True
                         report["successful_attempt"] = attempt
+                        if gt_doc and "binary_metrics" not in report:
+                            gt_artifact = get_gt_key_artifact(gt_doc, gt_verify_commands)
+                            if gt_artifact:
+                                _, workdir = await get_image_runtime_context(image_tag)
+                                binary_metrics = await measure_binary_in_image(
+                                    image_tag,
+                                    gt_artifact["path"],
+                                    workdir,
+                                    gt_artifact.get("size_bytes"),
+                                    gt_artifact.get("digest"),
+                                )
+                                report["binary_metrics"] = binary_metrics
                         log_info(
                             f"Build and verification succeeded for {repo_url} on attempt {attempt} after updating the verification command; image tag: {image_tag}; build log: {build_log_path}; verify log: {retry_verify_log_path}"
                         )

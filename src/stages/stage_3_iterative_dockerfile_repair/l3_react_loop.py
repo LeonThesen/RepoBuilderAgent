@@ -4,6 +4,11 @@ from typing import Any, Callable
 import yaml
 from langgraph.prebuilt import create_react_agent
 
+try:
+    from RepoBuilderAgent.src.core.common import prompt_path
+except ImportError:
+    from core.common import prompt_path
+
 
 def _extract_react_payload(result: dict) -> dict:
     messages = result.get("messages") or []
@@ -60,17 +65,25 @@ async def run_l3_dockerfile_repair_react(
     build_think_tool: Callable[[], Any],
     build_hadolint_snippet_tool: Callable[[], Any],
     extract_dockerfile: Callable[[str], str],
+    build_snippet_tool: "Callable[[], Any] | None" = None,
 ) -> tuple[str, int]:
     think = build_think_tool()
     hadolint_tool = build_hadolint_snippet_tool()
+    tools: list[Any] = [think, hadolint_tool]
+    if build_snippet_tool is not None:
+        tools.append(build_snippet_tool())
+    _snippet_hint = (
+        "Use get_dockerfile_snippet to retrieve validated RUN-block snippets for common toolchains "
+        "(call with action='list_actions' to see all available snippets). "
+        if build_snippet_tool is not None else ""
+    )
     repair_agent = create_react_agent(
         model=new_prebuilt_chat_model(repair_timeout),
-        tools=[think, hadolint_tool],
+        tools=tools,
         prompt=(
-            "You are Loop 3 (L3) Dockerfile Repair ReAct agent. "
-            "L3 is exclusively responsible for Dockerfile repair decisions. "
-            "Use think before major edits and use run_hadolint_on_snippet to validate candidate Dockerfile text. "
-            "Return YAML with keys: thought, repaired_dockerfile, done, stop_reason."
+            prompt_path("PROMPT_L3_REPAIR_SYSTEM.md").read_text(encoding="utf-8")
+            .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint)
+            .strip()
         ),
     )
 

@@ -1,7 +1,7 @@
 # Base Dockerfile for Rust projects
 # Includes: Debian, CA bootstrap, rustup, cargo, build-essential
 
-FROM debian:trixie-slim
+FROM debian:forky-slim
 
 # Install CA certificates and corporate CA if provided
 RUN apt-get update && apt-get install -y --no-install-recommends \

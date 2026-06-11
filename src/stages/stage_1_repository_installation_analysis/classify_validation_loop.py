@@ -10,6 +10,7 @@ try:
         build_search_selected_files_tool,
         build_think_tool,
     )
+    from RepoBuilderAgent.src.core.common import prompt_path
 except ImportError:
     from agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
@@ -17,6 +18,7 @@ except ImportError:
         build_search_selected_files_tool,
         build_think_tool,
     )
+    from core.common import prompt_path
 
 
 def _truncate_for_prompt(text: str, max_chars: int = 12000) -> str:
@@ -93,29 +95,18 @@ async def run_classify_validation_loop(
     validation_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context],
-        prompt=(
-            "You are the classify validation ReAct agent (quality checks for classify stage, not dockerfile repair loop). "
-            "Use list_selected_files/search_selected_files to inspect available evidence before fetching file content. "
-            "Use think for brief intent notes before/after key tool decisions. "
-            "Return YAML-compatible fields only."
-        ),
+        prompt=prompt_path("PROMPT_L1_VALIDATION_SYSTEM.md").read_text(encoding="utf-8").strip(),
     )
 
     compact_synthesis = _compact_synthesis_for_validation(synthesis_artifact)
     compact_summary = _truncate_for_prompt(summary, max_chars=14000)
 
     validation_prompt = (
-        f"Repository: {repo_url}\n"
-        "Validate installation/build evidence coverage and highlight risky gaps.\n"
-        "Use think between major tool decisions.\n"
-        "Return keys: thought, checks (map), warnings (list), selected_files (list), done (bool).\n"
-        "Each checks entry must include status (pass|warn|fail) and detail.\n\n"
-        "CURRENT_CHECKS:\n"
-        + yaml.dump(checks, sort_keys=False, allow_unicode=True)
-        + "\nSYNTHESIS_ARTIFACT:\n"
-        + yaml.dump(compact_synthesis, sort_keys=False, allow_unicode=True)
-        + "\nSUMMARY_EVIDENCE:\n"
-        + compact_summary
+        prompt_path("PROMPT_L1_VALIDATION_TASK.md").read_text(encoding="utf-8")
+        .replace("{{REPO_URL}}", repo_url)
+        .replace("{{CURRENT_CHECKS}}", yaml.dump(checks, sort_keys=False, allow_unicode=True))
+        .replace("{{SYNTHESIS_ARTIFACT}}", yaml.dump(compact_synthesis, sort_keys=False, allow_unicode=True))
+        .replace("{{SUMMARY_EVIDENCE}}", compact_summary)
     )
 
     result = await validation_agent.ainvoke(
@@ -152,6 +143,10 @@ async def run_classify_validation_loop(
         outcome_state = "failure"
     confidence = max(0.0, min(1.0, 1.0 - fail_count * 0.25 - warn_count * 0.08))
 
+    # Trigger L3→L2 escalation when there is zero build evidence and confidence is very low.
+    # The escalation lets L2 attempt a second synthesis pass with the same file context.
+    runtime_gap_detected = not has_manifest and not has_docker and confidence < 0.5
+
     validation_artifact = {
         "repo": repo_url,
         "stage": "validation",
@@ -172,6 +167,7 @@ async def run_classify_validation_loop(
             "warn_count": warn_count,
         },
         "outcome_state": outcome_state,
+        "runtime_gap_detected": runtime_gap_detected,
         "checks": checks,
         "warnings": validation_warnings,
         "loop_trace": loop_trace,

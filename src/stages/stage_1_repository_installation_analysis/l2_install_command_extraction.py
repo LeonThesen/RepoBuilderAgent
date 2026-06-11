@@ -6,19 +6,27 @@ from langgraph.prebuilt import create_react_agent
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
+        build_get_dockerfile_snippet_tool,
         build_hadolint_snippet_tool,
         build_list_selected_files_tool,
+        build_read_gitlog_tool,
+        build_search_commits_tool,
         build_search_selected_files_tool,
         build_think_tool,
     )
+    from RepoBuilderAgent.src.core.common import prompt_path
 except ImportError:
     from agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
+        build_get_dockerfile_snippet_tool,
         build_hadolint_snippet_tool,
         build_list_selected_files_tool,
+        build_read_gitlog_tool,
+        build_search_commits_tool,
         build_search_selected_files_tool,
         build_think_tool,
     )
+    from core.common import prompt_path
 
 
 def _deterministic_signal_scan(selected_files: list[str], markers: tuple[str, ...], limit: int = 8) -> list[str]:
@@ -45,23 +53,15 @@ async def _invoke_signal_subagent(
     signal_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context],
-        prompt=(
-            "You are a focused L2 signal sub-agent. "
-            "Use tools to find high-value evidence for your assigned signal type. "
-            "Return YAML-compatible fields only."
-        ),
+        prompt=prompt_path("PROMPT_L2_SIGNAL_SYSTEM.md").read_text(encoding="utf-8").strip(),
     )
 
-
     subagent_prompt = (
-        f"Repository: {repo_name}\n"
-        f"Sub-agent: {name}\n"
-        + prompt_body
-        + "\n"
-        "Use think between major tool decisions.\n"
-        "Return keys: thought, signal (list), notes (list), done (bool).\n\n"
-        "SUMMARY_EVIDENCE:\n"
-        + summary
+        prompt_path("PROMPT_L2_SIGNAL_TASK.md").read_text(encoding="utf-8")
+        .replace("{{REPO_NAME}}", repo_name)
+        .replace("{{SUBAGENT_NAME}}", name)
+        .replace("{{PROMPT_BODY}}", prompt_body)
+        .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
     result = await signal_agent.ainvoke(
@@ -105,20 +105,13 @@ async def _invoke_gap_subagent(
     gap_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context],
-        prompt=(
-            "You are the L2 gap-check sub-agent. "
-            "Detect whether manifest, docker, and test evidence are present. "
-            "Return YAML-compatible fields only."
-        ),
+        prompt=prompt_path("PROMPT_L2_GAPCHECK_SYSTEM.md").read_text(encoding="utf-8").strip(),
     )
 
     gap_prompt = (
-        f"Repository: {repo_name}\n"
-        "Check evidence presence and return booleans.\n"
-        "Use think between major tool decisions.\n"
-        "Return keys: thought, has_manifest (bool), has_docker (bool), has_tests (bool), notes (list), done (bool).\n\n"
-        "SUMMARY_EVIDENCE:\n"
-        + summary
+        prompt_path("PROMPT_L2_GAPCHECK_TASK.md").read_text(encoding="utf-8")
+        .replace("{{REPO_NAME}}", repo_name)
+        .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
     result = await gap_agent.ainvoke(
@@ -294,6 +287,7 @@ async def run_l2_synthesis_loop(
     *,
     repo_url: str,
     repo_name: str,
+    repo_path: "Path",
     selected_files: list[str],
     summary: str,
     exploration_artifact: dict[str, Any],
@@ -302,6 +296,7 @@ async def run_l2_synthesis_loop(
     synthesis_react_max_steps: int,
     synthesis_subagents_enabled: bool,
     synthesis_review_rounds: int,
+    snippet_tools_enabled: bool = False,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -328,11 +323,17 @@ async def run_l2_synthesis_loop(
         "test_evidence_missing" if exploration_artifact["evidence_gaps"]["test_evidence_missing"] else None,
     ]
     risk_notes = [item for item in risk_notes if item]
+    from pathlib import Path as _Path
+    _repo_path = _Path(repo_path).resolve()
+
     fetch_file_context = build_fetch_file_context_tool(file_context_by_path)
     list_selected_files = build_list_selected_files_tool(selected_snapshot)
     search_selected_files = build_search_selected_files_tool(selected_snapshot)
     think = build_think_tool()
     hadolint_check = build_hadolint_snippet_tool()
+    read_gitlog = build_read_gitlog_tool(_repo_path)
+    search_commits = build_search_commits_tool(_repo_path)
+    get_dockerfile_snippet = build_get_dockerfile_snippet_tool() if snippet_tools_enabled else None
 
     subagent_outputs = (
         await _run_synthesis_subagents(
@@ -353,31 +354,31 @@ async def run_l2_synthesis_loop(
         else []
     )
 
+    _generator_tools = [think, list_selected_files, search_selected_files, fetch_file_context, read_gitlog, search_commits, hadolint_check]
+    if get_dockerfile_snippet is not None:
+        _generator_tools.append(get_dockerfile_snippet)
+    _snippet_hint_generator = (
+        "Use get_dockerfile_snippet to retrieve validated RUN-block snippets for common toolchains "
+        "(call with action='list_actions' to see all options). "
+        if get_dockerfile_snippet is not None else ""
+    )
     synthesis_generator = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context, hadolint_check],
+        tools=_generator_tools,
         prompt=(
-            "You are the L2 synthesis generator agent. Use tools whenever evidence is missing. "
-            "Use list_selected_files/search_selected_files to inspect available evidence before fetching file content. "
-            "If you draft a Dockerfile snippet as part of a hypothesis, call run_hadolint_on_snippet to lint it before finalizing. "
-            "Use think for brief intent notes before/after key tool decisions. "
-            "Return YAML-compatible fields only."
+            prompt_path("PROMPT_L2_SYNTHESIS_GENERATOR_SYSTEM.md").read_text(encoding="utf-8")
+            .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint_generator)
+            .strip()
         ),
     )
 
     synthesis_prompt = (
-        f"Repository: {repo_url}\n"
-        "Improve build strategy hypotheses and risk notes using evidence.\n"
-        "Use think between major tool decisions.\n"
-        "Return keys: thought, hypothesis_updates (list), risk_updates (list), selected_files (list), done (bool).\n\n"
-        "CURRENT_HYPOTHESES:\n"
-        + "\n".join(f"- {item}" for item in base_hypotheses[:20])
-        + "\n\nCURRENT_RISKS:\n"
-        + ("\n".join(f"- {item}" for item in risk_notes[:20]) if risk_notes else "- (none)")
-        + "\n\nSUBAGENT_SIGNALS:\n"
-        + str(subagent_outputs[:4])
-        + "\n\nSUMMARY_EVIDENCE:\n"
-        + summary
+        prompt_path("PROMPT_L2_SYNTHESIS_TASK.md").read_text(encoding="utf-8")
+        .replace("{{REPO_URL}}", repo_url)
+        .replace("{{CURRENT_HYPOTHESES}}", "\n".join(f"- {item}" for item in base_hypotheses[:20]))
+        .replace("{{CURRENT_RISKS}}", "\n".join(f"- {item}" for item in risk_notes[:20]) if risk_notes else "- (none)")
+        .replace("{{SUBAGENT_SIGNALS}}", str(subagent_outputs[:4]))
+        .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
     generation_result = await synthesis_generator.ainvoke(
@@ -394,13 +395,20 @@ async def run_l2_synthesis_loop(
     generator_trace = extract_agent_trace(generation_result)
     generator_stop_reason = "model_done" if done_flag else "agent_converged"
 
+    _reviewer_tools = [think, list_selected_files, search_selected_files, fetch_file_context, read_gitlog, search_commits, hadolint_check]
+    if get_dockerfile_snippet is not None:
+        _reviewer_tools.append(get_dockerfile_snippet)
+    _snippet_hint_reviewer = (
+        "Use get_dockerfile_snippet to retrieve validated RUN-block snippets for toolchains you are reviewing. "
+        if get_dockerfile_snippet is not None else ""
+    )
     synthesis_reviewer = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context, hadolint_check],
+        tools=_reviewer_tools,
         prompt=(
-            "You are the L2 synthesis reviewer agent. Critique the generator output for missing evidence and weak assumptions. "
-            "Use tools to verify claims, and use run_hadolint_on_snippet when Dockerfile snippets appear in hypotheses. "
-            "Return YAML-compatible fields only."
+            prompt_path("PROMPT_L2_SYNTHESIS_REVIEWER_SYSTEM.md").read_text(encoding="utf-8")
+            .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint_reviewer)
+            .strip()
         ),
     )
 
@@ -414,17 +422,14 @@ async def run_l2_synthesis_loop(
 
     for round_index in range(max(1, int(synthesis_review_rounds))):
         reviewer_prompt = (
-            f"Repository: {repo_url}\n"
-            f"Review and refine generated synthesis output (round {round_index + 1}/{max(1, int(synthesis_review_rounds))}).\n"
-            "Return keys: thought, accepted (bool), revised_hypotheses (list), revised_risks (list), critique_notes (list), done (bool).\n\n"
-            "GENERATOR_HYPOTHESES:\n"
-            + "\n".join(f"- {item}" for item in review_hypotheses[:30])
-            + "\n\nGENERATOR_RISKS:\n"
-            + ("\n".join(f"- {item}" for item in review_risks[:30]) if review_risks else "- (none)")
-            + "\n\nSUBAGENT_SIGNALS:\n"
-            + str(subagent_outputs[:4])
-            + "\n\nSUMMARY_EVIDENCE:\n"
-            + summary
+            prompt_path("PROMPT_L2_REVIEW_TASK.md").read_text(encoding="utf-8")
+            .replace("{{REPO_URL}}", repo_url)
+            .replace("{{ROUND_INDEX}}", str(round_index + 1))
+            .replace("{{ROUND_TOTAL}}", str(max(1, int(synthesis_review_rounds))))
+            .replace("{{GENERATOR_HYPOTHESES}}", "\n".join(f"- {item}" for item in review_hypotheses[:30]))
+            .replace("{{GENERATOR_RISKS}}", "\n".join(f"- {item}" for item in review_risks[:30]) if review_risks else "- (none)")
+            .replace("{{SUBAGENT_SIGNALS}}", str(subagent_outputs[:4]))
+            .replace("{{SUMMARY_EVIDENCE}}", summary)
         )
 
         review_result = await synthesis_reviewer.ainvoke(
@@ -475,9 +480,22 @@ async def run_l2_synthesis_loop(
     has_docker = any("dockerfile" in path or "docker-compose" in path for path in selected_lower)
     has_tests = any("test" in path or "spec" in path for path in selected_lower)
     has_ci = any(path.startswith(".github/workflows/") for path in selected_lower)
-    coverage_hits = sum(1 for hit in (has_manifest, has_docker, has_tests, has_ci) if hit)
+    # Weighted signal hierarchy per diagram: CI/CD (0.20) > Dockerfile (0.18) > Manifest (0.15) > Tests (0.10)
+    per_source_confidence = {
+        "ci": 0.20 if has_ci else 0.0,
+        "docker": 0.18 if has_docker else 0.0,
+        "manifest": 0.15 if has_manifest else 0.0,
+        "tests": 0.10 if has_tests else 0.0,
+    }
+    weighted_coverage = sum(per_source_confidence.values())
     gap_penalty = sum(1 for flag in exploration_artifact.get("evidence_gaps", {}).values() if flag)
-    confidence = max(0.0, min(1.0, 0.35 + coverage_hits * 0.15 - gap_penalty * 0.08))
+    # Sub-agents with empty signal lists had no evidence to return.
+    unknown_markers = [
+        out["name"] for out in subagent_outputs
+        if isinstance(out.get("signal"), list) and not out["signal"]
+    ]
+    stack_unknown = weighted_coverage == 0.0 and not dedup_hypotheses
+    confidence = max(0.0, min(1.0, 0.35 + weighted_coverage - gap_penalty * 0.08))
     run_classify_validation = bool(gap_penalty > 0 or confidence < 0.78 or dedup_risks)
     transition_reasons: list[str] = []
     if gap_penalty > 0:
@@ -529,6 +547,9 @@ async def run_l2_synthesis_loop(
             "confidence": round(confidence, 4),
             "reasons": transition_reasons,
         },
+        "stack_unknown": stack_unknown,
+        "per_source_confidence": per_source_confidence,
+        "unknown_markers": unknown_markers,
         "build_strategy_hypotheses": dedup_hypotheses[:40],
         "dependency_assumptions": {
             "system_build_tools_required": any(marker in path for marker in ("binding.gyp", "cmake", "makefile") for path in selected_lower),

@@ -88,6 +88,7 @@ parser.add_argument("--summaries-dir", default="summaries", help="Directory cont
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
 parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory containing generated Dockerfiles")
 parser.add_argument("--reports-dir", default="repair-reports", help="Directory where repair logs and reports are written")
+parser.add_argument("--dataset-dir", default=None, help="Path to RepoBuilderDataset directory; passed to repair agent for GT verify injection and binary metrics")
 parser.add_argument("--install-guides-dir", default="install-guides", help="Directory where generated INSTALL.md guides are written")
 parser.add_argument("--analysis-dir", default="analysis", help="Directory where analysis outputs are written when --run-analysis is enabled")
 parser.add_argument("--container-cli", default="docker", help="Container CLI to use for repair builds")
@@ -157,8 +158,14 @@ parser.add_argument("--skip-install-guide", action="store_true", help="Skip the 
 parser.add_argument(
     "--variant",
     default="flat_baseline",
-    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_prev_attempt_ctx_off", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_iterative_react", "one_shot_direct"],
+    choices=["flat_baseline", "exploration", "synthesis", "validation", "full_system", "ab_prev_attempt_ctx_on", "ab_prev_attempt_ctx_off", "ab_stateful_tree_on", "ab_stateful_tree_off", "ab_retrieval_bm25", "ab_retrieval_neural_embedding", "ab_retrieval_one_shot_fingerprint", "ab_retrieval_one_shot_fingerprint_budgeted", "ab_retrieval_iterative_react", "ab_snippet_tools_baseline", "ab_snippet_tools_on", "ab_snippet_tools_off", "one_shot_direct"],
     help="Pipeline variant for ablation runs.",
+)
+parser.add_argument(
+    "--snippet-tools",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable Dockerfile snippet tools (get_dockerfile_snippet) in L2 synthesis and L3 repair agents.",
 )
 parser.add_argument(
     "--agent-config",
@@ -627,7 +634,7 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
 
         if "retrieval_strategy" in classification_cfg:
             retrieval_strategy = _expect_str(classification_cfg["retrieval_strategy"], key="classification.retrieval_strategy")
-            allowed = {"iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint"}
+            allowed = {"iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint", "one_shot_fingerprint_budgeted"}
             if retrieval_strategy not in allowed:
                 raise ValueError(
                     "agent_config.classification.retrieval_strategy must be one of "
@@ -704,6 +711,11 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
                 key="repair.tree_max_children",
             )
             applied.setdefault("repair", {})["tree_max_children"] = args.stateful_tree_max_children
+
+    snippet_tools_cfg = agent_config.get("snippet_tools")
+    if snippet_tools_cfg is not None:
+        args.snippet_tools = _expect_bool(snippet_tools_cfg, key="snippet_tools")
+        applied["snippet_tools"] = args.snippet_tools
 
     user_constraints_cfg = agent_config.get("user_constraints")
     if user_constraints_cfg is not None:
@@ -788,6 +800,7 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
     command.append("--synthesis-enabled" if args.arch_synthesis_enabled else "--no-synthesis-enabled")
     command.append("--validation-enabled" if args.arch_validation_enabled else "--no-validation-enabled")
     command.append("--scratchpads-enabled" if args.arch_scratchpads_enabled else "--no-scratchpads-enabled")
+    command.append("--snippet-tools" if args.snippet_tools else "--no-snippet-tools")
     command.append("--no-analysis")
     return command
 
@@ -850,6 +863,9 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
         "--stateful-tree-max-chars", str(args.stateful_tree_max_chars),
         "--stateful-tree-max-children", str(args.stateful_tree_max_children),
     ])
+    command.append("--snippet-tools" if args.snippet_tools else "--no-snippet-tools")
+    if args.dataset_dir:
+        command.extend(["--dataset-dir", args.dataset_dir])
     return command
 
 
@@ -1117,11 +1133,15 @@ def _expected_validation_gate_enabled_for_variant(variant: str) -> bool | None:
         "ab_retrieval_bm25": True,
         "ab_retrieval_neural_embedding": True,
         "ab_retrieval_one_shot_fingerprint": True,
+        "ab_retrieval_one_shot_fingerprint_budgeted": True,
         "ab_retrieval_iterative_react": True,
         "ab_prev_attempt_ctx_on": True,
         "ab_prev_attempt_ctx_off": True,
         "ab_stateful_tree_on": True,
         "ab_stateful_tree_off": True,
+        "ab_snippet_tools_baseline": False,
+        "ab_snippet_tools_on": True,
+        "ab_snippet_tools_off": True,
     }
     return contract.get(variant)
 
@@ -1154,6 +1174,7 @@ def resolve_classify_retrieval_strategy() -> str:
         "ab_retrieval_bm25": "bm25",
         "ab_retrieval_neural_embedding": "neural_embedding",
         "ab_retrieval_one_shot_fingerprint": "one_shot_fingerprint",
+        "ab_retrieval_one_shot_fingerprint_budgeted": "one_shot_fingerprint_budgeted",
         "ab_retrieval_iterative_react": "iterative_react",
     }
     if args.retrieval_strategy:
@@ -1185,6 +1206,17 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "validation_enabled": True,
         "scratchpads_enabled": True,
         "retrieval_strategy": "one_shot_fingerprint",
+    },
+    "ab_retrieval_one_shot_fingerprint_budgeted": {
+        "phase2_anchor": False,
+        "repo_context_source": "one_shot_fingerprint_budgeted_retrieval",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "one_shot_fingerprint_budgeted",
     },
     "ab_retrieval_neural_embedding": {
         "phase2_anchor": False,
@@ -1275,6 +1307,42 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "scratchpads_enabled": True,
         "retrieval_strategy": "iterative_exploration",
     },
+    "ab_snippet_tools_baseline": {
+        "phase2_anchor": False,
+        "repo_context_source": "staged_pipeline",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
+        "retrieval_strategy": "baseline_one_shot_fingerprint",
+        "snippet_tools_enabled": True,
+    },
+    "ab_snippet_tools_on": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_exploration",
+        "snippet_tools_enabled": True,
+    },
+    "ab_snippet_tools_off": {
+        "phase2_anchor": False,
+        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
+        "classification_required": True,
+        "repair_enabled": True,
+        "exploration_enabled": True,
+        "synthesis_enabled": True,
+        "validation_enabled": True,
+        "scratchpads_enabled": True,
+        "retrieval_strategy": "iterative_exploration",
+        "snippet_tools_enabled": False,
+    },
     "validation": {
         "phase2_anchor": False,
         "repo_context_source": "iterative_exploration_synthesis_validation",
@@ -1349,11 +1417,15 @@ def apply_stateful_contract_by_variant() -> None:
         "ab_retrieval_bm25": (False, False),
         "ab_retrieval_neural_embedding": (False, False),
         "ab_retrieval_one_shot_fingerprint": (False, False),
+        "ab_retrieval_one_shot_fingerprint_budgeted": (False, False),
         "ab_retrieval_iterative_react": (False, False),
         "ab_prev_attempt_ctx_on": (True, False),
         "ab_prev_attempt_ctx_off": (True, False),
         "ab_stateful_tree_on": (True, True),
         "ab_stateful_tree_off": (True, False),
+        "ab_snippet_tools_baseline": (False, False),
+        "ab_snippet_tools_on": (False, False),
+        "ab_snippet_tools_off": (False, False),
     }
     expected = contract.get(args.variant)
     if expected is None:
@@ -1408,6 +1480,8 @@ def main() -> int:
     args.arch_synthesis_enabled = bool(base_variant_policy.get("synthesis_enabled", True))
     args.arch_validation_enabled = bool(base_variant_policy.get("validation_enabled", True))
     args.arch_scratchpads_enabled = bool(base_variant_policy.get("scratchpads_enabled", True))
+    if "snippet_tools_enabled" in base_variant_policy:
+        args.snippet_tools = bool(base_variant_policy["snippet_tools_enabled"])
 
     agent_config_path = _resolve_agent_config_path(workspace_root)
     agent_config_applied: dict = {}

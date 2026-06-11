@@ -16,6 +16,7 @@ except ImportError:
 class ArchitectureLoopState(TypedDict):
     repo_url: str
     repo_name: str
+    repo_path: str
     summary: str
     selected_files: list[str]
     file_context_by_path: dict[str, str]
@@ -28,12 +29,14 @@ class ArchitectureLoopState(TypedDict):
     validation_stop_reason: NotRequired[str]
     l2_to_classify_validation_route_reason: NotRequired[str]
     run_validation: bool
+    l3_retry_count: NotRequired[int]
 
 
 async def run_architecture_state_graph(
     *,
     repo_url: str,
     repo_name: str,
+    repo_path: str,
     summary: str,
     selected_files: list[str],
     exploration_artifact: dict[str, Any],
@@ -44,6 +47,7 @@ async def run_architecture_state_graph(
     synthesis_review_rounds: int,
     validation_react_max_steps: int,
     synthesis_subagents_enabled: bool,
+    snippet_tools_enabled: bool = False,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -56,6 +60,7 @@ async def run_architecture_state_graph(
         synthesis_artifact, synthesis_loop_trace, synthesis_stop_reason = await run_l2_synthesis_loop(
             repo_url=state["repo_url"],
             repo_name=state["repo_name"],
+            repo_path=state["repo_path"],
             selected_files=state["selected_files"],
             summary=state["summary"],
             exploration_artifact=state["exploration_artifact"],
@@ -64,6 +69,7 @@ async def run_architecture_state_graph(
             synthesis_react_max_steps=synthesis_react_max_steps,
             synthesis_review_rounds=synthesis_review_rounds,
             synthesis_subagents_enabled=synthesis_subagents_enabled,
+            snippet_tools_enabled=snippet_tools_enabled,
             new_prebuilt_chat_model=new_prebuilt_chat_model,
             extract_agent_payload=extract_agent_payload,
             extract_agent_trace=extract_agent_trace,
@@ -103,6 +109,7 @@ async def run_architecture_state_graph(
             "validation_artifact": validation_artifact,
             "validation_loop_trace": validation_loop_trace,
             "validation_stop_reason": validation_stop_reason,
+            "l3_retry_count": int(state.get("l3_retry_count", 0)) + 1,
         }
 
     def route_after_l2(state: ArchitectureLoopState) -> str:
@@ -115,17 +122,26 @@ async def run_architecture_state_graph(
             return END
         return "classify_validation"
 
+    def route_after_l3(state: ArchitectureLoopState) -> str:
+        """Escalate back to L2 once when L3 detects zero build evidence (runtime gap)."""
+        validation_artifact = cast(dict[str, Any], state.get("validation_artifact", {}))
+        retry_count = int(state.get("l3_retry_count", 0))
+        if validation_artifact.get("runtime_gap_detected") and retry_count <= 1:
+            return "l2_synthesis"
+        return END
+
     graph.add_node("l2_synthesis", l2_node)
     graph.add_node("classify_validation", classify_validation_node)
     graph.add_edge(START, "l2_synthesis")
     graph.add_conditional_edges("l2_synthesis", route_after_l2, {"classify_validation": "classify_validation", END: END})
-    graph.add_edge("classify_validation", END)
+    graph.add_conditional_edges("classify_validation", route_after_l3, {"l2_synthesis": "l2_synthesis", END: END})
 
     compiled = graph.compile(checkpointer=InMemorySaver(), store=InMemoryStore())
     result = await compiled.ainvoke(
         {
             "repo_url": repo_url,
             "repo_name": repo_name,
+            "repo_path": repo_path,
             "summary": summary,
             "selected_files": selected_files,
             "exploration_artifact": exploration_artifact,

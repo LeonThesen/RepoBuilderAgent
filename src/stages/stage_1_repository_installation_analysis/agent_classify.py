@@ -40,7 +40,7 @@ try:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
+    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
 except ImportError:
@@ -68,7 +68,7 @@ except ImportError:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25
+    from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import preprocess_repository
 
@@ -119,11 +119,12 @@ parser.add_argument("--exploration-enabled", action=argparse.BooleanOptionalActi
 parser.add_argument("--synthesis-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable synthesis-stage artifact generation")
 parser.add_argument("--validation-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable validation-stage artifact generation")
 parser.add_argument("--scratchpads-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable architecture scratchpad artifact generation")
+parser.add_argument("--snippet-tools", action=argparse.BooleanOptionalAction, default=False, help="Enable Dockerfile snippet tools (get_dockerfile_snippet) in L2 synthesis agents")
 parser.add_argument("--no-analysis", action="store_true", help="Skip running the analysis script after completion")
 parser.add_argument(
     "--retrieval-strategy",
     default="iterative_react",
-    choices=["iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint"],
+    choices=["iterative_react", "bm25", "neural_embedding", "one_shot_fingerprint", "one_shot_fingerprint_budgeted"],
     help="Step 1.1 repository evidence-selection strategy.",
 )
 parser.add_argument(
@@ -751,6 +752,7 @@ async def _run_architecture_state_graph(
     *,
     repo_url: str,
     repo_name: str,
+    repo_path: "Path",
     summary: str,
     selected_files: list[str],
     exploration_artifact: dict[str, Any],
@@ -760,6 +762,7 @@ async def _run_architecture_state_graph(
     return await _run_architecture_state_graph_impl(
         repo_url=repo_url,
         repo_name=repo_name,
+        repo_path=str(repo_path),
         summary=summary,
         selected_files=selected_files,
         exploration_artifact=exploration_artifact,
@@ -770,6 +773,7 @@ async def _run_architecture_state_graph(
         synthesis_review_rounds=args.synthesis_review_rounds,
         validation_react_max_steps=args.validation_react_max_steps,
         synthesis_subagents_enabled=args.synthesis_subagents_enabled,
+        snippet_tools_enabled=args.snippet_tools,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         extract_agent_payload=_extract_agent_payload,
         extract_agent_trace=_extract_agent_trace,
@@ -1017,6 +1021,23 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 )
                 selected_files = []
                 log_info(f"Using static repo fingerprint for {repo_name} via one-shot retrieval.")
+            elif args.retrieval_strategy == "one_shot_fingerprint_budgeted":
+                _budgeted_files = select_files_by_bm25_budgeted(
+                    repo_path, build_bm25_query_terms(repo_name, prior_failure_terms)
+                )
+                baseline_summary = fingerprint(
+                    format="md",
+                    repo_path=str(repo_path),
+                    structure_only=False,
+                    selected_files=_budgeted_files if _budgeted_files else None,
+                    include_tree=True,
+                    context="step2-one-shot-fingerprint-budgeted",
+                )
+                selected_files = []
+                log_info(
+                    f"Using budgeted repo fingerprint for {repo_name} via one-shot-budgeted retrieval "
+                    f"({len(_budgeted_files)} files selected)."
+                )
             elif args.retrieval_strategy == "iterative_react":
                 if prior_failure_summary:
                     structure_summary = (
@@ -1027,6 +1048,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 selected_files, step1_tokens, react_trace, react_stop_reason = await select_files_by_iterative_react(
                     repo_url=repo_url,
                     repo_name=repo_name,
+                    repo_path=repo_path,
                     structure_summary=structure_summary,
                     default_selected_files=default_selected_files,
                     model_name=args.model,
@@ -1052,7 +1074,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
 
             selected_files_before_budget = selected_files.copy()
             budget_behavior = {
-                "enabled": bool(args.step2_token_budget > 0 and args.retrieval_strategy != "one_shot_fingerprint"),
+                "enabled": bool(args.step2_token_budget > 0 and args.retrieval_strategy not in {"one_shot_fingerprint", "one_shot_fingerprint_budgeted"}),
                 "token_budget": int(args.step2_token_budget),
                 "initial_selected_files_count": len(selected_files_before_budget),
                 "post_budget_selected_files_count": len(selected_files_before_budget),
@@ -1066,7 +1088,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 "hard_enforcement_applied": False,
             }
 
-            if args.retrieval_strategy != "one_shot_fingerprint" and args.step2_token_budget > 0:
+            if args.retrieval_strategy not in {"one_shot_fingerprint", "one_shot_fingerprint_budgeted"} and args.step2_token_budget > 0:
                 estimated_before = _estimate_step2_prompt_tokens_from_selected_files(
                     repo_path,
                     repo_url,
@@ -1109,7 +1131,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     )
                 log_info(f"ReAct retrieval trace saved at {react_trace_path}")
 
-            if args.retrieval_strategy not in {"bm25", "neural_embedding", "one_shot_fingerprint", "iterative_react"}:
+            if args.retrieval_strategy not in {"bm25", "neural_embedding", "one_shot_fingerprint", "one_shot_fingerprint_budgeted", "iterative_react"}:
                 selection_prompt = (
                     SELECT_FILES_PROMPT_TEMPLATE
                     .replace("{{REPO_URL}}", repo_url)
@@ -1197,6 +1219,15 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 )
             ]
 
+            # SP1: extract files the L1 agent actually read/listed from the trace.
+            _files_read_by_l1: list[dict[str, str]] = []
+            for _evt in react_trace:
+                for _tc in (_evt.get("tool_calls") or []):
+                    if isinstance(_tc, dict) and _tc.get("name") in {"read_file", "list_tree"}:
+                        _path = (_tc.get("args") or {}).get("path")
+                        if _path:
+                            _files_read_by_l1.append({"tool": _tc["name"], "path": str(_path)})
+
             exploration_artifact = {
                 "repo": repo_url,
                 "stage": "exploration",
@@ -1206,6 +1237,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     "stop_reason": react_stop_reason,
                 },
                 "high_signal_files": high_signal_files,
+                "files_read_by_l1": _files_read_by_l1,
                 "evidence_gaps": {
                     "manifest_evidence_missing": not has_manifest,
                     "ci_workflow_evidence_missing": not has_ci,
@@ -1226,7 +1258,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 log_info(f"Exploration artifact saved at {exploration_path}")
 
             # Step 2: only selected file contents are provided to the classification prompt.
-            if args.retrieval_strategy == "one_shot_fingerprint":
+            if args.retrieval_strategy in {"one_shot_fingerprint", "one_shot_fingerprint_budgeted"}:
                 summary = baseline_summary
             else:
                 summary = fingerprint(
@@ -1298,22 +1330,69 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             log_info(f"Generated selected-files summary at {summary_path}")
 
             file_context_by_path = _build_file_context_by_path(repo_path)
-            (
-                synthesis_artifact,
-                synthesis_loop_trace,
-                synthesis_stop_reason,
-                validation_artifact,
-                validation_loop_trace,
-                validation_stop_reason,
-            ) = await _run_architecture_state_graph(
-                repo_url=repo_url,
-                repo_name=repo_name,
-                summary=summary,
-                selected_files=selected_files,
-                exploration_artifact=exploration_artifact,
-                file_context_by_path=file_context_by_path,
-                llm_metrics=llm_metrics,
-            )
+            _l1_escalation_count = 0
+            _graph_selected_files = selected_files
+            _graph_summary = summary
+            while True:
+                (
+                    synthesis_artifact,
+                    synthesis_loop_trace,
+                    synthesis_stop_reason,
+                    validation_artifact,
+                    validation_loop_trace,
+                    validation_stop_reason,
+                ) = await _run_architecture_state_graph(
+                    repo_url=repo_url,
+                    repo_name=repo_name,
+                    repo_path=repo_path,
+                    summary=_graph_summary,
+                    selected_files=_graph_selected_files,
+                    exploration_artifact=exploration_artifact,
+                    file_context_by_path=file_context_by_path,
+                    llm_metrics=llm_metrics,
+                )
+                # L2→L1 escalation: re-run L1 with doubled steps when L2 found no stack signals.
+                # Only triggers for iterative_react strategy (others have no L1 to re-run).
+                if (
+                    synthesis_artifact.get("stack_unknown")
+                    and _l1_escalation_count < 1
+                    and args.retrieval_strategy == "iterative_react"
+                ):
+                    _l1_escalation_count += 1
+                    log_info(
+                        f"Stack unknown for {repo_name} — escalating to L1 re-run "
+                        f"(attempt {_l1_escalation_count}, react_max_steps={args.react_max_steps * 2})."
+                    )
+                    _rerun_files, _, _, _ = await select_files_by_iterative_react(
+                        repo_url=repo_url,
+                        repo_name=repo_name,
+                        repo_path=repo_path,
+                        structure_summary=structure_summary,
+                        default_selected_files=default_selected_files,
+                        model_name=args.model,
+                        selection_timeout=args.selection_timeout,
+                        react_max_steps=args.react_max_steps * 2,
+                        react_max_total_files=args.react_max_total_files,
+                        react_final_cap=args.react_final_cap,
+                        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+                        extract_agent_payload=_extract_agent_payload,
+                        extract_agent_trace=_extract_agent_trace,
+                        normalize_text_list=_normalize_text_list,
+                        estimate_tokens=estimate_tokens,
+                    )
+                    if _rerun_files:
+                        _graph_selected_files = _rerun_files
+                        _graph_summary = fingerprint(
+                            format="md",
+                            repo_path=str(repo_path),
+                            selected_files=_graph_selected_files,
+                            include_tree=False,
+                            context="l1-escalation-step2",
+                        )
+                    continue
+                break
+            selected_files = _graph_selected_files
+            summary = _graph_summary
             synthesis_path = None
             if args.synthesis_enabled:
                 synthesis_path = summary_dir / f"{repo_name}.synthesis.yaml"

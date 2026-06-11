@@ -118,6 +118,73 @@ def build_ground_truth_index(dataset_dir: Path) -> dict[str, Path]:
     return index
 
 
+def load_gt_for_repo(dataset_dir: Path, repo_url: str) -> Optional[dict]:
+    """Load the ground truth YAML for a single repo URL. Returns None if not found."""
+    index = build_ground_truth_index(dataset_dir)
+    gt_path = index.get(repo_url.rstrip("/"))
+    return _load_yaml(gt_path) if gt_path else None
+
+
+def get_gt_verify_commands(gt_doc: dict) -> list[str]:
+    """Extract verification commands from a GT YAML document as a list of strings."""
+    if not gt_doc:
+        return []
+    v = gt_doc.get("categories", {}).get("verification", {})
+    if not v:
+        return []
+    cmds = v.get("value", [])
+    if isinstance(cmds, str):
+        return [cmds] if cmds.strip() else []
+    return [c for c in cmds if isinstance(c, str) and c.strip()]
+
+
+def get_gt_key_artifact(gt_doc: dict, verify_commands: list[str]) -> Optional[dict]:
+    """
+    Find the key final artifact for binary size/hash comparison.
+
+    Strategy: extract relative file paths referenced in verify commands
+    (e.g. 'target/release/bat --version' → 'target/release/bat'),
+    then match against the GT artifacts list.
+
+    Returns {'path': str, 'size_bytes': int|None, 'digest': str|None} or None.
+    """
+    if not gt_doc or not verify_commands:
+        return None
+    artifacts = gt_doc.get("categories", {}).get("artifacts", {}).get("value", [])
+    if not artifacts:
+        return None
+
+    # Collect candidate relative paths from verify commands.
+    # A token is a candidate if it contains '/' and doesn't look like a flag or env var.
+    candidate_paths: set[str] = set()
+    for cmd in verify_commands:
+        parts = cmd.strip().split()
+        for part in parts:
+            if "/" in part and not part.startswith("-") and not part.startswith("$") and not part.startswith("http"):
+                # Strip leading './' so paths match artifact locations
+                candidate_paths.add(part.lstrip("./"))
+
+    if not candidate_paths:
+        return None
+
+    artifact_by_loc: dict[str, dict] = {}
+    for art in artifacts:
+        loc = art.get("location", "").lstrip("./")
+        if loc:
+            artifact_by_loc[loc] = art
+
+    for cand in candidate_paths:
+        art = artifact_by_loc.get(cand)
+        if art:
+            return {
+                "path": art.get("location", cand),
+                "size_bytes": art.get("size_bytes"),
+                "digest": art.get("digest"),
+            }
+
+    return None
+
+
 def observe_dockerfile(workspace_root: Path, repo_url: str, dockerfiles_dir: str = "dockerfiles") -> dict:
     """
     Parse the generated Dockerfile to extract observed build facts:
@@ -446,6 +513,7 @@ def compute_repo_metrics(
                         pass
                 break
 
+        binary_metrics_raw = report.get("binary_metrics") or {}
         repair_metrics = {
             "build_success": build_success,
             "first_attempt_success": bool(build_success and successful_attempt == 1),
@@ -455,6 +523,8 @@ def compute_repo_metrics(
             "successful_attempt": successful_attempt,
             "first_failure_mode": first_failure_mode,
             "error_recurrence": detect_error_recurrence(attempts),
+            "binary_size_plausible": binary_metrics_raw.get("binary_size_plausible"),
+            "binary_hash_match": binary_metrics_raw.get("binary_hash_match"),
         }
 
     dockerfile_metrics = analyze_dockerfile(workspace_root, repo_url, dockerfiles_dir)
@@ -498,6 +568,9 @@ def compute_aggregate_metrics(results: list[dict]) -> dict:
     first_attempt = [r for r in results if r.get("metrics", {}).get("repair", {}).get("first_attempt_success")]
     repair_salvaged = [r for r in results if r.get("metrics", {}).get("repair", {}).get("repair_salvaged")]
     verify_passed = [r for r in results if r.get("metrics", {}).get("repair", {}).get("verification_passed")]
+    # binary_size_plausible: only count repos where GT binary info was available (not None)
+    binary_plausible_applicable = [r for r in results if r.get("metrics", {}).get("repair", {}).get("binary_size_plausible") is not None]
+    binary_plausible_pass = [r for r in binary_plausible_applicable if r["metrics"]["repair"]["binary_size_plausible"] is True]
 
     total_tokens: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
     for r in results:
@@ -553,6 +626,7 @@ def compute_aggregate_metrics(results: list[dict]) -> dict:
         "first_attempt_success_rate": round(len(first_attempt) / total, 4),
         "repair_salvage_rate": round(len(repair_salvaged) / total, 4),
         "verification_pass_rate": round(len(verify_passed) / total, 4),
+        "binary_size_plausible_rate": round(len(binary_plausible_pass) / len(binary_plausible_applicable), 4) if binary_plausible_applicable else None,
         "total_tokens": total_tokens,
         "avg_tokens_per_repo": {k: round(total_tokens[k] / total) for k in total_tokens} if total else {},
         "attempts_to_success_histogram": dict(sorted(attempt_histogram.items())),

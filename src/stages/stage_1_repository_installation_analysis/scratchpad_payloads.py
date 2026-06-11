@@ -45,6 +45,7 @@ def build_architecture_scratchpad_payload(
                 "react_stop_reason": react_stop_reason,
                 "exploration_artifact_path": str(exploration_path) if exploration_path else None,
                 "evidence_gaps": exploration_artifact["evidence_gaps"],
+                "files_read_by_l1": exploration_artifact.get("files_read_by_l1", []),
                 "react_trace": react_trace,
             },
             "synthesis": {
@@ -57,6 +58,8 @@ def build_architecture_scratchpad_payload(
                 "subagents_enabled": subagents_enabled,
                 "subagent_outputs": synthesis_artifact["subagent_outputs"],
                 "abstraction": synthesis_artifact.get("abstraction_l2", {}),
+                "per_source_confidence": synthesis_artifact.get("per_source_confidence", {}),
+                "unknown_markers": synthesis_artifact.get("unknown_markers", []),
                 "transition_policy": synthesis_artifact.get("transition_policy", {}),
                 "loop_checkpoint": synthesis_artifact.get("loop_checkpoint", {}),
                 "react_trace": synthesis_loop_trace,

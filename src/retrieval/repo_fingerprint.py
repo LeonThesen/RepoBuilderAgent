@@ -24,9 +24,19 @@ except ImportError:
 # Config Loading
 # ---------------------------------------------------------------------------
 
+def _find_config_dir() -> Path:
+    """Walk ancestor directories until config/manifest-files.yaml is found."""
+    current = Path(__file__).resolve().parent
+    for _ in range(8):
+        if (current / "config" / "manifest-files.yaml").exists():
+            return current / "config"
+        current = current.parent
+    return Path(__file__).parent.parent / "config"  # original fallback
+
+
 def load_config() -> tuple[set, list, dict]:
     """Load manifest patterns from config YAML files."""
-    config_dir = Path(__file__).parent.parent / "config"
+    config_dir = _find_config_dir()
     
     # Load manifest-files.yaml
     manifest_path = config_dir / "manifest-files.yaml"
@@ -510,6 +520,105 @@ def select_files_by_bm25(root: Path, query_terms: list[str], top_k: int = 12) ->
 
     ranked.sort(key=lambda item: (-item[0], item[1]))
     return [rel for _, rel in ranked[:top_k]]
+
+
+def select_files_by_bm25_budgeted(
+    root: Path, query_terms: list[str], token_budget: int = 6000
+) -> list[str]:
+    """BM25-rank candidates then fill a token budget top-down.
+
+    Uses character length / 4 as a conservative token estimate so the resulting
+    fingerprint stays within model context limits regardless of repo size.
+    """
+    candidates = collect_retrieval_candidates(root)
+    if not candidates:
+        return []
+
+    high_signal_names = {
+        "readme.md", "readme.rst", "readme.txt", "install.md", "install.txt",
+        "pyproject.toml", "requirements.txt", "package.json", "package-lock.json",
+        "yarn.lock", "pnpm-lock.yaml", "go.mod", "cargo.toml", "dockerfile",
+        "docker-compose.yml", "docker-compose.yaml", "makefile", "cmakelists.txt",
+        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+        "settings.gradle.kts", "gradlew", "gemfile", "composer.json",
+        "setup.py", "setup.cfg", "pipfile", "pipfile.lock", ".env.example",
+    }
+
+    normalized_terms: list[str] = []
+    seen_terms: set[str] = set()
+    for term in query_terms:
+        for token in _tokenize_text(term):
+            if token and token not in seen_terms:
+                seen_terms.add(token)
+                normalized_terms.append(token)
+
+    def _fill_budget(ordered: list[tuple[str, str]]) -> list[str]:
+        selected: list[str] = []
+        tokens_used = 0
+        for rel, content in ordered:
+            cost = max(1, len(content) // 4)
+            if tokens_used + cost > token_budget and selected:
+                break
+            selected.append(rel)
+            tokens_used += cost
+        return selected
+
+    if not normalized_terms:
+        return _fill_budget(candidates)
+
+    documents: list[tuple[str, list[str]]] = []
+    content_by_rel: dict[str, str] = {}
+    document_frequency: dict[str, int] = {}
+    total_length = 0
+
+    for rel, content in candidates:
+        tokens = _tokenize_text(f"{rel}\n{content}") or _tokenize_text(rel)
+        documents.append((rel, tokens))
+        content_by_rel[rel] = content
+        total_length += len(tokens)
+        for token in set(tokens):
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+
+    avg_doc_length = total_length / len(documents) if documents else 0.0
+    k1 = 1.5
+    b = 0.75
+    ranked: list[tuple[float, str]] = []
+
+    for rel, tokens in documents:
+        if not tokens:
+            continue
+        token_counts: dict[str, int] = {}
+        for token in tokens:
+            token_counts[token] = token_counts.get(token, 0) + 1
+
+        doc_length = len(tokens)
+        norm = k1 * (1 - b + b * (doc_length / avg_doc_length)) if avg_doc_length else k1
+        score = 0.0
+        for term in normalized_terms:
+            tf = token_counts.get(term, 0)
+            if tf <= 0:
+                continue
+            n_docs = document_frequency.get(term, 0)
+            idf = math.log(1 + ((len(documents) - n_docs + 0.5) / (n_docs + 0.5)))
+            score += idf * ((tf * (k1 + 1)) / (tf + norm))
+
+        rel_lower = rel.lower()
+        basename = Path(rel_lower).name
+        if basename in high_signal_names:
+            score += 2.5
+        elif basename.startswith(("readme", "install")):
+            score += 1.5
+        if rel_lower.startswith(".github/workflows/"):
+            score += 0.25
+
+        if score > 0:
+            ranked.append((score, rel))
+
+    if not ranked:
+        return _fill_budget(candidates)
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return _fill_budget([(rel, content_by_rel.get(rel, "")) for _, rel in ranked])
 
 
 def collect_metadata(root: Path) -> dict:
