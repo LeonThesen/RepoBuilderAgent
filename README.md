@@ -2,8 +2,6 @@
 
 ## Runtime Dependencies
 
-The classification architecture stage now uses LangChain/LangGraph prebuilt agents.
-
 Install required packages into the workspace virtual environment:
 
 ```bash
