@@ -1,10 +1,103 @@
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import yaml
 from langchain_core.tools import tool
+
+# Reserves headroom under the model's ~60k input cap for the system prompt + the
+# model's own response. create_react_agent re-sends the FULL accumulated message
+# history on every turn, so we trim the per-turn input down to this budget.
+HISTORY_BUDGET = 48000
+
+
+def tool_call_budget(recursion_limit: int) -> int:
+    """Max tool calls an agent can make under a given LangGraph recursion_limit.
+
+    Each tool call costs ~2 graph nodes (the model turn + the tool turn); we leave
+    one node for the finalize call. Floored at 1 so prompts never advertise 0 calls.
+    """
+    return max(1, int(recursion_limit) // 2 - 1)
+
+
+def _message_token_counter(model_name: str) -> "Callable[[list[Any]], int]":
+    """Return a token_counter(list[messages]) -> int using tiktoken.
+
+    Falls back to cl100k_base when the model name is unknown. Adds ~4 tokens of
+    per-message overhead, which is the standard chat-format framing fudge factor.
+    """
+    import tiktoken
+
+    try:
+        encoding = tiktoken.encoding_for_model(model_name)
+    except Exception:
+        encoding = tiktoken.get_encoding("cl100k_base")
+
+    def _count(messages: "list[Any]") -> int:
+        total = 0
+        for message in messages:
+            content = getattr(message, "content", message)
+            text = content if isinstance(content, str) else str(content)
+            total += len(encoding.encode(text)) + 4
+        return total
+
+    return _count
+
+
+def make_history_trim_hook(model_name: str, max_tokens: int) -> "Callable[[dict], dict]":
+    """Build a create_react_agent pre_model_hook that caps accumulated history.
+
+    create_react_agent re-sends the entire message history (every tool observation)
+    on every model turn with no built-in trimming, so token usage grows unbounded
+    over a ReAct loop. This hook keeps the system message plus the most-recent
+    messages that fit under max_tokens and returns them via "llm_input_messages"
+    (which feeds the model WITHOUT mutating the persisted state["messages"]).
+    """
+    from langchain_core.messages import trim_messages
+
+    token_counter = _message_token_counter(model_name)
+
+    def hook(state: dict) -> dict:
+        messages = (state or {}).get("messages") or []
+        if not messages:
+            return {"llm_input_messages": messages}
+        try:
+            trimmed = trim_messages(
+                messages,
+                strategy="last",
+                token_counter=token_counter,
+                max_tokens=max_tokens,
+                include_system=True,
+                start_on="human",
+                allow_partial=False,
+            )
+            if trimmed:
+                return {"llm_input_messages": trimmed}
+        except Exception:
+            pass
+        # Manual fallback: keep the leading system message (if any) + as many of the
+        # most-recent messages as fit under the budget.
+        from langchain_core.messages import SystemMessage
+
+        system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+        head = system_msgs[:1]
+        base_cost = token_counter(head) if head else 0
+        kept_tail: list[Any] = []
+        running = base_cost
+        for message in reversed([m for m in messages if m not in head]):
+            cost = token_counter([message])
+            if running + cost > max_tokens and kept_tail:
+                break
+            kept_tail.append(message)
+            running += cost
+        kept_tail.reverse()
+        result = head + kept_tail
+        if not result:
+            result = messages[-1:]
+        return {"llm_input_messages": result}
+
+    return hook
 
 _SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", "env",

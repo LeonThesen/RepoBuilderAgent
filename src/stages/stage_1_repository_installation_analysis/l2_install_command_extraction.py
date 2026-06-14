@@ -5,6 +5,7 @@ from langgraph.prebuilt import create_react_agent
 
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
+        HISTORY_BUDGET,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_get_dockerfile_snippet_tool,
@@ -16,11 +17,14 @@ try:
         build_think_tool,
         extract_finalize_answer,
         hit_step_limit,
+        make_history_trim_hook,
+        tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
     from agent_tools.react_loop_tools import (
+        HISTORY_BUDGET,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_get_dockerfile_snippet_tool,
@@ -32,6 +36,8 @@ except ImportError:
         build_think_tool,
         extract_finalize_answer,
         hit_step_limit,
+        make_history_trim_hook,
+        tool_call_budget,
     )
     from core.common import prompt_path
     from core.log_utils import log_warn
@@ -49,6 +55,7 @@ async def _invoke_signal_subagent(
     prompt_body: str,
     deterministic_fallback: list[str],
     classification_timeout: int,
+    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -58,10 +65,12 @@ async def _invoke_signal_subagent(
     search_selected_files,
     fetch_file_context,
 ) -> dict[str, Any]:
+    recursion_limit = 16
     signal_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
         prompt=prompt_path("PROMPT_L2_SIGNAL_SYSTEM.md").read_text(encoding="utf-8").strip(),
+        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
     subagent_prompt = (
@@ -69,12 +78,13 @@ async def _invoke_signal_subagent(
         .replace("{{REPO_NAME}}", repo_name)
         .replace("{{SUBAGENT_NAME}}", name)
         .replace("{{PROMPT_BODY}}", prompt_body)
+        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
     result = await signal_agent.ainvoke(
         {"messages": [{"role": "user", "content": subagent_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:{name}"}, "recursion_limit": 16},
+        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:{name}"}, "recursion_limit": recursion_limit},
     )
     payload = extract_agent_payload(result)
     signal = normalize_text_list(payload.get("signal") if isinstance(payload, dict) else [])
@@ -105,6 +115,7 @@ async def _invoke_gap_subagent(
     scripts_signals: dict[str, Any],
     source_signals: dict[str, Any],
     classification_timeout: int,
+    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -114,10 +125,12 @@ async def _invoke_gap_subagent(
     search_selected_files,
     fetch_file_context,
 ) -> dict[str, Any]:
+    recursion_limit = 16
     gap_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
         prompt=prompt_path("PROMPT_L2_GAPCHECK_SYSTEM.md").read_text(encoding="utf-8").strip(),
+        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
     def _format_signal(sig: dict) -> str:
@@ -137,12 +150,13 @@ async def _invoke_gap_subagent(
         .replace("{{RUNTIME_SIGNALS}}", _format_signal(runtime_signals))
         .replace("{{SCRIPTS_SIGNALS}}", _format_signal(scripts_signals))
         .replace("{{SOURCE_SIGNALS}}", _format_signal(source_signals))
+        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
     result = await gap_agent.ainvoke(
         {"messages": [{"role": "user", "content": gap_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:gap-check"}, "recursion_limit": 16},
+        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:gap-check"}, "recursion_limit": recursion_limit},
     )
     payload = extract_agent_payload(result)
     trace = extract_agent_trace(result)
@@ -198,6 +212,7 @@ async def _run_synthesis_subagents(
     selected_files: list[str],
     summary: str,
     classification_timeout: int,
+    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -242,6 +257,7 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify top manifest/build-declaration files (e.g. package.json, pyproject.toml, Cargo.toml, pom.xml, go.mod) relevant for build and dependency planning.",
                 deterministic_fallback=build_fallback,
                 classification_timeout=classification_timeout,
+                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
                 extract_agent_payload=extract_agent_payload,
                 extract_agent_trace=extract_agent_trace,
@@ -262,6 +278,7 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify containerization and runtime files (e.g. Dockerfile, docker-compose.yml, Nix flakes, Vagrantfile) that describe the full execution stack.",
                 deterministic_fallback=runtime_fallback,
                 classification_timeout=classification_timeout,
+                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
                 extract_agent_payload=extract_agent_payload,
                 extract_agent_trace=extract_agent_trace,
@@ -282,6 +299,7 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify build/install helper scripts (e.g. Makefile, setup.sh, install.sh, files in /bin or /scripts) that document manual installation steps.",
                 deterministic_fallback=scripts_fallback,
                 classification_timeout=classification_timeout,
+                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
                 extract_agent_payload=extract_agent_payload,
                 extract_agent_trace=extract_agent_trace,
@@ -302,6 +320,7 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify source files that reveal implicit dependencies: files with import statements, .env / config files listing required ENV variables, or source files containing error strings that hint at missing system dependencies.",
                 deterministic_fallback=source_fallback,
                 classification_timeout=classification_timeout,
+                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
                 extract_agent_payload=extract_agent_payload,
                 extract_agent_trace=extract_agent_trace,
@@ -325,6 +344,7 @@ async def _run_synthesis_subagents(
                 scripts_signals=state.get("scripts") or {},
                 source_signals=state.get("source") or {},
                 classification_timeout=classification_timeout,
+                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
                 extract_agent_payload=extract_agent_payload,
                 extract_agent_trace=extract_agent_trace,
@@ -376,6 +396,7 @@ async def run_l2_synthesis_loop(
     synthesis_subagents_enabled: bool,
     synthesis_review_rounds: int,
     snippet_tools_enabled: bool = False,
+    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -420,6 +441,7 @@ async def run_l2_synthesis_loop(
             selected_files=selected_snapshot,
             summary=summary,
             classification_timeout=classification_timeout,
+            model_name=model_name,
             new_prebuilt_chat_model=new_prebuilt_chat_model,
             extract_agent_payload=extract_agent_payload,
             extract_agent_trace=extract_agent_trace,
@@ -441,14 +463,19 @@ async def run_l2_synthesis_loop(
         "(call with action='list_actions' to see all options). "
         if get_dockerfile_snippet is not None else ""
     )
+    # Shared by the generator and every reviewer round so the prompt budget and the
+    # graph config stay consistent.
+    synthesis_recursion_limit = max(20, int(synthesis_react_max_steps) * 6)
     synthesis_generator = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=_generator_tools,
         prompt=(
             prompt_path("PROMPT_L2_SYNTHESIS_GENERATOR_SYSTEM.md").read_text(encoding="utf-8")
             .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint_generator)
+            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
             .strip()
         ),
+        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
     synthesis_prompt = (
@@ -457,12 +484,13 @@ async def run_l2_synthesis_loop(
         .replace("{{CURRENT_HYPOTHESES}}", "\n".join(f"- {item}" for item in base_hypotheses[:20]))
         .replace("{{CURRENT_RISKS}}", "\n".join(f"- {item}" for item in risk_notes[:20]) if risk_notes else "- (none)")
         .replace("{{SUBAGENT_SIGNALS}}", str(subagent_outputs[:4]))
+        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
     generation_result = await synthesis_generator.ainvoke(
         {"messages": [{"role": "user", "content": synthesis_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": max(20, int(synthesis_react_max_steps) * 6)},
+        config={"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": synthesis_recursion_limit},
     )
     generation_payload = extract_agent_payload(generation_result)
     updates = normalize_text_list(generation_payload.get("hypothesis_updates") if isinstance(generation_payload, dict) else [])
@@ -494,8 +522,10 @@ async def run_l2_synthesis_loop(
         prompt=(
             prompt_path("PROMPT_L2_SYNTHESIS_REVIEWER_SYSTEM.md").read_text(encoding="utf-8")
             .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint_reviewer)
+            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
             .strip()
         ),
+        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
     review_hypotheses = generated_hypotheses[:]
@@ -515,6 +545,7 @@ async def run_l2_synthesis_loop(
             .replace("{{GENERATOR_HYPOTHESES}}", "\n".join(f"- {item}" for item in review_hypotheses[:30]))
             .replace("{{GENERATOR_RISKS}}", "\n".join(f"- {item}" for item in review_risks[:30]) if review_risks else "- (none)")
             .replace("{{SUBAGENT_SIGNALS}}", str(subagent_outputs[:4]))
+            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
             .replace("{{SUMMARY_EVIDENCE}}", summary)
         )
 
@@ -522,7 +553,7 @@ async def run_l2_synthesis_loop(
             {"messages": [{"role": "user", "content": reviewer_prompt}]},
             config={
                 "configurable": {"thread_id": f"{repo_name}:l2-review:r{round_index + 1}"},
-                "recursion_limit": max(20, int(synthesis_react_max_steps) * 6),
+                "recursion_limit": synthesis_recursion_limit,
             },
         )
         review_rounds_executed += 1

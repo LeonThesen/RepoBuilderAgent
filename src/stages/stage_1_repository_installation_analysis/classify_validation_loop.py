@@ -5,6 +5,7 @@ from langgraph.prebuilt import create_react_agent
 
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
+        HISTORY_BUDGET,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_list_selected_files_tool,
@@ -12,11 +13,14 @@ try:
         build_think_tool,
         extract_finalize_answer,
         hit_step_limit,
+        make_history_trim_hook,
+        tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
     from agent_tools.react_loop_tools import (
+        HISTORY_BUDGET,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_list_selected_files_tool,
@@ -24,6 +28,8 @@ except ImportError:
         build_think_tool,
         extract_finalize_answer,
         hit_step_limit,
+        make_history_trim_hook,
+        tool_call_budget,
     )
     from core.common import prompt_path
     from core.log_utils import log_warn
@@ -57,6 +63,7 @@ async def run_classify_validation_loop(
     file_context_by_path: dict[str, str],
     classification_timeout: int,
     validation_react_max_steps: int,
+    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
@@ -100,10 +107,12 @@ async def run_classify_validation_loop(
     search_selected_files = build_search_selected_files_tool(selected_files)
     think = build_think_tool()
 
+    recursion_limit = max(20, int(validation_react_max_steps) * 6)
     validation_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
         tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
         prompt=prompt_path("PROMPT_L1_VALIDATION_SYSTEM.md").read_text(encoding="utf-8").strip(),
+        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
     compact_synthesis = _compact_synthesis_for_validation(synthesis_artifact)
@@ -114,12 +123,13 @@ async def run_classify_validation_loop(
         .replace("{{REPO_URL}}", repo_url)
         .replace("{{CURRENT_CHECKS}}", yaml.dump(checks, sort_keys=False, allow_unicode=True))
         .replace("{{SYNTHESIS_ARTIFACT}}", yaml.dump(compact_synthesis, sort_keys=False, allow_unicode=True))
+        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", compact_summary)
     )
 
     result = await validation_agent.ainvoke(
         {"messages": [{"role": "user", "content": validation_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": max(20, int(validation_react_max_steps) * 6)},
+        config={"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": recursion_limit},
     )
     payload = extract_agent_payload(result)
     parsed_checks = normalize_validation_checks(payload.get("checks") if isinstance(payload, dict) else {})

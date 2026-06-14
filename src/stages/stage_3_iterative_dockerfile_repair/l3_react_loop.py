@@ -8,17 +8,23 @@ try:
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.log_utils import log_warn
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
+        HISTORY_BUDGET,
         build_finalize_tool,
         extract_finalize_answer,
         hit_step_limit,
+        make_history_trim_hook,
+        tool_call_budget,
     )
 except ImportError:
     from core.common import prompt_path
     from core.log_utils import log_warn
     from agent_tools.react_loop_tools import (
+        HISTORY_BUDGET,
         build_finalize_tool,
         extract_finalize_answer,
         hit_step_limit,
+        make_history_trim_hook,
+        tool_call_budget,
     )
 
 
@@ -128,6 +134,7 @@ async def run_l3_dockerfile_repair_react(
     prompt: str,
     repair_timeout: int,
     l3_react_max_steps: int,
+    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
     build_think_tool: Callable[[], Any],
     build_hadolint_snippet_tool: Callable[[], Any],
@@ -150,21 +157,24 @@ async def run_l3_dockerfile_repair_react(
         "(call with action='list_actions' to see all available snippets). "
         if build_snippet_tool is not None else ""
     )
+    recursion_limit = max(8, int(l3_react_max_steps) * 4)
     repair_agent = create_react_agent(
         model=new_prebuilt_chat_model(repair_timeout),
         tools=tools,
         prompt=(
             prompt_path("PROMPT_L3_REPAIR_SYSTEM.md").read_text(encoding="utf-8")
             .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint)
+            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
             .strip()
         ),
+        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
     result = await repair_agent.ainvoke(
         {"messages": [{"role": "user", "content": prompt}]},
         config={
             "configurable": {"thread_id": f"{repo_url}:l3-repair:{attempt_number}"},
-            "recursion_limit": max(8, int(l3_react_max_steps) * 4),
+            "recursion_limit": recursion_limit,
         },
     )
 
@@ -201,21 +211,24 @@ async def run_l3_verification_command_react(
     thread_suffix: str,
     system_prompt: str,
     candidate_keys: list[str],
+    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
     build_think_tool: Callable[[], Any],
 ) -> tuple[str, int]:
     think = build_think_tool()
+    recursion_limit = max(8, int(l3_react_max_steps) * 4)
     verify_agent = create_react_agent(
         model=new_prebuilt_chat_model(verify_timeout),
         tools=[think, build_finalize_tool()],
-        prompt=system_prompt,
+        prompt=system_prompt.replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit))),
+        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
     result = await verify_agent.ainvoke(
         {"messages": [{"role": "user", "content": prompt}]},
         config={
             "configurable": {"thread_id": f"{repo_url}:{thread_suffix}"},
-            "recursion_limit": max(8, int(l3_react_max_steps) * 4),
+            "recursion_limit": recursion_limit,
         },
     )
 

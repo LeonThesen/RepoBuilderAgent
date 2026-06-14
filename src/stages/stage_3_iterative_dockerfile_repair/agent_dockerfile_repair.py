@@ -912,6 +912,7 @@ async def request_repair(
         prompt=prompt,
         repair_timeout=args.repair_timeout,
         l3_react_max_steps=args.l3_react_max_steps,
+        model_name=args.model,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         build_think_tool=build_think_tool,
         build_hadolint_snippet_tool=build_hadolint_snippet_tool,
@@ -1014,6 +1015,7 @@ async def request_verification_command_repair(
         thread_suffix="l3-verify-repair",
         system_prompt=VERIFY_REPAIR_SYSTEM_PROMPT,
         candidate_keys=["verification_command", "verify_command", "repaired_verification_command", "command"],
+        model_name=args.model,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         build_think_tool=build_think_tool,
     )
@@ -1067,6 +1069,7 @@ async def request_verification_command_refresh(
         thread_suffix="l3-verify-refresh",
         system_prompt=VERIFY_REFRESH_SYSTEM_PROMPT,
         candidate_keys=["verification_command", "verify_command", "refreshed_verification_command", "command"],
+        model_name=args.model,
         new_prebuilt_chat_model=_new_prebuilt_chat_model,
         build_think_tool=build_think_tool,
     )

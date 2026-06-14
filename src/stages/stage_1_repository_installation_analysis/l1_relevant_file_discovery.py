@@ -15,6 +15,7 @@ try:
         build_search_structure_paths_tool,
         build_select_default_files_tool,
         build_think_tool,
+        tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
 except ImportError:
@@ -28,6 +29,7 @@ except ImportError:
         build_search_structure_paths_tool,
         build_select_default_files_tool,
         build_think_tool,
+        tool_call_budget,
     )
     from core.common import prompt_path
 
@@ -102,10 +104,14 @@ async def select_files_by_iterative_react(
     _repo_path = _Path(repo_path).resolve()
 
     max_total = max(1, int(react_max_total_files))
+    # Keep the recursion_limit in one place so the prompt's tool-call budget and the
+    # graph config can never drift apart.
+    recursion_limit = max(30, int(react_max_steps) * 8)
     step1_prompt = (
         prompt_path("PROMPT_L1_TASK.md").read_text(encoding="utf-8")
         .replace("{{REPO_URL}}", repo_url)
         .replace("{{MAX_FILES}}", str(max_total))
+        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
         .replace("{{STRUCTURE_SUMMARY}}", structure_summary)
     )
     step1_tokens_total = estimate_tokens(step1_prompt, model_name)
@@ -119,6 +125,11 @@ async def select_files_by_iterative_react(
     read_gitlog = build_read_gitlog_tool(_repo_path)
     search_commits = build_search_commits_tool(_repo_path)
 
+    # NOTE: L1 uses langchain.agents.create_agent (middleware API), not
+    # create_react_agent (pre_model_hook API), so the history-trim hook does not
+    # apply here. History trimming for L1 is intentionally deferred: its input is
+    # already bounded (a token-capped structure summary plus a small tool-call
+    # budget of small observations), so it does not overflow the input cap.
     retrieval_agent = create_agent(
         model=new_prebuilt_chat_model(selection_timeout),
         tools=[think, list_tree, search_pattern, read_file, read_gitlog, search_commits, search_structure_paths, select_default_files, build_finalize_tool()],
@@ -132,7 +143,7 @@ async def select_files_by_iterative_react(
     try:
         result = await retrieval_agent.ainvoke(
             {"messages": [{"role": "user", "content": step1_prompt}]},
-            config={"configurable": {"thread_id": f"{repo_name}:l1"}, "recursion_limit": max(30, int(react_max_steps) * 8)},
+            config={"configurable": {"thread_id": f"{repo_name}:l1"}, "recursion_limit": recursion_limit},
         )
     except GraphRecursionError:
         # The ReAct loop never emitted a finalize action within the step budget
