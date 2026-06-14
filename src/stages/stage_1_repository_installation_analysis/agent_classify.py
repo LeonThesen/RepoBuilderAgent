@@ -178,6 +178,14 @@ parser.add_argument(
     help="Hard token budget target for Step 2 classification prompt (0 disables budget pruning).",
 )
 parser.add_argument(
+    "--max-input-tokens",
+    type=int,
+    default=60000,
+    help="Max input tokens the model endpoint accepts. Large repo-structure summaries are "
+    "truncated to fit so classification doesn't 400 on huge repos (e.g. linux ~306k tokens). "
+    "Set below the model's hard cap to leave room for the ReAct loop.",
+)
+parser.add_argument(
     "--synthesis-subagents-enabled",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -231,6 +239,39 @@ def estimate_tokens(string: str, model_name: str) -> int:
         encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = len(encoding.encode(string))
     return num_tokens
+
+
+def _truncate_to_token_budget(text: str, model_name: str, max_tokens: int, *, label: str = "content") -> str:
+    """Truncate text to at most max_tokens (exact, via the tokenizer) for LLM prompts.
+
+    Huge repos (e.g. linux's ~306k-token structure summary) otherwise overflow the
+    endpoint's input cap and 400 the whole classification. Keeps the head (top-of-tree
+    and manifests come first in the fingerprint) and appends a notice; the agent can
+    still reach the rest via list_tree/search_pattern/read_file. Callers retain the full
+    text on disk — only the prompt copy is trimmed."""
+    if max_tokens <= 0 or not text:
+        return text
+    try:
+        encoding = tiktoken.encoding_for_model(model_name)
+    except Exception:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    tokens = encoding.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    notice = (
+        f"\n\n... [{label} truncated to fit the {max_tokens}-token input budget; "
+        f"use list_tree/search_pattern/read_file to inspect the rest]"
+    )
+    keep = max(1, max_tokens - len(encoding.encode(notice)))
+    head = encoding.decode(tokens[:keep])
+    newline = head.rfind("\n")
+    if newline > 0:
+        head = head[:newline]
+    log_warn(
+        f"[{label}] {len(tokens)} tokens exceeds the {max_tokens}-token budget; "
+        f"truncated for the LLM prompt (full copy retained on disk)."
+    )
+    return head + notice
 
 
 def pct(part: int, whole: int) -> float:
@@ -1014,6 +1055,13 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             with open(structure_summary_path, "w") as f:
                 f.write(structure_summary)
 
+            # Cap the structure summary fed to LLM prompts (the full copy stays on disk).
+            # The ReAct loop also accumulates tool output, so reserve ~half the input budget.
+            structure_summary = _truncate_to_token_budget(
+                structure_summary, args.model, int(args.max_input_tokens * 0.5),
+                label="structure summary",
+            )
+
             selected_files = default_selected_files.copy()
             baseline_summary = ""
             step1_tokens = 0
@@ -1044,6 +1092,10 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     include_tree=True,
                     context="step2-one-shot-fingerprint",
                 )
+                baseline_summary = _truncate_to_token_budget(
+                    baseline_summary, args.model, int(args.max_input_tokens * 0.8),
+                    label="one-shot fingerprint",
+                )
                 selected_files = []
                 log_info(f"Using static repo fingerprint for {repo_name} via one-shot retrieval.")
             elif args.retrieval_strategy == "one_shot_fingerprint_budgeted":
@@ -1057,6 +1109,10 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     selected_files=_budgeted_files if _budgeted_files else None,
                     include_tree=True,
                     context="step2-one-shot-fingerprint-budgeted",
+                )
+                baseline_summary = _truncate_to_token_budget(
+                    baseline_summary, args.model, int(args.max_input_tokens * 0.8),
+                    label="one-shot fingerprint",
                 )
                 selected_files = []
                 log_info(
