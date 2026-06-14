@@ -558,7 +558,57 @@ def compute_repo_metrics(
 # Aggregate metrics
 # ---------------------------------------------------------------------------
 
-def compute_aggregate_metrics(results: list[dict]) -> dict:
+def load_model_pricing(workspace_root: Optional[Path] = None) -> dict:
+    """Load config/model_pricing.json. Returns {} if missing/invalid (cost stays unpriced)."""
+    root = workspace_root or Path.cwd()
+    path = Path(root) / "config" / "model_pricing.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("models", {}) if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def compute_cost_usd(total_tokens: dict, model: Optional[str], pricing: Optional[dict]) -> dict:
+    """Estimate dollar cost from recorded tokens. Unknown/unpriced models -> priced=false."""
+    entry = (pricing or {}).get(model or "")
+    in_price = entry.get("input_per_mtok") if entry else None
+    out_price = entry.get("output_per_mtok") if entry else None
+    if in_price is None or out_price is None:
+        return {"priced": False, "model": model}
+    prompt = total_tokens.get("prompt_tokens", 0)
+    completion = total_tokens.get("completion_tokens", 0)
+    input_usd = prompt / 1_000_000 * in_price
+    output_usd = completion / 1_000_000 * out_price
+    return {
+        "priced": True,
+        "model": model,
+        "input_usd": round(input_usd, 4),
+        "output_usd": round(output_usd, 4),
+        "total_usd": round(input_usd + output_usd, 4),
+    }
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    """Linear-interpolation percentile over an already-sorted, non-empty list."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = (pct / 100.0) * (len(sorted_values) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = rank - lo
+    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
+
+
+def compute_aggregate_metrics(
+    results: list[dict],
+    model: Optional[str] = None,
+    pricing: Optional[dict] = None,
+) -> dict:
     total = len(results)
     if total == 0:
         return {}
@@ -619,6 +669,41 @@ def compute_aggregate_metrics(results: list[dict]) -> dict:
     df_runs = [r.get("metrics", {}).get("dockerfile", {}).get("run_layers") for r in results]
     df_runs_valid = [v for v in df_runs if v is not None]
 
+    # Wall-clock: per-repo durations recorded by eval.py. Skipped repos have 0.0,
+    # so a positive-value filter keeps only repos that actually executed.
+    durations = sorted(
+        d for d in (r.get("duration_seconds") for r in results)
+        if isinstance(d, (int, float)) and d > 0
+    )
+    wall_clock = {
+        "repos_timed": len(durations),
+        "total_seconds": round(sum(durations), 1),
+        "mean_seconds": round(sum(durations) / len(durations), 1),
+        "median_seconds": round(_percentile(durations, 50), 1),
+        "p90_seconds": round(_percentile(durations, 90), 1),
+        "min_seconds": round(durations[0], 1),
+        "max_seconds": round(durations[-1], 1),
+    } if durations else {}
+
+    # Cost efficiency: total spend per *successful* build — the Pareto axis that pairs
+    # quality (build_success_rate) with cost (tokens + wall-clock).
+    n_build = len(build_success)
+    n_verify = len(verify_passed)
+    total_tok = total_tokens["total_tokens"]
+    wc_total = sum(durations) if durations else None
+    cost_efficiency = {
+        "tokens_per_successful_build": round(total_tok / n_build) if n_build else None,
+        "tokens_per_verified_build": round(total_tok / n_verify) if n_verify else None,
+        "wall_clock_seconds_per_successful_build": (
+            round(wc_total / n_build, 1) if (n_build and wc_total is not None) else None
+        ),
+    }
+
+    # Dollar cost (estimate; unpriced models are reported as priced=false).
+    cost_usd = compute_cost_usd(total_tokens, model, pricing)
+    if cost_usd.get("priced") and n_build:
+        cost_efficiency["usd_per_successful_build"] = round(cost_usd["total_usd"] / n_build, 4)
+
     return {
         "total_repos": total,
         "pipeline_completed_rate": round(len(completed_pipelines) / total, 4),
@@ -629,6 +714,9 @@ def compute_aggregate_metrics(results: list[dict]) -> dict:
         "binary_size_plausible_rate": round(len(binary_plausible_pass) / len(binary_plausible_applicable), 4) if binary_plausible_applicable else None,
         "total_tokens": total_tokens,
         "avg_tokens_per_repo": {k: round(total_tokens[k] / total) for k in total_tokens} if total else {},
+        "wall_clock_seconds": wall_clock,
+        "cost_efficiency": cost_efficiency,
+        "cost_usd": cost_usd,
         "attempts_to_success_histogram": dict(sorted(attempt_histogram.items())),
         "failure_mode_distribution": dict(sorted(failure_modes.items(), key=lambda x: -x[1])),
         "by_language": dict(sorted(by_language.items())),
@@ -713,6 +801,14 @@ def compute_regression_delta(current_results: list[dict], prior_path: Path) -> O
     curr_build_ok = sum(1 for r in current_results if r.get("metrics", {}).get("repair", {}).get("build_success"))
     curr_build_rate = round(curr_build_ok / len(current_results), 4) if current_results else 0.0
 
+    # Flip rate = fraction of matched repos whose build outcome changed in either
+    # direction. Against an identical-config prior (e.g. the AB-26 confirmation rerun
+    # vs the champion's first run) this is the non-determinism floor: it tells you how
+    # large a build_success_rate delta must be before it can be read as signal rather
+    # than run-to-run noise.
+    matched = unchanged + len(regressions) + len(improvements)
+    flipped = len(regressions) + len(improvements)
+
     return {
         "prior_eval": str(prior_path),
         "prior_run_id": prior.get("run_id"),
@@ -720,4 +816,7 @@ def compute_regression_delta(current_results: list[dict], prior_path: Path) -> O
         "regressions": regressions,
         "improvements": improvements,
         "unchanged_count": unchanged,
+        "matched_count": matched,
+        "flipped_count": flipped,
+        "flip_rate": round(flipped / matched, 4) if matched else None,
     }
