@@ -1690,7 +1690,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             log_info(f"LLM metrics saved at {llm_metrics_path}")
 
         except Exception as e:
-            log_error(f"Unexpected error while processing {repo_url}: {e}")
+            log_error(f"Unexpected error in during classification while processing {repo_url}: {e}")
             with open(llm_metrics_path, "w", encoding="utf-8") as f:
                 yaml.dump(finalize_llm_metrics(llm_metrics), f, sort_keys=False, allow_unicode=True)
         finally:
