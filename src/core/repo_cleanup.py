@@ -10,8 +10,26 @@ except ImportError:
     from core.log_utils import log_info, log_trace, log_warn
 
 
-# CI/CD config files — safe to drop from the build context (never build inputs).
-_DELETE_CI_FILE_NAMES: frozenset[str] = frozenset({
+_DELETE_DOCS_EXTENSIONS: tuple[str, ...] = (
+    ".md", ".rst", ".adoc", ".asciidoc", ".textile", ".wiki",
+    ".pdf", ".doc", ".docx", ".odt", ".rtf",
+    ".tex", ".pod", ".man",
+    ".ipynb", ".pptx", ".ppt",
+)
+
+# Build-metadata files that happen to use a doc extension but are NOT install
+# documentation — build systems reference/embed them (CMake globbing ChangeLog.md,
+# packaging steps reading LICENSE.md). Keep these even though they look like docs.
+# These are legal/metadata files, not "how to build" instructions, so preserving
+# them does not leak the install procedure to the agent. Matched on the filename
+# stem (case-insensitive), so LICENSE.md / ChangeLog.rst / NOTICE.adoc all qualify.
+_KEEP_DOC_FILE_STEMS: frozenset[str] = frozenset({
+    "license", "licence", "copying", "copyright", "notice", "unlicense",
+    "changelog", "changes", "history", "news",
+    "authors", "contributors", "credits",
+})
+
+_DELETE_DOCS_FILE_NAMES: frozenset[str] = frozenset({
     "Jenkinsfile",
     ".travis.yml", ".travis.yaml",
     ".gitlab-ci.yml", ".gitlab-ci.yaml",
@@ -22,12 +40,15 @@ _DELETE_CI_FILE_NAMES: frozenset[str] = frozenset({
     "CODEOWNERS",
 })
 
-# CI/CD config directories — safe to drop. Documentation directories (docs/, doc/,
-# website/, man/, sphinx/, …) are NOT removed: build systems routinely reference
-# docs as build inputs (e.g. CMake add_subdirectory(doc), generated man pages).
-_DELETE_CI_DIR_NAMES: frozenset[str] = frozenset({
+_DELETE_DOCS_DIR_NAMES: frozenset[str] = frozenset({
     ".github", ".gitlab", ".circleci", ".buildkite", ".drone",
     ".woodpecker", ".jenkins", ".azure-pipelines",
+    "docs", "doc", "documentation",
+    "website", "site", "gh-pages",
+    "wiki",
+    "javadoc", "apidoc", "apidocs",
+    "man", "manpages",
+    "sphinx", "docsrc",
 })
 
 
@@ -87,41 +108,58 @@ def preprocess_repository(repo_path: Path, deletion_patterns_file: str) -> None:
         log_info(f"Preprocessing complete: deleted {deleted_count} files/directories from {repo_path.name}")
 
 
-def delete_docs_build_context(repo_path: Path, repo_name: str) -> None:
-    """Remove CI/CD config files/dirs from repo_path before image builds.
+def _is_build_metadata_doc(item: Path) -> bool:
+    """A doc-extension file that is build metadata (LICENSE/CHANGELOG/…), not
+    install documentation — preserved so builds that reference it don't break."""
+    return item.stem.lower() in _KEEP_DOC_FILE_STEMS
 
-    NOTE: this intentionally does NOT delete documentation files (.md/.rst/.adoc/…)
-    or documentation directories. Doing so corrupted the build context and broke
-    real builds whose build systems reference those files as inputs — e.g. fmt
-    (CMake referenced ChangeLog.md), vite (LICENSE.md), git (Documentation/*.adoc).
-    The agent cannot recover files that are absent from the context, so we only
-    drop things that are never build inputs (CI/CD config)."""
-    log_info(f"[delete-docs {repo_name}] Removing CI/CD config from {repo_path}")
+
+def delete_docs_build_context(repo_path: Path, repo_name: str) -> None:
+    """Remove documentation and CI/CD files from repo_path before image builds.
+
+    The benchmark's premise is that the agent builds WITHOUT install documentation
+    (and with repo-tools on, the repair agent could otherwise read it), so docs are
+    stripped. The ONLY carve-out is build-metadata files (LICENSE/CHANGELOG/NOTICE/…)
+    that builds reference as inputs — those use a doc extension but are not install
+    instructions. See _KEEP_DOC_FILE_STEMS. (Repos whose build genuinely consumes
+    prose docs, e.g. git's Documentation/*.adoc, are not covered here and may need a
+    narrow explicit exception.)"""
+    log_info(f"[delete-docs {repo_name}] Starting docs/CI deletion in {repo_path}")
 
     removed_files: list[str] = []
     removed_dirs: list[str] = []
+    kept_metadata: list[str] = []
 
     for item in list(repo_path.rglob("*")):
         if not item.exists():
             continue
 
         if item.is_dir():
-            if item.name in _DELETE_CI_DIR_NAMES:
+            if item.name in _DELETE_DOCS_DIR_NAMES:
                 rel = item.relative_to(repo_path)
                 if len(rel.parts) <= 2:
-                    log_trace(f"[delete-docs {repo_name}] Removing CI/CD directory: {rel}")
+                    log_trace(f"[delete-docs {repo_name}] Removing doc/CI directory: {rel}")
                     shutil.rmtree(item)
                     removed_dirs.append(str(rel))
                 else:
-                    log_trace(f"[delete-docs {repo_name}] Skipping deep dir: {rel}")
+                    log_trace(f"[delete-docs {repo_name}] Skipping deep source dir: {rel}")
         elif item.is_file():
-            if item.name in _DELETE_CI_FILE_NAMES:
+            if item.suffix.lower() in _DELETE_DOCS_EXTENSIONS:
+                if _is_build_metadata_doc(item):
+                    kept_metadata.append(str(item.relative_to(repo_path)))
+                    continue
+                rel = item.relative_to(repo_path)
+                log_trace(f"[delete-docs {repo_name}] Removing doc file: {rel}")
+                item.unlink()
+                removed_files.append(str(rel))
+            elif item.name in _DELETE_DOCS_FILE_NAMES:
                 rel = item.relative_to(repo_path)
                 log_trace(f"[delete-docs {repo_name}] Removing CI/CD file: {rel}")
                 item.unlink()
                 removed_files.append(str(rel))
 
     log_info(
-        f"[delete-docs {repo_name}] Done — removed {len(removed_files)} CI file(s), "
-        f"{len(removed_dirs)} CI director{'ies' if len(removed_dirs) != 1 else 'y'}"
+        f"[delete-docs {repo_name}] Done — removed {len(removed_files)} file(s), "
+        f"{len(removed_dirs)} director{'ies' if len(removed_dirs) != 1 else 'y'}; "
+        f"kept {len(kept_metadata)} build-metadata file(s)"
     )
