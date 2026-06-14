@@ -10,7 +10,7 @@ from pathlib import Path
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.common import upsert_shared_repository_state
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         prompt_profile_metadata,
@@ -18,11 +18,12 @@ try:
         resolve_prompt_temperature,
     )
     from RepoBuilderAgent.src.core.variant_policy import VARIANT_POLICY_TABLE, resolve_variant_policy
+    from RepoBuilderAgent.src.core import architecture_manifest as arch_manifest
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.common import upsert_shared_repository_state
-    from core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
+    from core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_trace_enabled
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         prompt_profile_metadata,
@@ -30,6 +31,7 @@ except ImportError:
         resolve_prompt_temperature,
     )
     from core.variant_policy import VARIANT_POLICY_TABLE, resolve_variant_policy
+    from core import architecture_manifest as arch_manifest
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -158,6 +160,18 @@ parser.add_argument("--skip-dockerfile", action="store_true", help="Skip the Doc
 parser.add_argument("--skip-validation-gate", action="store_true", help="Skip the post-generation validation gate phase")
 parser.add_argument("--skip-repair", action="store_true", help="Skip the Dockerfile repair phase")
 parser.add_argument("--skip-install-guide", action="store_true", help="Skip the INSTALL.md generation phase")
+parser.add_argument(
+    "--output-audit",
+    choices=["fail", "warn", "off"],
+    default="fail",
+    help=(
+        "Architecture audit. Preflight verifies every active subpart and ReAct tool is WIRED "
+        "(its implementing symbol imports/resolves); after each stage, verifies every active "
+        "subpart produced its per-repo artifact (NO_OUTPUT detection), per-subpart not just "
+        "per-stage. 'fail' (default) aborts on a not-wired or no-output gap; 'warn' logs loudly "
+        "but continues; 'off' disables both checks."
+    ),
+)
 parser.add_argument(
     "--variant",
     default="flat_baseline",
@@ -1010,6 +1024,196 @@ def collect_repair_outcomes(reports_dir: Path) -> dict:
     return outcome
 
 
+# ── Architecture audit: wiring (NOT_WIRED) + output (NO_OUTPUT) ──────────────
+# Each stage runs as a child process; run_step() only checks the exit code. Two
+# distinct failure modes are otherwise invisible, and must NOT be conflated:
+#
+#   NOT_WIRED  — a subpart/tool the active config claims to use has no importable
+#                implementing symbol. The architecture is missing/disconnected.
+#                Checked statically at preflight, per-subpart AND per-tool, off
+#                the declarative manifest in core.architecture_manifest.
+#   NO_OUTPUT  — a wired, enabled subpart produced no per-repo artifact at runtime.
+#                Checked after each stage, only for parts that passed wiring.
+#
+# Expected-repo sets are chained off upstream artifacts so repos legitimately
+# dropped earlier (cascading skips) never raise false NO_OUTPUT alarms.
+
+def _repair_blocked_by_gate(summaries_dir: Path, repo: str) -> bool:
+    """Repair legitimately skips a repo when the post-generation validation gate
+    recorded decision.run_repair = False (see agent_dockerfile_repair.py)."""
+    artifact = summaries_dir / f"{repo}.postgen-validation.yaml"
+    if not artifact.exists():
+        return False
+    try:
+        data = yaml.safe_load(artifact.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+    decision = data.get("decision")
+    return isinstance(decision, dict) and decision.get("run_repair") is False
+
+
+def _dockerfile_one_shot_direct_active() -> bool:
+    if args.dockerfile_one_shot_direct is not None:
+        return bool(args.dockerfile_one_shot_direct)
+    return args.variant == "one_shot_direct"
+
+
+def build_architecture_flags(phase_skips: dict) -> dict:
+    """Snapshot the runtime config the manifest needs to decide which subparts
+    and tools are active for this run."""
+    return {
+        "phase_skips": dict(phase_skips),
+        "retrieval_strategy": resolve_classify_retrieval_strategy(),
+        "exploration": bool(args.arch_exploration_enabled),
+        "synthesis": bool(args.arch_synthesis_enabled),
+        "validation": bool(args.arch_validation_enabled),
+        "scratchpads": bool(args.arch_scratchpads_enabled),
+        "snippet_tools": bool(args.snippet_tools),
+        "repair_repo_tools": bool(args.repair_repo_tools),
+        "stateful_repair": bool(args.stateful_repair),
+        "stateful_repair_tree": bool(args.stateful_repair_tree),
+    }
+
+
+def audit_architecture_wiring(flags: dict) -> dict:
+    """Preflight: resolve the implementing symbol of every active subpart and
+    tool. Anything that does not import/resolve is NOT WIRED — the architecture
+    is missing or disconnected, distinct from a runtime no-output failure."""
+    units = list(arch_manifest.active_components(flags)) + list(arch_manifest.active_tools(flags))
+    checked: list[dict] = []
+    not_wired: list[dict] = []
+    for unit in units:
+        ok, detail = arch_manifest.resolve_symbol(unit.symbol)
+        record = {"key": unit.key, "kind": unit.kind, "symbol": unit.symbol, "wired": ok, "detail": detail}
+        checked.append(record)
+        if not ok:
+            not_wired.append(record)
+
+    result = {"checked": len(checked), "not_wired": not_wired}
+    if not_wired:
+        bar = "=" * 72
+        lines = "\n".join(f"  [{r['kind']:8}] {r['key']:30} {r['symbol']}\n             → {r['detail']}" for r in not_wired)
+        log_error(
+            f"\n{bar}\nARCHITECTURE WIRING FAILURE — {len(not_wired)}/{len(checked)} active "
+            f"component(s)/tool(s) are NOT WIRED:\n{lines}\n"
+            f"The config enables these parts but their implementing symbols do not import/resolve.\n"
+            f"This is a missing or disconnected architecture, not a runtime build failure.\n{bar}"
+        )
+        result["status"] = "not_wired"
+        result["message"] = (
+            f"architecture wiring: {len(not_wired)} active component(s)/tool(s) not wired: "
+            f"{', '.join(r['key'] for r in not_wired)}"
+        )
+    else:
+        result["status"] = "ok"
+        log_info(f"Architecture wiring OK: all {len(checked)} active component(s) + tool(s) resolve.")
+    return result
+
+
+def _good_classification(repo: str) -> bool:
+    """A repo completed Stage 1 if its classification YAML exists and is not an
+    error marker (agent_classify writes {'error': ...} on parse failure)."""
+    path = Path(args.results_dir) / f"{repo}.yaml"
+    if not path.exists():
+        return False
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return True  # exists but unreadable here → assume Stage 1 ran
+    return not (isinstance(data, dict) and "error" in data)
+
+
+def _expected_repos_for_phase(phase: str, repo_names: list[str]) -> list[str]:
+    """Repos a phase was expected to handle, chained off upstream artifacts."""
+    dockerfiles_dir = Path(args.dockerfiles_dir)
+    if phase == arch_manifest.CLASSIFY:
+        return list(repo_names)
+    if phase == arch_manifest.DOCKERFILE:
+        if _dockerfile_one_shot_direct_active():
+            return list(repo_names)
+        return [r for r in repo_names if _good_classification(r)]
+    # validation gate / repair / install guide all key off a generated Dockerfile
+    return [r for r in repo_names if (dockerfiles_dir / f"{r}.Dockerfile").exists()]
+
+
+def _artifact_path(component, repo: str) -> Path:
+    base = Path(getattr(args, component.dir_key))
+    return base / component.artifact.format(repo=repo)
+
+
+def audit_stage_outputs(stage: str, repo_names: list[str], flags: dict) -> dict:
+    """Per-subpart output audit for a completed stage. For each active subpart of
+    ``stage`` that writes a per-repo artifact, verify it was produced for every
+    expected repo. Distinguishes NO_OUTPUT (wired+enabled, wrote nothing) from a
+    partial gap, and logs loudly. Returns a record the caller may treat as fatal."""
+    components = [c for c in arch_manifest.active_components(flags) if c.phase == stage and c.checks_output]
+    base_expected = _expected_repos_for_phase(stage, repo_names)
+    summaries_dir = Path(args.summaries_dir)
+    bar = "=" * 72
+
+    subparts: list[dict] = []
+    failed: list[dict] = []
+    for component in components:
+        # Stage-1 subparts (synthesis/validation/etc.) are intermediate: they are
+        # only expected for repos that completed Stage 1, not every input repo.
+        if stage == arch_manifest.CLASSIFY and component.kind != "primary":
+            expected = [r for r in repo_names if _good_classification(r)]
+        else:
+            expected = base_expected
+
+        # Repair legitimately skips repos the validation gate blocked.
+        if component.key == "stage3.repair":
+            auditable = [r for r in expected if not _repair_blocked_by_gate(summaries_dir, r)]
+        else:
+            auditable = list(expected)
+
+        produced = [r for r in auditable if _artifact_path(component, r).exists()]
+        missing = [r for r in auditable if not _artifact_path(component, r).exists()]
+
+        entry = {
+            "key": component.key,
+            "label": component.label,
+            "artifact": component.artifact,
+            "expected": len(auditable),
+            "produced": len(produced),
+            "missing": missing,
+        }
+        if not auditable:
+            entry["status"] = "ok"
+        elif not produced:
+            entry["status"] = "no_output"
+            entry["message"] = (
+                f"'{component.label}' ({component.key}) produced ZERO output for "
+                f"{len(auditable)} expected repo(s): {', '.join(auditable)}"
+            )
+            log_error(
+                f"\n{bar}\nOUTPUT AUDIT — NO OUTPUT: {entry['message']}\n"
+                f"This subpart is wired and enabled but wrote nothing — not a normal build failure.\n{bar}"
+            )
+            failed.append(entry)
+        elif missing:
+            entry["status"] = "missing"
+            detail = ", ".join(f"{r} (missing {_artifact_path(component, r).name})" for r in missing)
+            entry["message"] = (
+                f"'{component.label}' ({component.key}) missing output for "
+                f"{len(missing)}/{len(auditable)} repo(s): {detail}"
+            )
+            log_error(f"\n{bar}\nOUTPUT AUDIT — PARTIAL: {entry['message']}\n{bar}")
+            failed.append(entry)
+        else:
+            entry["status"] = "ok"
+            log_info(f"Output audit OK: '{component.label}' produced output for all {len(auditable)} expected repo(s).")
+        subparts.append(entry)
+
+    record = {"stage": stage, "subparts": subparts}
+    if failed:
+        record["status"] = "no_output" if any(f["status"] == "no_output" for f in failed) else "missing"
+        record["message"] = "; ".join(f["message"] for f in failed)
+    else:
+        record["status"] = "ok"
+    return record
+
+
 def _update_phase_totals(target: dict, phase_data: dict) -> None:
     for key in (
         "calls",
@@ -1474,6 +1678,32 @@ def main() -> int:
     if constraints_seeded:
         log_info(f"Seeded user constraints into shared state for {constraints_seeded} repositories")
 
+    repo_names = [_repo_name_from_url(url) for url in repo_urls_for_run]
+    architecture_flags = build_architecture_flags(phase_skips)
+    summary["architecture_audit"] = {"wiring": {}, "output": []}
+
+    # Preflight: a NOT-WIRED architecture is unambiguously broken, so check it
+    # before spending tokens/Docker time on stages that cannot succeed.
+    if args.output_audit != "off":
+        wiring = audit_architecture_wiring(architecture_flags)
+        summary["architecture_audit"]["wiring"] = wiring
+        if wiring.get("status") == "not_wired" and args.output_audit == "fail":
+            summary["status"] = "failed"
+            summary["error"] = wiring["message"]
+            summary["ended_at"] = utc_now()
+            write_summary(summary_path, summary)
+            log_error(wiring["message"])
+            return 1
+
+    def _audit(stage: str) -> None:
+        """Audit a completed stage's per-subpart outputs; abort when --output-audit=fail."""
+        if args.output_audit == "off":
+            return
+        record = audit_stage_outputs(stage, repo_names, architecture_flags)
+        summary["architecture_audit"]["output"].append(record)
+        if record.get("status") in ("no_output", "missing") and args.output_audit == "fail":
+            raise RuntimeError(record.get("message", f"output audit failed for stage '{stage}'"))
+
     try:
         if not phase_skips["classify"]:
             summary["phases"].append(
@@ -1483,6 +1713,7 @@ def main() -> int:
                     run_logs_dir / "classification.log",
                 )
             )
+            _audit("classification")
 
         if args.run_analysis:
             summary["phases"].append(
@@ -1501,6 +1732,7 @@ def main() -> int:
                     run_logs_dir / "dockerfile-generation.log",
                 )
             )
+            _audit("dockerfile generation")
 
         if not phase_skips["validation_gate"]:
             summary["phases"].append(
@@ -1510,6 +1742,7 @@ def main() -> int:
                     run_logs_dir / "post-generation-validation-gate.log",
                 )
             )
+            _audit("post-generation validation gate")
 
         if not phase_skips["repair"]:
             summary["phases"].append(
@@ -1519,6 +1752,7 @@ def main() -> int:
                     run_logs_dir / "dockerfile-repair.log",
                 )
             )
+            _audit("dockerfile repair")
 
         if not phase_skips["install_guide"]:
             summary["phases"].append(
@@ -1528,6 +1762,7 @@ def main() -> int:
                     run_logs_dir / "install-guide-generation.log",
                 )
             )
+            _audit("install guide generation")
 
         summary["status"] = "success"
 
