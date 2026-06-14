@@ -1,4 +1,6 @@
 import sys
+from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 try:
@@ -9,6 +11,8 @@ except Exception:
 
 _TRACE_ENABLED = False
 _ACTIVE_TQDM_BAR: Any = None
+_DUMP_PROMPTS_DIR: Path | None = None
+_DUMP_CALL_COUNTS: defaultdict = defaultdict(int)
 
 # ANSI color codes
 _GREEN = "\033[92m"
@@ -38,6 +42,31 @@ def _emit(msg: str) -> None:
 def set_trace_enabled(enabled: bool) -> None:
     global _TRACE_ENABLED
     _TRACE_ENABLED = enabled
+
+
+def set_dump_prompts_dir(path: str | Path) -> None:
+    global _DUMP_PROMPTS_DIR, _DUMP_CALL_COUNTS
+    _DUMP_PROMPTS_DIR = Path(path)
+    _DUMP_CALL_COUNTS = defaultdict(int)
+
+
+def dump_prompt(repo_url: str, phase: str, messages: list[dict]) -> None:
+    if _DUMP_PROMPTS_DIR is None:
+        return
+    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "") if repo_url else "unknown"
+    key = (repo_name, phase)
+    _DUMP_CALL_COUNTS[key] += 1
+    n = _DUMP_CALL_COUNTS[key]
+    out_dir = _DUMP_PROMPTS_DIR / repo_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = [f"# repo: {repo_name}", f"# phase: {phase}", f"# call: {n}", ""]
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        lines.append(f"[{role}]")
+        lines.append(content)
+        lines.append("")
+    (out_dir / f"{phase}.{n}.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
 def log_info(msg: str) -> None:

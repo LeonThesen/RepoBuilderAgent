@@ -7,6 +7,7 @@ import re
 import shlex
 import ssl
 from pathlib import Path
+from typing import Optional
 
 import httpx
 import yaml
@@ -15,8 +16,8 @@ from tqdm import tqdm
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
@@ -57,8 +58,8 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
-    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool
+    from core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
+    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool
     from metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.dockerfile_utils import extract_dockerfile, get_base_template
@@ -134,6 +135,7 @@ parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max
 parser.add_argument("--repair-timeout", type=int, default=int(TIMEOUTS["repair_timeout"]), help="Timeout for Dockerfile repair LLM calls in seconds")
 parser.add_argument("--verify-repair-timeout", type=int, default=int(TIMEOUTS["verify_repair_timeout"]), help="Timeout for verification-command repair LLM calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
+parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
@@ -211,6 +213,13 @@ parser.add_argument(
     default=False,
     help="Enable Dockerfile snippet tools (get_dockerfile_snippet) in the L3 repair agent.",
 )
+parser.add_argument(
+    "--repair-repo-tools",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Give the L3 repair agent read-only repository tools (read_file, list_tree, search_pattern) "
+    "so it can inspect the source it is fixing. Building/verifying stays deterministic in the outer loop.",
+)
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
@@ -241,6 +250,8 @@ VERIFY_REFRESH_SYSTEM_PROMPT = prompt_path("PROMPT_L3_VERIFY_REFRESH_SYSTEM.md")
 sem = asyncio.Semaphore(1)
 
 set_trace_enabled(args.trace)
+if args.dump_prompts:
+    set_dump_prompts_dir(args.dump_prompts)
 
 
 _new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
@@ -819,6 +830,8 @@ async def request_repair(
     llm_metrics: dict,
     repair_history: list[dict] | None = None,
     architecture_scratchpad_context: str = "",
+    repo_path: "Path | None" = None,
+    report_dir: "Path | None" = None,
 ) -> str:
     base_template = get_base_template(
         classification,
@@ -861,7 +874,15 @@ async def request_repair(
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
 
-    repaired, trace_steps = await run_l3_dockerfile_repair_react(
+    repo_tools = None
+    if args.repair_repo_tools and repo_path is not None:
+        repo_tools = [
+            build_read_file_tool(repo_path),
+            build_list_tree_tool(repo_path),
+            build_search_pattern_tool(repo_path),
+        ]
+
+    repaired, trace_steps, l3_trace = await run_l3_dockerfile_repair_react(
         repo_url=repo_url,
         attempt_number=attempt_number,
         prompt=prompt,
@@ -872,7 +893,42 @@ async def request_repair(
         build_hadolint_snippet_tool=build_hadolint_snippet_tool,
         extract_dockerfile=extract_dockerfile,
         build_snippet_tool=build_get_dockerfile_snippet_tool if args.snippet_tools else None,
+        repo_tools=repo_tools,
     )
+
+    # Persist the repair agent's ReAct trace (tool calls + reasoning) so the trace
+    # viewer can show which tools — including the optional repo tools — were used.
+    if report_dir is not None:
+        tools_available = ["think", "run_hadolint_on_snippet"]
+        if args.snippet_tools:
+            tools_available.append("get_dockerfile_snippet")
+        if repo_tools:
+            tools_available.extend(["read_file", "list_tree", "search_pattern"])
+        tool_calls_made = [
+            tc.get("name")
+            for event in l3_trace
+            for tc in (event.get("tool_calls") or [])
+            if tc.get("name")
+        ]
+        try:
+            write_text(
+                report_dir / f"attempt-{attempt_number}.l3-trace.yaml",
+                render_yaml(
+                    {
+                        "repo": repo_url,
+                        "attempt": attempt_number,
+                        "max_steps": int(args.l3_react_max_steps),
+                        "trace_steps": trace_steps,
+                        "repo_tools_enabled": bool(repo_tools),
+                        "snippet_tools_enabled": bool(args.snippet_tools),
+                        "tools_available": tools_available,
+                        "tool_calls_made": tool_calls_made,
+                        "trace": l3_trace,
+                    }
+                ),
+            )
+        except Exception as exc:  # tracing must never break a repair attempt
+            log_warn(f"Failed to write L3 repair trace for {repo_url} attempt {attempt_number}: {exc}")
 
     if not repaired:
         log_warn(f"L3 ReAct repair agent returned empty content for {repo_url} attempt {attempt_number}")
@@ -884,6 +940,7 @@ async def request_repair(
             "max_steps": int(args.l3_react_max_steps),
             "last_attempt": attempt_number,
             "trace_steps": trace_steps,
+            "repo_tools_enabled": bool(repo_tools),
         }
     )
     return repaired
@@ -1420,6 +1477,8 @@ async def repair_repository(
                         llm_metrics=llm_metrics,
                         repair_history=repair_history,
                         architecture_scratchpad_context=architecture_scratchpad_context,
+                        repo_path=repo_path,
+                        report_dir=report_dir,
                     )
                     prior_dockerfile = current_dockerfile
                     current_dockerfile, stop = _apply_repair(
@@ -1482,6 +1541,8 @@ async def repair_repository(
                     llm_metrics=llm_metrics,
                     repair_history=repair_history,
                     architecture_scratchpad_context=architecture_scratchpad_context,
+                    repo_path=repo_path,
+                    report_dir=report_dir,
                 )
                 prior_dockerfile = current_dockerfile
                 current_dockerfile, stop = _apply_repair(

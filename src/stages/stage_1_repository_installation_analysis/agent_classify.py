@@ -41,7 +41,7 @@ try:
         resolve_prompt_temperature,
     )
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
-    from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+    from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
@@ -69,7 +69,7 @@ except ImportError:
         resolve_prompt_temperature,
     )
     from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
-    from core.log_utils import log_info, log_warn, log_error, log_trace, set_trace_enabled, set_tqdm_bar, log_file_delta
+    from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import preprocess_repository
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -106,6 +106,7 @@ parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIM
 parser.add_argument("--selection-timeout", type=int, default=int(TIMEOUTS["selection_timeout"]), help="Timeout for file-selection LLM requests in seconds")
 parser.add_argument("--classification-timeout", type=int, default=int(TIMEOUTS["classification_timeout"]), help="Timeout for final classification LLM requests in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
+parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--force", action="store_true", help="Overwrite existing analysis results")
 parser.add_argument("--learn", action="store_true", help="Learn new files from LLM selections and update config")
 parser.add_argument("--preprocess", action="store_true", help="Remove docs and unnecessary files after cloning")
@@ -206,6 +207,8 @@ with open(prompt_path("PROMPT_SELECT_FILES.md"), "r") as f:
 sem = asyncio.Semaphore(4)
 
 set_trace_enabled(args.trace)
+if args.dump_prompts:
+    set_dump_prompts_dir(args.dump_prompts)
 
 
 _new_prebuilt_chat_model = make_prebuilt_chat_model_factory(

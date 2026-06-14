@@ -10,24 +10,26 @@ from pathlib import Path
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.common import upsert_shared_repository_state
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_trace_enabled
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
+    from RepoBuilderAgent.src.core.variant_policy import VARIANT_POLICY_TABLE, resolve_variant_policy
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.common import upsert_shared_repository_state
-    from core.log_utils import log_error, log_info, set_trace_enabled
+    from core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
+    from core.variant_policy import VARIANT_POLICY_TABLE, resolve_variant_policy
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -79,6 +81,7 @@ parser.add_argument("--repair-timeout", type=int, default=int(TIMEOUTS["repair_t
 parser.add_argument("--verify-repair-timeout", type=int, default=int(TIMEOUTS["verify_repair_timeout"]), help="Timeout for verification-command repair calls in seconds")
 parser.add_argument("--install-guide-timeout", type=int, default=int(TIMEOUTS["install_guide_timeout"]), help="Timeout for install-guide generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
+parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated artifacts where supported")
 parser.add_argument("--learn", action="store_true", help="Enable learning of new manifest file patterns during classification")
 parser.add_argument("--preprocess", action="store_true", help="Enable repository preprocessing during classification")
@@ -166,6 +169,13 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=False,
     help="Enable Dockerfile snippet tools (get_dockerfile_snippet) in L2 synthesis and L3 repair agents.",
+)
+parser.add_argument(
+    "--repair-repo-tools",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Give the L3 repair agent read-only repository tools (read_file, list_tree, search_pattern). "
+    "Building/verifying stays deterministic in the outer repair loop.",
 )
 parser.add_argument(
     "--agent-config",
@@ -266,8 +276,16 @@ RUN_DIR_DEFAULTS = {
 
 CANONICAL_EXECUTION_BRANCH = "ablation/full-system/runtime-agent-config"
 
+_stage_temperature_overrides: dict[str, float | None] = {}
+
+
+def _get_stage_temperature(stage: str) -> float | None:
+    return _stage_temperature_overrides.get(stage)
+
 
 set_trace_enabled(args.trace)
+if args.dump_prompts:
+    set_dump_prompts_dir(args.dump_prompts)
 
 
 def _load_dotenv_fallback(dotenv_path: Path) -> dict[str, str]:
@@ -359,7 +377,7 @@ def render_command(command: list[str]) -> str:
     return " ".join(sanitize_command(command))
 
 
-def append_shared_model_args(command: list[str], *, include_retry_backoff: bool = True) -> list[str]:
+def append_shared_model_args(command: list[str], *, include_retry_backoff: bool = True, stage_temperature: float | None = None) -> list[str]:
     command.extend(["--prompt-profile", args.prompt_profile])
     if args.endpoint:
         command.extend(["--endpoint", args.endpoint])
@@ -367,8 +385,9 @@ def append_shared_model_args(command: list[str], *, include_retry_backoff: bool 
         command.extend(["--model", args.model])
     if args.api_key:
         command.extend(["--api-key", args.api_key])
-    if args.temperature is not None:
-        command.extend(["--temperature", str(args.temperature)])
+    effective_temp = stage_temperature if stage_temperature is not None else args.temperature
+    if effective_temp is not None:
+        command.extend(["--temperature", str(effective_temp)])
     command.extend([
         "--timeout", str(args.timeout),
         "--llm-max-retries", str(args.llm_max_retries),
@@ -377,6 +396,8 @@ def append_shared_model_args(command: list[str], *, include_retry_backoff: bool 
         command.extend(["--llm-retry-backoff-seconds", str(args.llm_retry_backoff_seconds)])
     if args.trace:
         command.append("--trace")
+    if args.dump_prompts:
+        command.extend(["--dump-prompts", args.dump_prompts])
     return command
 
 
@@ -393,11 +414,12 @@ def build_agent_command(
     *,
     include_model_args: bool = True,
     include_retry_backoff: bool = True,
+    stage_temperature: float | None = None,
 ) -> list[str]:
     command = [python_executable, str(script_path)]
     append_repo_selection_args(command)
     if include_model_args:
-        append_shared_model_args(command, include_retry_backoff=include_retry_backoff)
+        append_shared_model_args(command, include_retry_backoff=include_retry_backoff, stage_temperature=stage_temperature)
     return command
 
 
@@ -711,6 +733,22 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
                 key="repair.tree_max_children",
             )
             applied.setdefault("repair", {})["tree_max_children"] = args.stateful_tree_max_children
+        if "repo_tools" in repair_cfg:
+            args.repair_repo_tools = _expect_bool(repair_cfg["repo_tools"], key="repair.repo_tools")
+            applied.setdefault("repair", {})["repo_tools"] = args.repair_repo_tools
+
+    temp_overrides_cfg = agent_config.get("temperature_overrides")
+    if temp_overrides_cfg is not None:
+        if not isinstance(temp_overrides_cfg, dict):
+            raise ValueError("agent_config.temperature_overrides must be an object")
+        valid_stages = {"classify", "dockerfile", "repair", "install_guide"}
+        for stage, val in temp_overrides_cfg.items():
+            if stage not in valid_stages:
+                raise ValueError(f"agent_config.temperature_overrides.{stage}: unknown stage")
+            if val is not None and not isinstance(val, (int, float)):
+                raise ValueError(f"agent_config.temperature_overrides.{stage} must be a number or null")
+            _stage_temperature_overrides[stage] = float(val) if val is not None else None
+            applied.setdefault("temperature_overrides", {})[stage] = val
 
     snippet_tools_cfg = agent_config.get("snippet_tools")
     if snippet_tools_cfg is not None:
@@ -769,7 +807,7 @@ def run_step(name: str, command: list[str], log_path: Path) -> dict:
 
 
 def build_classify_command(python_executable: str, script_path: Path) -> list[str]:
-    command = build_agent_command(python_executable, script_path)
+    command = build_agent_command(python_executable, script_path, stage_temperature=_get_stage_temperature("classify"))
     if args.force:
         command.append("--force")
     if args.learn:
@@ -806,7 +844,7 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
 
 
 def build_dockerfile_command(python_executable: str, script_path: Path) -> list[str]:
-    command = build_agent_command(python_executable, script_path)
+    command = build_agent_command(python_executable, script_path, stage_temperature=_get_stage_temperature("dockerfile"))
     if args.force:
         command.append("--force")
     one_shot_direct = args.variant == "one_shot_direct"
@@ -826,7 +864,7 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
 
 
 def build_repair_command(python_executable: str, script_path: Path) -> list[str]:
-    command = build_agent_command(python_executable, script_path, include_retry_backoff=False)
+    command = build_agent_command(python_executable, script_path, include_retry_backoff=False, stage_temperature=_get_stage_temperature("repair"))
     command.extend([
         "--repair-timeout", str(args.repair_timeout),
         "--verify-repair-timeout", str(args.verify_repair_timeout),
@@ -864,6 +902,7 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
         "--stateful-tree-max-children", str(args.stateful_tree_max_children),
     ])
     command.append("--snippet-tools" if args.snippet_tools else "--no-snippet-tools")
+    command.append("--repair-repo-tools" if args.repair_repo_tools else "--no-repair-repo-tools")
     if args.dataset_dir:
         command.extend(["--dataset-dir", args.dataset_dir])
     return command
@@ -893,7 +932,7 @@ def build_analysis_command(python_executable: str, script_path: Path) -> list[st
 
 
 def build_install_guide_command(python_executable: str, script_path: Path) -> list[str]:
-    command = build_agent_command(python_executable, script_path)
+    command = build_agent_command(python_executable, script_path, stage_temperature=_get_stage_temperature("install_guide"))
     if args.force:
         command.append("--force")
     command.extend([
@@ -1184,227 +1223,8 @@ def resolve_classify_retrieval_strategy() -> str:
     return "iterative_react"
 
 
-VARIANT_POLICY_TABLE: dict[str, dict] = {
-    "ab_retrieval_iterative_react": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_react_retrieval",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_react",
-    },
-    "ab_retrieval_one_shot_fingerprint": {
-        "phase2_anchor": False,
-        "repo_context_source": "one_shot_fingerprint_retrieval",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "one_shot_fingerprint",
-    },
-    "ab_retrieval_one_shot_fingerprint_budgeted": {
-        "phase2_anchor": False,
-        "repo_context_source": "one_shot_fingerprint_budgeted_retrieval",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "one_shot_fingerprint_budgeted",
-    },
-    "ab_retrieval_neural_embedding": {
-        "phase2_anchor": False,
-        "repo_context_source": "neural_embedding_retrieval",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "neural_embedding",
-    },
-    "ab_retrieval_bm25": {
-        "phase2_anchor": False,
-        "repo_context_source": "bm25_retrieval",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "bm25",
-    },
-    "ab_stateful_tree_off": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
-        "stateful_repair_enabled": True,
-        "stateful_tree_enabled": False,
-        "prev_attempt_context_enabled": True,
-    },
-    "ab_stateful_tree_on": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
-        "stateful_repair_enabled": True,
-        "stateful_tree_enabled": True,
-        "prev_attempt_context_enabled": True,
-    },
-    "ab_prev_attempt_ctx_on": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
-        "stateful_repair_enabled": True,
-        "stateful_tree_enabled": False,
-        "prev_attempt_context_enabled": True,
-    },
-    "ab_prev_attempt_ctx_off": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
-        "stateful_repair_enabled": True,
-        "stateful_tree_enabled": False,
-        "prev_attempt_context_enabled": False,
-    },
-    "full_system": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
-    },
-    "ab_snippet_tools_baseline": {
-        "phase2_anchor": False,
-        "repo_context_source": "staged_pipeline",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": False,
-        "synthesis_enabled": False,
-        "validation_enabled": False,
-        "scratchpads_enabled": False,
-        "retrieval_strategy": "baseline_one_shot_fingerprint",
-        "snippet_tools_enabled": True,
-    },
-    "ab_snippet_tools_on": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
-        "snippet_tools_enabled": True,
-    },
-    "ab_snippet_tools_off": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
-        "snippet_tools_enabled": False,
-    },
-    "validation": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_synthesis_validation",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": False,
-        "retrieval_strategy": "iterative_exploration",
-    },
-    "synthesis": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration_plus_synthesis",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": False,
-        "scratchpads_enabled": False,
-        "retrieval_strategy": "iterative_exploration",
-    },
-    "exploration": {
-        "phase2_anchor": False,
-        "repo_context_source": "iterative_exploration",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": False,
-        "validation_enabled": False,
-        "scratchpads_enabled": False,
-        "retrieval_strategy": "iterative_exploration",
-    },
-    "one_shot_direct": {
-        "phase2_anchor": False,
-        "repo_context_source": "static_fingerprint_only",
-        "classification_required": False,
-        "repair_enabled": False,
-        "exploration_enabled": False,
-        "synthesis_enabled": False,
-        "validation_enabled": False,
-        "scratchpads_enabled": False,
-        "retrieval_strategy": "none",
-    },
-}
-
-
-def resolve_variant_policy() -> dict:
-    if args.variant in VARIANT_POLICY_TABLE:
-        return VARIANT_POLICY_TABLE[args.variant]
-
-    return {
-        "phase2_anchor": True,
-        "repo_context_source": "staged_pipeline",
-        "classification_required": True,
-        "repair_enabled": True,
-        "exploration_enabled": False,
-        "synthesis_enabled": False,
-        "validation_enabled": False,
-        "scratchpads_enabled": False,
-        "retrieval_strategy": "baseline_one_shot_fingerprint",
-    }
+# VARIANT_POLICY_TABLE and resolve_variant_policy are imported from
+# RepoBuilderAgent.src.core.variant_policy (shared with eval.py to prevent drift).
 
 
 def apply_stateful_contract_by_variant() -> None:
@@ -1420,7 +1240,7 @@ def apply_stateful_contract_by_variant() -> None:
         "ab_retrieval_one_shot_fingerprint_budgeted": (False, False),
         "ab_retrieval_iterative_react": (False, False),
         "ab_prev_attempt_ctx_on": (True, False),
-        "ab_prev_attempt_ctx_off": (True, False),
+        "ab_prev_attempt_ctx_off": (False, False),
         "ab_stateful_tree_on": (True, True),
         "ab_stateful_tree_off": (True, False),
         "ab_snippet_tools_baseline": (False, False),
@@ -1470,12 +1290,12 @@ def main() -> int:
     repair_script = src_root / "stages" / "stage_3_iterative_dockerfile_repair" / "agent_dockerfile_repair.py"
     validation_gate_script = src_root / "stages" / "stage_2_dockerfile_generation" / "agent_validation_gate.py"
     install_guide_script = src_root / "stages" / "stage_4_install_guide" / "agent_install_guide.py"
-    analysis_script = src_dir / "parse_results.py"
+    analysis_script = src_root / "metrics" / "parse_results.py"
 
     phase_skips = resolve_phase_skips()
     apply_stateful_contract_by_variant()
 
-    base_variant_policy = resolve_variant_policy()
+    base_variant_policy = resolve_variant_policy(args.variant)
     args.arch_exploration_enabled = bool(base_variant_policy.get("exploration_enabled", True))
     args.arch_synthesis_enabled = bool(base_variant_policy.get("synthesis_enabled", True))
     args.arch_validation_enabled = bool(base_variant_policy.get("validation_enabled", True))
@@ -1519,7 +1339,7 @@ def main() -> int:
         log_info("Classification is skipped: disabling --run-analysis because parse_results depends on classify outputs.")
         args.run_analysis = False
 
-    variant_policy = resolve_variant_policy()
+    variant_policy = resolve_variant_policy(args.variant)
 
     summary: dict = {
         "run_id": run_id,
@@ -1591,6 +1411,7 @@ def main() -> int:
                 "history_max_chars": args.stateful_history_max_chars,
                 "tree_max_chars": args.stateful_tree_max_chars,
                 "tree_max_children": args.stateful_tree_max_children,
+                "repo_tools": args.repair_repo_tools,
             },
             "user_constraints": agent_config_applied.get("user_constraints", {}),
         },

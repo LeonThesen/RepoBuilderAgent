@@ -6,7 +6,7 @@ import yaml
 from tqdm import tqdm
 
 try:
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from RepoBuilderAgent.src.core.common import (
         load_repo_urls,
         read_yaml_file,
@@ -17,7 +17,7 @@ try:
         validate_dockerfile_syntax,
     )
 except ImportError:
-    from core.log_utils import log_error, log_info, log_warn, set_tqdm_bar, set_trace_enabled
+    from core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from core.common import (
         load_repo_urls,
         read_yaml_file,
@@ -40,12 +40,15 @@ parser.add_argument(
     help="Validate a specific repository URL (can be passed multiple times). Overrides --input-file when provided.",
 )
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
+parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--skip-hadolint-gate", action="store_true", help="Skip hadolint syntax check in validation gate")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
 parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory containing generated Dockerfiles")
 args = parser.parse_args()
 
 set_trace_enabled(args.trace)
+if args.dump_prompts:
+    set_dump_prompts_dir(args.dump_prompts)
 sem = asyncio.Semaphore(8)
 
 

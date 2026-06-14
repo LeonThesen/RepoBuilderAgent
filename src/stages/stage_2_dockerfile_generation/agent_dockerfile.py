@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
@@ -47,7 +47,7 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from core.dockerfile_utils import extract_dockerfile, get_base_template
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
@@ -117,6 +117,7 @@ parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIM
 parser.add_argument("--dockerfile-timeout", type=int, default=int(TIMEOUTS["dockerfile_timeout"]), help="Timeout for Dockerfile generation calls in seconds")
 parser.add_argument("--verify-cmd-timeout", type=int, default=int(TIMEOUTS["verify_cmd_timeout"]), help="Timeout for verification command generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
+parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated Dockerfiles")
 parser.add_argument("--one-shot-direct", action="store_true", help="Generate Dockerfile from static repository fingerprint only, without classification outputs")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint")
@@ -150,6 +151,8 @@ with open(prompt_path("PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as
 sem = asyncio.Semaphore(4)
 
 set_trace_enabled(args.trace)
+if args.dump_prompts:
+    set_dump_prompts_dir(args.dump_prompts)
 
 
 def infer_language_from_repo(repo_path: Path) -> str:

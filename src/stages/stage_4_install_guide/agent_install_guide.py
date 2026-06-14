@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -43,7 +43,7 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from core.log_utils import log_error, log_info, log_trace, log_warn, set_tqdm_bar, set_trace_enabled
+    from core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -107,6 +107,7 @@ parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max
 parser.add_argument("--llm-retry-backoff-seconds", type=float, default=float(TIMEOUTS["llm_retry_backoff_seconds"]), help="Base exponential backoff delay in seconds for LLM retries")
 parser.add_argument("--install-guide-timeout", type=int, default=int(TIMEOUTS["install_guide_timeout"]), help="Timeout for INSTALL.md generation calls in seconds")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
+parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated install guides")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
@@ -136,6 +137,8 @@ with open(prompt_path("PROMPT_INSTALL_GUIDE.md"), "r", encoding="utf-8") as prom
 sem = asyncio.Semaphore(4)
 
 set_trace_enabled(args.trace)
+if args.dump_prompts:
+    set_dump_prompts_dir(args.dump_prompts)
 
 
 

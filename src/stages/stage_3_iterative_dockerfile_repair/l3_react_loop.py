@@ -10,6 +10,34 @@ except ImportError:
     from core.common import prompt_path
 
 
+def _extract_repair_trace(result: dict, *, max_content_chars: int = 2000) -> list[dict]:
+    """Build a compact, serializable trace of the repair agent's ReAct steps.
+
+    Captures each message's role, truncated content and any tool calls (name + args)
+    so the viewer can show which tools the agent used — including the optional
+    read-only repository tools. This is the L3 analogue of the L1 react-trace.
+    """
+    trace: list[dict] = []
+    for idx, message in enumerate(result.get("messages") or [], start=1):
+        content = getattr(message, "content", "")
+        text = content if isinstance(content, str) else str(content)
+        if len(text) > max_content_chars:
+            text = text[:max_content_chars] + "\n... [truncated]"
+        tool_calls = []
+        for tc in (getattr(message, "tool_calls", None) or []):
+            if isinstance(tc, dict):
+                tool_calls.append({"name": tc.get("name"), "args": tc.get("args")})
+        trace.append(
+            {
+                "step": idx,
+                "role": getattr(message, "type", "unknown"),
+                "content": text,
+                "tool_calls": tool_calls,
+            }
+        )
+    return trace
+
+
 def _extract_react_payload(result: dict) -> dict:
     messages = result.get("messages") or []
     if not messages:
@@ -18,7 +46,7 @@ def _extract_react_payload(result: dict) -> dict:
     content = getattr(last, "content", "")
     if not isinstance(content, str) or not content.strip():
         return {}
-    match = re.search(r"```(?:yaml)?\\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
+    match = re.search(r"```(?:yaml)?\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
     yaml_text = match.group(1) if match else content
     try:
         parsed = yaml.safe_load(yaml_text)
@@ -66,12 +94,18 @@ async def run_l3_dockerfile_repair_react(
     build_hadolint_snippet_tool: Callable[[], Any],
     extract_dockerfile: Callable[[str], str],
     build_snippet_tool: "Callable[[], Any] | None" = None,
-) -> tuple[str, int]:
+    repo_tools: "list[Any] | None" = None,
+) -> tuple[str, int, list[dict]]:
     think = build_think_tool()
     hadolint_tool = build_hadolint_snippet_tool()
     tools: list[Any] = [think, hadolint_tool]
     if build_snippet_tool is not None:
         tools.append(build_snippet_tool())
+    # Optional read-only repository tools (read_file / list_tree / search_pattern) let the
+    # repair agent inspect the actual source it is fixing. They are evidence-gathering only;
+    # building/verifying/rollback stay in the deterministic outer loop.
+    if repo_tools:
+        tools.extend(repo_tools)
     _snippet_hint = (
         "Use get_dockerfile_snippet to retrieve validated RUN-block snippets for common toolchains "
         "(call with action='list_actions' to see all available snippets). "
@@ -109,7 +143,8 @@ async def run_l3_dockerfile_repair_react(
             if isinstance(last_content, str) and last_content.strip():
                 repaired = extract_dockerfile(last_content.strip())
 
-    return repaired, len(result.get("messages") or [])
+    trace = _extract_repair_trace(result)
+    return repaired, len(result.get("messages") or []), trace
 
 
 async def run_l3_verification_command_react(

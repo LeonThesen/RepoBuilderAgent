@@ -1,4 +1,4 @@
-from typing import Any, Callable
+from typing import Any, Callable, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
@@ -92,6 +92,10 @@ async def _invoke_gap_subagent(
     repo_name: str,
     summary: str,
     selected_lower: list[str],
+    build_signals: dict[str, Any],
+    runtime_signals: dict[str, Any],
+    scripts_signals: dict[str, Any],
+    source_signals: dict[str, Any],
     classification_timeout: int,
     new_prebuilt_chat_model: Callable[[int], Any],
     extract_agent_payload: Callable[[dict[str, Any]], Any],
@@ -108,9 +112,23 @@ async def _invoke_gap_subagent(
         prompt=prompt_path("PROMPT_L2_GAPCHECK_SYSTEM.md").read_text(encoding="utf-8").strip(),
     )
 
+    def _format_signal(sig: dict) -> str:
+        if not sig:
+            return "  (no output)"
+        files = sig.get("signal", [])
+        notes = sig.get("notes", [])
+        lines = [f"  files: {files}"]
+        if notes:
+            lines.append(f"  notes: {notes}")
+        return "\n".join(lines)
+
     gap_prompt = (
         prompt_path("PROMPT_L2_GAPCHECK_TASK.md").read_text(encoding="utf-8")
         .replace("{{REPO_NAME}}", repo_name)
+        .replace("{{BUILD_SIGNALS}}", _format_signal(build_signals))
+        .replace("{{RUNTIME_SIGNALS}}", _format_signal(runtime_signals))
+        .replace("{{SCRIPTS_SIGNALS}}", _format_signal(scripts_signals))
+        .replace("{{SOURCE_SIGNALS}}", _format_signal(source_signals))
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
@@ -129,12 +147,25 @@ async def _invoke_gap_subagent(
         value = payload.get(field)
         return bool(value) if isinstance(value, bool) else fallback
 
+    def _as_list(field: str) -> list:
+        if not isinstance(payload, dict):
+            return []
+        value = payload.get(field)
+        return value if isinstance(value, list) else []
+
     fallback_manifest = any(
         any(marker in path for marker in ("package.json", "pyproject.toml", "requirements", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))
         for path in selected_lower
     )
     fallback_docker = any("dockerfile" in path or "docker-compose" in path for path in selected_lower)
-    fallback_tests = any("test" in path or "spec" in path for path in selected_lower)
+    fallback_scripts = any(
+        any(marker in path for marker in ("makefile", "setup.sh", "install.sh", "build.sh", "/bin/", "/scripts/"))
+        for path in selected_lower
+    )
+    fallback_source = any(
+        any(marker in path for marker in (".env", "config.", "settings.", "src/", "lib/"))
+        for path in selected_lower
+    )
 
     return {
         "name": "gap-check",
@@ -142,7 +173,10 @@ async def _invoke_gap_subagent(
         "signal": {
             "has_manifest": _as_bool("has_manifest", fallback_manifest),
             "has_docker": _as_bool("has_docker", fallback_docker),
-            "has_tests": _as_bool("has_tests", fallback_tests),
+            "has_scripts": _as_bool("has_scripts", fallback_scripts),
+            "has_source_deps": _as_bool("has_source_deps", fallback_source),
+            "conflicts": _as_list("conflicts"),
+            "gaps": _as_list("gaps"),
         },
         "notes": notes[:8],
         "steps": len(trace),
@@ -165,8 +199,12 @@ async def _run_synthesis_subagents(
     search_selected_files,
     fetch_file_context,
 ) -> list[dict[str, Any]]:
-    class SignalSubagentState(dict):
-        pass
+    class SignalSubagentState(TypedDict, total=False):
+        build: Optional[dict]
+        runtime: Optional[dict]
+        scripts: Optional[dict]
+        source: Optional[dict]
+        gap: Optional[dict]
 
     selected_lower = [path.lower() for path in selected_files]
 
@@ -176,11 +214,15 @@ async def _run_synthesis_subagents(
     )
     runtime_fallback = _deterministic_signal_scan(
         selected_files,
-        ("dockerfile", "docker-compose", "runtime", "launch", "entrypoint"),
+        ("dockerfile", "docker-compose", "nix", "vagrantfile", "entrypoint"),
     )
-    verification_fallback = _deterministic_signal_scan(
+    scripts_fallback = _deterministic_signal_scan(
         selected_files,
-        ("test", "spec", ".github/workflows", "ci"),
+        ("makefile", "setup.sh", "install.sh", "build.sh", "/bin/", "scripts/"),
+    )
+    source_fallback = _deterministic_signal_scan(
+        selected_files,
+        (".env", ".env.example", "config.", "settings.", "src/", "lib/"),
     )
 
     async def build_node(_: SignalSubagentState) -> dict[str, Any]:
@@ -189,7 +231,7 @@ async def _run_synthesis_subagents(
                 name="build-signal-scan",
                 repo_name=repo_name,
                 summary=summary,
-                prompt_body="Identify top manifest/build-signal files relevant for installation/build planning.",
+                prompt_body="Identify top manifest/build-declaration files (e.g. package.json, pyproject.toml, Cargo.toml, pom.xml, go.mod) relevant for build and dependency planning.",
                 deterministic_fallback=build_fallback,
                 classification_timeout=classification_timeout,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
@@ -209,7 +251,7 @@ async def _run_synthesis_subagents(
                 name="runtime-signal-scan",
                 repo_name=repo_name,
                 summary=summary,
-                prompt_body="Identify top runtime/containerization-signal files relevant for execution behavior.",
+                prompt_body="Identify containerization and runtime files (e.g. Dockerfile, docker-compose.yml, Nix flakes, Vagrantfile) that describe the full execution stack.",
                 deterministic_fallback=runtime_fallback,
                 classification_timeout=classification_timeout,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
@@ -223,14 +265,14 @@ async def _run_synthesis_subagents(
             )
         }
 
-    async def verification_node(_: SignalSubagentState) -> dict[str, Any]:
+    async def scripts_node(_: SignalSubagentState) -> dict[str, Any]:
         return {
-            "verification": await _invoke_signal_subagent(
-                name="verification-signal-scan",
+            "scripts": await _invoke_signal_subagent(
+                name="scripts-signal-scan",
                 repo_name=repo_name,
                 summary=summary,
-                prompt_body="Identify top verification/test/CI signal files relevant for confidence and validation.",
-                deterministic_fallback=verification_fallback,
+                prompt_body="Identify build/install helper scripts (e.g. Makefile, setup.sh, install.sh, files in /bin or /scripts) that document manual installation steps.",
+                deterministic_fallback=scripts_fallback,
                 classification_timeout=classification_timeout,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
                 extract_agent_payload=extract_agent_payload,
@@ -243,12 +285,37 @@ async def _run_synthesis_subagents(
             )
         }
 
-    async def gap_node(_: SignalSubagentState) -> dict[str, Any]:
+    async def source_node(_: SignalSubagentState) -> dict[str, Any]:
+        return {
+            "source": await _invoke_signal_subagent(
+                name="source-signal-scan",
+                repo_name=repo_name,
+                summary=summary,
+                prompt_body="Identify source files that reveal implicit dependencies: files with import statements, .env / config files listing required ENV variables, or source files containing error strings that hint at missing system dependencies.",
+                deterministic_fallback=source_fallback,
+                classification_timeout=classification_timeout,
+                new_prebuilt_chat_model=new_prebuilt_chat_model,
+                extract_agent_payload=extract_agent_payload,
+                extract_agent_trace=extract_agent_trace,
+                normalize_text_list=normalize_text_list,
+                think=think,
+                list_selected_files=list_selected_files,
+                search_selected_files=search_selected_files,
+                fetch_file_context=fetch_file_context,
+            )
+        }
+
+    async def gap_node(state: SignalSubagentState) -> dict[str, Any]:
+        # Runs after all four scanners complete — can see their full outputs
         return {
             "gap": await _invoke_gap_subagent(
                 repo_name=repo_name,
                 summary=summary,
                 selected_lower=selected_lower,
+                build_signals=state.get("build") or {},
+                runtime_signals=state.get("runtime") or {},
+                scripts_signals=state.get("scripts") or {},
+                source_signals=state.get("source") or {},
                 classification_timeout=classification_timeout,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
                 extract_agent_payload=extract_agent_payload,
@@ -264,15 +331,19 @@ async def _run_synthesis_subagents(
     subgraph = StateGraph(SignalSubagentState)
     subgraph.add_node("build", build_node)
     subgraph.add_node("runtime", runtime_node)
-    subgraph.add_node("verification", verification_node)
+    subgraph.add_node("scripts", scripts_node)
+    subgraph.add_node("source", source_node)
     subgraph.add_node("gap", gap_node)
+    # Fan-out: 4 scanners run in parallel
     subgraph.add_edge(START, "build")
     subgraph.add_edge(START, "runtime")
-    subgraph.add_edge(START, "verification")
-    subgraph.add_edge(START, "gap")
-    subgraph.add_edge("build", END)
-    subgraph.add_edge("runtime", END)
-    subgraph.add_edge("verification", END)
+    subgraph.add_edge(START, "scripts")
+    subgraph.add_edge(START, "source")
+    # Fan-in: gap runs after all four complete, receives merged state
+    subgraph.add_edge("build", "gap")
+    subgraph.add_edge("runtime", "gap")
+    subgraph.add_edge("scripts", "gap")
+    subgraph.add_edge("source", "gap")
     subgraph.add_edge("gap", END)
     compiled = subgraph.compile()
 
@@ -280,7 +351,7 @@ async def _run_synthesis_subagents(
         {},
         config={"configurable": {"thread_id": f"{repo_name}:l2-signals"}},
     )
-    return [results["build"], results["runtime"], results["verification"], results["gap"]]
+    return [results["build"], results["runtime"], results["scripts"], results["source"], results["gap"]]
 
 
 async def run_l2_synthesis_loop(

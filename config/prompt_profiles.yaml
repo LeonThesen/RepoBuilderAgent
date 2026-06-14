@@ -2,14 +2,65 @@ default_profile: baseline_structured
 pstar_profile: baseline_structured
 
 profiles:
+  # ── Active default / P* candidate ───────────────────────────────────────────
+  # All Phase 2+ runs use this unless overridden. Update pstar_profile above
+  # once Phase 1 results identify the winning combination.
   baseline_structured:
-    few_shot_count: 1
+    few_shot_count: 0
     prompt_length_mode: detailed
     reasoning_instruction: true
     output_format_mode: structured
     temperature: 0.0
     role_framing: expert
 
+  # ── Phase 1 — OFAT prompt ablation ──────────────────────────────────────────
+  # Null baseline: absolute minimum prompt. Every Phase 1 run differs from this
+  # by exactly one variable so effects are attributable.
+  phase1_zero_baseline:
+    few_shot_count: 0
+    prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  # AB-01: role framing only (neutral → expert)
+  phase1_role_only:
+    few_shot_count: 0
+    prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: expert
+
+  # AB-02: reasoning instruction only
+  phase1_reasoning_only:
+    few_shot_count: 0
+    prompt_length_mode: concise
+    reasoning_instruction: true
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  # AB-03: prompt verbosity only (concise → detailed)
+  phase1_length_only:
+    few_shot_count: 0
+    prompt_length_mode: detailed
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  # AB-04: output format only (strict → structured)
+  phase1_format_only:
+    few_shot_count: 0
+    prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: structured
+    temperature: 0.0
+    role_framing: neutral
+
+  # ── Legacy profiles (no longer scheduled; kept for reference) ────────────────
   concise_neutral:
     few_shot_count: 0
     prompt_length_mode: concise

@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,11 +17,11 @@ import yaml
 from openai import APIConnectionError, APIError, APITimeoutError
 
 try:
-    from RepoBuilderAgent.src.core.log_utils import log_info, log_warn
+    from RepoBuilderAgent.src.core.log_utils import dump_prompt, log_info, log_warn
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
-    from core.log_utils import log_info, log_warn
+    from core.log_utils import dump_prompt, log_info, log_warn
     from retrieval.repo_fingerprint import fingerprint
 
 
@@ -78,6 +79,17 @@ def is_retryable_api_error(error: APIError) -> bool:
     return status_code in {408, 409, 429} or status_code >= 500
 
 
+_RESPONSES_API_MODELS = {"gpt-5-codex"}
+
+
+def _normalize_responses_output(raw) -> types.SimpleNamespace:
+    """Wrap a responses API result to the same interface as chat.completions."""
+    text = getattr(raw, "output_text", "") or ""
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
+    )
+
+
 async def chat_completion_with_retries(
     *,
     client,
@@ -93,16 +105,23 @@ async def chat_completion_with_retries(
 ):
     bucket = _phase_bucket(metrics, phase)
     last_error: Exception | None = None
+    dump_prompt(repo_url, phase, messages)
+    use_responses_api = model in _RESPONSES_API_MODELS
 
     for attempt in range(1, max_retries + 2):
         bucket["calls"] += 1
         started = time.perf_counter()
         try:
-            response = await client.with_options(timeout=timeout_seconds).chat.completions.create(
-                model=model,
-                temperature=temperature,
-                messages=messages,
-            )
+            c = client.with_options(timeout=timeout_seconds)
+            if use_responses_api:
+                raw = await c.responses.create(model=model, input=messages)
+                response = _normalize_responses_output(raw)
+            else:
+                response = await c.chat.completions.create(
+                    model=model,
+                    temperature=temperature,
+                    messages=messages,
+                )
             latency = round(time.perf_counter() - started, 3)
             bucket["success"] += 1
             bucket["latencies_seconds"].append(latency)

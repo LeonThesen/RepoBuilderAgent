@@ -26,6 +26,8 @@ def make_prebuilt_chat_model_factory(
             "max_retries": max_retries,
             "http_async_client": http_async_client,
         }
+        if model == "gpt-5-codex":
+            kwargs["use_responses_api"] = True
         return ChatOpenAI(**kwargs)
 
     return _new_prebuilt_chat_model

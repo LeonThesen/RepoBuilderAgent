@@ -16,7 +16,7 @@ DEFAULT_FACTORS = {
 
 
 def _config_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "config" / "prompt_profiles.yaml"
+    return Path(__file__).resolve().parent.parent.parent / "config" / "prompt_profiles.yaml"
 
 
 def _to_bool(value: Any, fallback: bool) -> bool:
