@@ -1482,6 +1482,13 @@ def main() -> int:
             str(resolve_output_dir(workspace_root, run_dir, getattr(args, attr_name), default_value, run_subdir)),
         )
 
+    # Anchor the run dir to the (possibly eval-provided) output dirs so the lock
+    # and summary live alongside the real artifacts. Under eval, the dirs above
+    # point at eval's run dir; without this the self-computed run-<id> spawned a
+    # throwaway runs/run-<id>/ holding only runtime-config-lock.yaml on every
+    # per-repo invocation, littering runs/ and burying the real run.
+    run_dir = Path(args.pipeline_reports_dir).parent
+
     python_executable = resolve_python_executable(workspace_root)
     reports_dir = Path(args.pipeline_reports_dir)
     run_logs_dir = reports_dir / run_id
