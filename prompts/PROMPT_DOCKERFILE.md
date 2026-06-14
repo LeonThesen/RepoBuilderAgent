@@ -18,6 +18,7 @@ Your task is to:
      - Final CMD or ENTRYPOINT if the repo is an application
   3. Add any additional system packages needed for THIS specific repo (if not already in base template).
   4. Follow these additional guidelines:
+     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `apt-get install -y` up front (run `apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim — prefer UNVERSIONED toolchain packages (build-essential, gcc, g++, clang) over version-pinned names like `gcc-11` that may not exist in forky; install `gnupg`+`ca-certificates` before any `gpg`/key step.
      - Be conservative. Only include commands and dependencies supported by provided evidence.
      - Do not use insecure TLS bypasses (curl -k, strict-ssl=false) unless explicitly required.
      - Never bake secrets into the image; use comments for unclear values.
