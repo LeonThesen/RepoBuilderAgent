@@ -652,6 +652,30 @@ async def get_image_runtime_context(image_tag: str) -> tuple[str, str]:
     return user.strip(), workdir.strip()
 
 
+async def get_image_size_bytes(image_tag: str) -> int | None:
+    """Total size of the built image in bytes (docker image inspect .Size). None on error."""
+    command = [
+        args.container_cli,
+        "image",
+        "inspect",
+        "--format",
+        "{{.Size}}",
+        image_tag,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await process.communicate()
+    if process.returncode != 0:
+        return None
+    try:
+        return int(output.decode("utf-8", errors="replace").strip())
+    except ValueError:
+        return None
+
+
 def _extract_direct_exec_command(smoke_command: str) -> list[str] | None:
     command = smoke_command.strip()
     if command.startswith("export PATH=") and ";" in command:
@@ -1264,6 +1288,8 @@ async def repair_repository(
                 )
 
                 if exit_code == 0:
+                    # Record final image size (quality metric: multi-stage builds aim small).
+                    report["attempts"][-1]["image_size_bytes"] = await get_image_size_bytes(image_tag)
                     verify_log_path = report_dir / f"attempt-{attempt}.verify.log"
                     log_info(
                         f"Running build verification for {repo_url} using command: {verify_command_to_use}"

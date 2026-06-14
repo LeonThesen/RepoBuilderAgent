@@ -9,6 +9,8 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import shutil
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -436,6 +438,21 @@ def detect_error_recurrence(attempts: list[dict]) -> bool:
 # Dockerfile analysis
 # ---------------------------------------------------------------------------
 
+def _hadolint_warning_count(df_path: Path) -> Optional[int]:
+    """Count hadolint findings on the final Dockerfile. None if hadolint is unavailable."""
+    if shutil.which("hadolint") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["hadolint", "--no-fail", "--format", "json", str(df_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        findings = json.loads(proc.stdout or "[]")
+        return len(findings) if isinstance(findings, list) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def analyze_dockerfile(workspace_root: Path, repo_url: str, dockerfiles_dir: str = "dockerfiles") -> dict:
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     df_path = workspace_root / dockerfiles_dir / f"{repo_name}.Dockerfile"
@@ -458,6 +475,7 @@ def analyze_dockerfile(workspace_root: Path, repo_url: str, dockerfiles_dir: str
         "byte_count": len(content.encode("utf-8")),
         "run_layers": run_layers,
         "base_image": base_image,
+        "hadolint_warnings": _hadolint_warning_count(df_path),
     }
 
 
@@ -516,6 +534,12 @@ def compute_repo_metrics(
                 break
 
         binary_metrics_raw = report.get("binary_metrics") or {}
+        # Final image size recorded on the successful-build attempt (None if pre-dating capture).
+        image_size_bytes = None
+        if successful_attempt is not None:
+            succ = next((a for a in attempts if a.get("attempt") == successful_attempt), None)
+            if succ:
+                image_size_bytes = succ.get("image_size_bytes")
         repair_metrics = {
             "build_success": build_success,
             "first_attempt_success": bool(build_success and successful_attempt == 1),
@@ -527,6 +551,7 @@ def compute_repo_metrics(
             "error_recurrence": detect_error_recurrence(attempts),
             "binary_size_plausible": binary_metrics_raw.get("binary_size_plausible"),
             "binary_hash_match": binary_metrics_raw.get("binary_hash_match"),
+            "image_size_bytes": image_size_bytes,
         }
 
     dockerfile_metrics = analyze_dockerfile(workspace_root, repo_url, dockerfiles_dir)
@@ -739,6 +764,21 @@ def compute_aggregate_metrics(
     df_lines_valid = [v for v in df_lines if v is not None]
     df_runs = [r.get("metrics", {}).get("dockerfile", {}).get("run_layers") for r in results]
     df_runs_valid = [v for v in df_runs if v is not None]
+    hado = [r.get("metrics", {}).get("dockerfile", {}).get("hadolint_warnings") for r in results]
+    hado_valid = [v for v in hado if v is not None]
+
+    # Final image size (bytes), recorded on successful builds.
+    img_sizes = sorted(
+        v for v in (r.get("metrics", {}).get("repair", {}).get("image_size_bytes") for r in results)
+        if isinstance(v, int) and v > 0
+    )
+    image_size = {
+        "builds_measured": len(img_sizes),
+        "mean_mb": round(sum(img_sizes) / len(img_sizes) / 1_048_576, 1),
+        "median_mb": round(_percentile(img_sizes, 50) / 1_048_576, 1),
+        "p90_mb": round(_percentile(img_sizes, 90) / 1_048_576, 1),
+        "max_mb": round(img_sizes[-1] / 1_048_576, 1),
+    } if img_sizes else {}
 
     # Wall-clock: per-repo durations recorded by eval.py. Skipped repos have 0.0,
     # so a positive-value filter keeps only repos that actually executed.
@@ -795,7 +835,9 @@ def compute_aggregate_metrics(
         "dockerfile_stats": {
             "line_count": {"mean": round(sum(df_lines_valid) / len(df_lines_valid), 1), "min": min(df_lines_valid), "max": max(df_lines_valid)} if df_lines_valid else {},
             "run_layers": {"mean": round(sum(df_runs_valid) / len(df_runs_valid), 1), "min": min(df_runs_valid), "max": max(df_runs_valid)} if df_runs_valid else {},
+            "hadolint_warnings": {"dockerfiles_linted": len(hado_valid), "mean": round(sum(hado_valid) / len(hado_valid), 1), "min": min(hado_valid), "max": max(hado_valid)} if hado_valid else {},
         },
+        "image_size": image_size,
         "ground_truth_scores": _aggregate_gt_scores(results),
         "retrieval_quality": _aggregate_retrieval_quality(results),
     }
