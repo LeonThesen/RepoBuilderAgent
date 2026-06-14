@@ -6,6 +6,7 @@ Import this module instead of duplicating logic between the two scripts.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from collections import defaultdict
@@ -470,6 +471,7 @@ def compute_repo_metrics(
     reports_dir: str = "repair-reports",
     dockerfiles_dir: str = "dockerfiles",
     results_dir: str = "classification_results",
+    summaries_dir: str = "summaries",
     dataset_dir: Optional[Path] = None,
     ground_truth_index: Optional[dict] = None,
 ) -> dict:
@@ -543,6 +545,14 @@ def compute_repo_metrics(
             dockerfiles_dir=dockerfiles_dir,
         )
 
+    # Retrieval quality: L1 selected files vs curated gold set (only when both exist).
+    retrieval_quality = None
+    if dataset_dir is not None:
+        gold = get_gt_install_relevant_files(load_gt_for_repo(dataset_dir, repo_url))
+        predicted = read_selected_files(workspace_root, repo_url, summaries_dir)
+        if gold and predicted is not None:
+            retrieval_quality = compute_retrieval_quality(predicted, gold)
+
     return {
         "tokens": {
             "by_phase": phase_tokens,
@@ -551,6 +561,7 @@ def compute_repo_metrics(
         "repair": repair_metrics,
         "dockerfile": dockerfile_metrics,
         "ground_truth_comparison": gt_comparison,
+        "retrieval_quality": retrieval_quality,
     }
 
 
@@ -588,6 +599,66 @@ def compute_cost_usd(total_tokens: dict, model: Optional[str], pricing: Optional
         "input_usd": round(input_usd, 4),
         "output_usd": round(output_usd, 4),
         "total_usd": round(input_usd + output_usd, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Retrieval quality (Stage 1 L1 file selection vs curated gold set)
+# ---------------------------------------------------------------------------
+
+def _norm_path(p: str) -> str:
+    return p.strip().lstrip("./").replace("\\", "/")
+
+
+def get_gt_install_relevant_files(gt_doc: Optional[dict]) -> list[str]:
+    """Curated gold set: categories.install_relevant_files.value (empty if absent)."""
+    if not gt_doc:
+        return []
+    v = (gt_doc.get("categories") or {}).get("install_relevant_files") or {}
+    val = v.get("value") if isinstance(v, dict) else None
+    return val if isinstance(val, list) else []
+
+
+def read_selected_files(workspace_root: Path, repo_url: str, summaries_dir: str = "summaries") -> Optional[list[str]]:
+    """Read the L1 prediction artifact: {repo}.selected-files.yaml -> selected_files."""
+    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+    doc = _load_yaml(workspace_root / summaries_dir / f"{repo_name}.selected-files.yaml")
+    if not doc:
+        return None
+    sf = doc.get("selected_files")
+    return sf if isinstance(sf, list) else None
+
+
+def compute_retrieval_quality(predicted: list[str], gold: list[str]) -> Optional[dict]:
+    """Glob-aware precision/recall/F1 of L1-selected files vs the curated gold set.
+
+    `predicted` entries may be concrete paths or globs (e.g. '.github/workflows/*.yml');
+    `gold` is the curated concrete file list. A gold file is covered (recall) if some
+    predicted entry equals or glob-matches it; a predicted entry is a hit (precision) if
+    it matches at least one gold file. Returns None when no gold set exists for the repo.
+    """
+    gold_set = {_norm_path(g) for g in gold if isinstance(g, str) and g.strip()}
+    if not gold_set:
+        return None
+    pred_unique = list(dict.fromkeys(_norm_path(p) for p in predicted if isinstance(p, str) and p.strip()))
+
+    def matches(p: str, g: str) -> bool:
+        return p == g or fnmatch.fnmatch(g, p)
+
+    covered = {g for g in gold_set if any(matches(p, g) for p in pred_unique)}
+    hits = [p for p in pred_unique if any(matches(p, g) for g in gold_set)]
+
+    precision = round(len(hits) / len(pred_unique), 4) if pred_unique else 0.0
+    recall = round(len(covered) / len(gold_set), 4)
+    f1 = round(2 * precision * recall / (precision + recall), 4) if (precision + recall) else 0.0
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "predicted_count": len(pred_unique),
+        "gold_count": len(gold_set),
+        "matched_gold": len(covered),
+        "missed_gold": sorted(gold_set - covered),
     }
 
 
@@ -726,6 +797,25 @@ def compute_aggregate_metrics(
             "run_layers": {"mean": round(sum(df_runs_valid) / len(df_runs_valid), 1), "min": min(df_runs_valid), "max": max(df_runs_valid)} if df_runs_valid else {},
         },
         "ground_truth_scores": _aggregate_gt_scores(results),
+        "retrieval_quality": _aggregate_retrieval_quality(results),
+    }
+
+
+def _aggregate_retrieval_quality(results: list[dict]) -> dict:
+    """Mean precision/recall/F1 of L1 file selection over repos with a curated gold set."""
+    rqs = [
+        r["metrics"]["retrieval_quality"]
+        for r in results
+        if r.get("metrics", {}).get("retrieval_quality")
+    ]
+    if not rqs:
+        return {"available": 0}
+    n = len(rqs)
+    return {
+        "available": n,
+        "mean_precision": round(sum(q["precision"] for q in rqs) / n, 4),
+        "mean_recall": round(sum(q["recall"] for q in rqs) / n, 4),
+        "mean_f1": round(sum(q["f1"] for q in rqs) / n, 4),
     }
 
 
