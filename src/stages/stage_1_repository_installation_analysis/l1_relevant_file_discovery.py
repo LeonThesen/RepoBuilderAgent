@@ -6,6 +6,7 @@ from langgraph.store.memory import InMemoryStore
 
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
+        build_finalize_tool,
         build_list_tree_tool,
         build_read_file_tool,
         build_read_gitlog_tool,
@@ -18,6 +19,7 @@ try:
     from RepoBuilderAgent.src.core.common import prompt_path
 except ImportError:
     from agent_tools.react_loop_tools import (
+        build_finalize_tool,
         build_list_tree_tool,
         build_read_file_tool,
         build_read_gitlog_tool,
@@ -119,7 +121,7 @@ async def select_files_by_iterative_react(
 
     retrieval_agent = create_agent(
         model=new_prebuilt_chat_model(selection_timeout),
-        tools=[think, list_tree, search_pattern, read_file, read_gitlog, search_commits, search_structure_paths, select_default_files],
+        tools=[think, list_tree, search_pattern, read_file, read_gitlog, search_commits, search_structure_paths, select_default_files, build_finalize_tool()],
         system_prompt=prompt_path("PROMPT_L1_SYSTEM.md").read_text(encoding="utf-8").strip(),
         checkpointer=InMemorySaver(),
         store=InMemoryStore(),

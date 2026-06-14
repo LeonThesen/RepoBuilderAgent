@@ -6,6 +6,7 @@ from langgraph.prebuilt import create_react_agent
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
+        build_finalize_tool,
         build_get_dockerfile_snippet_tool,
         build_hadolint_snippet_tool,
         build_list_selected_files_tool,
@@ -13,11 +14,15 @@ try:
         build_search_commits_tool,
         build_search_selected_files_tool,
         build_think_tool,
+        extract_finalize_answer,
+        hit_step_limit,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
     from agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
+        build_finalize_tool,
         build_get_dockerfile_snippet_tool,
         build_hadolint_snippet_tool,
         build_list_selected_files_tool,
@@ -25,8 +30,11 @@ except ImportError:
         build_search_commits_tool,
         build_search_selected_files_tool,
         build_think_tool,
+        extract_finalize_answer,
+        hit_step_limit,
     )
     from core.common import prompt_path
+    from core.log_utils import log_warn
 
 
 def _deterministic_signal_scan(selected_files: list[str], markers: tuple[str, ...], limit: int = 8) -> list[str]:
@@ -52,7 +60,7 @@ async def _invoke_signal_subagent(
 ) -> dict[str, Any]:
     signal_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context],
+        tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
         prompt=prompt_path("PROMPT_L2_SIGNAL_SYSTEM.md").read_text(encoding="utf-8").strip(),
     )
 
@@ -108,7 +116,7 @@ async def _invoke_gap_subagent(
 ) -> dict[str, Any]:
     gap_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context],
+        tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
         prompt=prompt_path("PROMPT_L2_GAPCHECK_SYSTEM.md").read_text(encoding="utf-8").strip(),
     )
 
@@ -425,7 +433,7 @@ async def run_l2_synthesis_loop(
         else []
     )
 
-    _generator_tools = [think, list_selected_files, search_selected_files, fetch_file_context, read_gitlog, search_commits, hadolint_check]
+    _generator_tools = [think, list_selected_files, search_selected_files, fetch_file_context, read_gitlog, search_commits, hadolint_check, build_finalize_tool()]
     if get_dockerfile_snippet is not None:
         _generator_tools.append(get_dockerfile_snippet)
     _snippet_hint_generator = (
@@ -454,7 +462,7 @@ async def run_l2_synthesis_loop(
 
     generation_result = await synthesis_generator.ainvoke(
         {"messages": [{"role": "user", "content": synthesis_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": max(8, int(synthesis_react_max_steps) * 4)},
+        config={"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": max(20, int(synthesis_react_max_steps) * 6)},
     )
     generation_payload = extract_agent_payload(generation_result)
     updates = normalize_text_list(generation_payload.get("hypothesis_updates") if isinstance(generation_payload, dict) else [])
@@ -464,9 +472,16 @@ async def run_l2_synthesis_loop(
     generated_hypotheses = list(dict.fromkeys(item.strip() for item in (base_hypotheses + updates) if item and item.strip()))
     generated_risks = list(dict.fromkeys(item.strip() for item in (risk_notes + risk_updates) if item and item.strip()))
     generator_trace = extract_agent_trace(generation_result)
-    generator_stop_reason = "model_done" if done_flag else "agent_converged"
+    if not generation_payload and hit_step_limit(generation_result):
+        log_warn(
+            f"[l2-synthesis {repo_name}] generator hit the recursion_limit without "
+            f"finalizing; generation payload empty."
+        )
+        generator_stop_reason = "recursion_limit_hit"
+    else:
+        generator_stop_reason = "model_done" if done_flag else "agent_converged"
 
-    _reviewer_tools = [think, list_selected_files, search_selected_files, fetch_file_context, read_gitlog, search_commits, hadolint_check]
+    _reviewer_tools = [think, list_selected_files, search_selected_files, fetch_file_context, read_gitlog, search_commits, hadolint_check, build_finalize_tool()]
     if get_dockerfile_snippet is not None:
         _reviewer_tools.append(get_dockerfile_snippet)
     _snippet_hint_reviewer = (
@@ -507,7 +522,7 @@ async def run_l2_synthesis_loop(
             {"messages": [{"role": "user", "content": reviewer_prompt}]},
             config={
                 "configurable": {"thread_id": f"{repo_name}:l2-review:r{round_index + 1}"},
-                "recursion_limit": max(8, int(synthesis_react_max_steps) * 4),
+                "recursion_limit": max(20, int(synthesis_react_max_steps) * 6),
             },
         )
         review_rounds_executed += 1

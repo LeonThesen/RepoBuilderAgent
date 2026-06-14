@@ -272,6 +272,61 @@ def build_search_selected_files_tool(selected_files: list[str]) -> Callable[[str
     return search_selected_files
 
 
+def build_finalize_tool() -> Callable:
+    @tool
+    def finalize(answer: str) -> str:
+        """Submit your FINAL answer as YAML and end the task. Call this exactly once,
+        as your LAST action, when you have enough evidence OR when you are near your
+        tool-call budget. Do not call any other tool after finalize."""
+        return "finalized"
+    return finalize
+
+
+def extract_finalize_answer(messages) -> "str | None":
+    """Scan messages in reverse for an AIMessage whose tool_calls contains a call
+    named 'finalize', and return its args['answer'] string.
+
+    Handles tool_call being a dict (LangGraph standard) or an object with .name/.args,
+    and args being a dict or an object exposing .answer / ['answer'].
+    Returns None when no finalize call with a usable answer is found.
+    """
+    for message in reversed(list(messages or [])):
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                name = tc.get("name")
+                tc_args = tc.get("args")
+            else:
+                name = getattr(tc, "name", None)
+                tc_args = getattr(tc, "args", None)
+            if name != "finalize":
+                continue
+            answer = None
+            if isinstance(tc_args, dict):
+                answer = tc_args.get("answer")
+            elif tc_args is not None:
+                answer = getattr(tc_args, "answer", None)
+            if isinstance(answer, str) and answer.strip():
+                return answer
+    return None
+
+
+def hit_step_limit(result) -> bool:
+    """True if the ReAct loop ended on LangGraph's recursion-limit placeholder.
+
+    LangGraph emits the message content "Sorry, need more steps to process this
+    request." as the last message when the agent exhausts its recursion_limit.
+    """
+    messages = (result or {}).get("messages") or [] if isinstance(result, dict) else []
+    if not messages:
+        return False
+    content = getattr(messages[-1], "content", "")
+    text = content if isinstance(content, str) else str(content)
+    return text.strip() == "Sorry, need more steps to process this request."
+
+
 def build_think_tool() -> Callable[[str], str]:
     @tool
     def think(note: str) -> str:

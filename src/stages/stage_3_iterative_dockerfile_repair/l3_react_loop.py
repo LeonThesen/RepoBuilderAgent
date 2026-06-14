@@ -6,8 +6,33 @@ from langgraph.prebuilt import create_react_agent
 
 try:
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.log_utils import log_warn
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
+        build_finalize_tool,
+        extract_finalize_answer,
+        hit_step_limit,
+    )
 except ImportError:
     from core.common import prompt_path
+    from core.log_utils import log_warn
+    from agent_tools.react_loop_tools import (
+        build_finalize_tool,
+        extract_finalize_answer,
+        hit_step_limit,
+    )
+
+
+def _parse_react_yaml(text: str) -> dict:
+    """Parse a YAML payload from raw model/tool text (fenced block preferred)."""
+    if not isinstance(text, str) or not text.strip():
+        return {}
+    match = re.search(r"```(?:yaml)?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    yaml_text = match.group(1) if match else text
+    try:
+        parsed = yaml.safe_load(yaml_text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _extract_repair_trace(result: dict, *, max_content_chars: int = 2000) -> list[dict]:
@@ -39,20 +64,34 @@ def _extract_repair_trace(result: dict, *, max_content_chars: int = 2000) -> lis
 
 
 def _extract_react_payload(result: dict) -> dict:
+    # (1) structured_response if dict.
+    structured = result.get("structured_response")
+    if isinstance(structured, dict):
+        return structured
+
     messages = result.get("messages") or []
-    if not messages:
-        return {}
-    last = messages[-1]
-    content = getattr(last, "content", "")
-    if not isinstance(content, str) or not content.strip():
-        return {}
-    match = re.search(r"```(?:yaml)?\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
-    yaml_text = match.group(1) if match else content
-    try:
-        parsed = yaml.safe_load(yaml_text)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+
+    # (2) prefer the finalize tool-call's answer when present.
+    finalize_answer = extract_finalize_answer(messages)
+    if finalize_answer is not None:
+        parsed = _parse_react_yaml(finalize_answer)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+
+    # (3) trailing-message YAML fallback.
+    if messages:
+        content = getattr(messages[-1], "content", "")
+        parsed = _parse_react_yaml(content)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+
+    # (4) {} — surface the silent recursion-limit failure.
+    if hit_step_limit(result):
+        log_warn(
+            "[l3] ReAct repair/verify agent yielded empty payload after hitting the "
+            "LangGraph recursion_limit (placeholder 'Sorry, need more steps...'); returning {}."
+        )
+    return {}
 
 
 def _extract_react_command(result: dict, candidate_keys: list[str]) -> str:
@@ -98,7 +137,7 @@ async def run_l3_dockerfile_repair_react(
 ) -> tuple[str, int, list[dict]]:
     think = build_think_tool()
     hadolint_tool = build_hadolint_snippet_tool()
-    tools: list[Any] = [think, hadolint_tool]
+    tools: list[Any] = [think, hadolint_tool, build_finalize_tool()]
     if build_snippet_tool is not None:
         tools.append(build_snippet_tool())
     # Optional read-only repository tools (read_file / list_tree / search_pattern) let the
@@ -144,6 +183,12 @@ async def run_l3_dockerfile_repair_react(
                 repaired = extract_dockerfile(last_content.strip())
 
     trace = _extract_repair_trace(result)
+    if not repaired and hit_step_limit(result):
+        log_warn(
+            f"[l3 repair attempt {attempt_number}] hit the LangGraph recursion_limit "
+            f"without producing a repaired Dockerfile; tagging trace recursion_limit_hit."
+        )
+        trace.append({"step": len(trace) + 1, "role": "system", "content": "", "tool_calls": [], "stop_reason": "recursion_limit_hit"})
     return repaired, len(result.get("messages") or []), trace
 
 
@@ -162,7 +207,7 @@ async def run_l3_verification_command_react(
     think = build_think_tool()
     verify_agent = create_react_agent(
         model=new_prebuilt_chat_model(verify_timeout),
-        tools=[think],
+        tools=[think, build_finalize_tool()],
         prompt=system_prompt,
     )
 

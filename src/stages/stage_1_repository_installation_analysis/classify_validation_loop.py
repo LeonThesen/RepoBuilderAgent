@@ -6,19 +6,27 @@ from langgraph.prebuilt import create_react_agent
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
+        build_finalize_tool,
         build_list_selected_files_tool,
         build_search_selected_files_tool,
         build_think_tool,
+        extract_finalize_answer,
+        hit_step_limit,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
     from agent_tools.react_loop_tools import (
         build_fetch_file_context_tool,
+        build_finalize_tool,
         build_list_selected_files_tool,
         build_search_selected_files_tool,
         build_think_tool,
+        extract_finalize_answer,
+        hit_step_limit,
     )
     from core.common import prompt_path
+    from core.log_utils import log_warn
 
 
 def _truncate_for_prompt(text: str, max_chars: int = 12000) -> str:
@@ -94,7 +102,7 @@ async def run_classify_validation_loop(
 
     validation_agent = create_react_agent(
         model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context],
+        tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
         prompt=prompt_path("PROMPT_L1_VALIDATION_SYSTEM.md").read_text(encoding="utf-8").strip(),
     )
 
@@ -111,7 +119,7 @@ async def run_classify_validation_loop(
 
     result = await validation_agent.ainvoke(
         {"messages": [{"role": "user", "content": validation_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": max(8, int(validation_react_max_steps) * 4)},
+        config={"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": max(20, int(validation_react_max_steps) * 6)},
     )
     payload = extract_agent_payload(result)
     parsed_checks = normalize_validation_checks(payload.get("checks") if isinstance(payload, dict) else {})
@@ -126,7 +134,14 @@ async def run_classify_validation_loop(
         }
 
     loop_trace = extract_agent_trace(result)
-    stop_reason = "model_done" if done_flag else "agent_converged"
+    if not payload and hit_step_limit(result):
+        log_warn(
+            f"[classify-validation {repo_url}] ReAct agent hit the recursion_limit "
+            f"without finalizing; validation payload empty."
+        )
+        stop_reason = "recursion_limit_hit"
+    else:
+        stop_reason = "model_done" if done_flag else "agent_converged"
 
     validation_warnings = [
         key

@@ -43,6 +43,7 @@ try:
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
@@ -71,6 +72,7 @@ except ImportError:
     from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import preprocess_repository
+    from agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -536,11 +538,24 @@ class AgentPayload(TypedDict, total=False):
 
 
 def _extract_agent_payload(result: dict[str, Any]) -> AgentPayload:
+    # (1) structured_response if dict.
     payload = result.get("structured_response")
     if isinstance(payload, dict):
         return cast(AgentPayload, payload)
 
     messages = result.get("messages") or []
+
+    # (2) prefer the finalize tool-call's answer when present.
+    finalize_answer = extract_finalize_answer(messages)
+    if finalize_answer is not None:
+        try:
+            parsed = parse_llm_yaml(finalize_answer)
+            if isinstance(parsed, dict):
+                return cast(AgentPayload, parsed)
+        except Exception:
+            pass
+
+    # (3) trailing-message YAML fallback.
     if messages:
         last = messages[-1]
         content = getattr(last, "content", "")
@@ -551,6 +566,13 @@ def _extract_agent_payload(result: dict[str, Any]) -> AgentPayload:
                     return cast(AgentPayload, parsed)
             except Exception:
                 pass
+
+    # (4) {} — surface the silent recursion-limit failure.
+    if hit_step_limit(result):
+        log_warn(
+            "[classify] ReAct agent yielded empty payload after hitting the LangGraph "
+            "recursion_limit (placeholder 'Sorry, need more steps...'); returning {}."
+        )
     return {}
 
 
