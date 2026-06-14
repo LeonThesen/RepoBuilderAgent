@@ -23,6 +23,7 @@ same way in both places.
 from __future__ import annotations
 
 import importlib
+import sys
 from dataclasses import dataclass, field
 
 # Phase identifiers — must match the run_step() names used in agent_pipeline.py.
@@ -123,16 +124,28 @@ def resolve_symbol(dotted: str) -> tuple[bool, str]:
         return False, f"malformed symbol '{dotted}' (expected 'module:attr')"
     module_path, attr = dotted.split(":", 1)
     last_error = "no import prefix succeeded"
-    for prefix in _IMPORT_PREFIXES:
-        try:
-            module = importlib.import_module(prefix + module_path)
-        except Exception as exc:  # noqa: BLE001 — any import failure means not wired
-            last_error = f"import {prefix + module_path} failed: {exc}"
-            continue
-        if not hasattr(module, attr):
-            return False, f"module {prefix + module_path} has no attribute '{attr}'"
-        return True, f"{prefix + module_path}:{attr}"
-    return False, last_error
+    # Some stage modules call parser.parse_args() at import time. Importing them
+    # here to verify wiring would otherwise parse the *pipeline's* argv with the
+    # *stage's* parser and sys.exit. Neutralize argv during import (the test
+    # harness does the same) and tolerate a module that exits at import.
+    saved_argv = sys.argv
+    sys.argv = [saved_argv[0] if saved_argv else "arch_wiring_probe"]
+    try:
+        for prefix in _IMPORT_PREFIXES:
+            try:
+                module = importlib.import_module(prefix + module_path)
+            except SystemExit as exc:  # module-level parse_args() exited
+                last_error = f"import {prefix + module_path} called sys.exit({exc.code}) at import time"
+                continue
+            except Exception as exc:  # noqa: BLE001 — any import failure means not wired
+                last_error = f"import {prefix + module_path} failed: {exc}"
+                continue
+            if not hasattr(module, attr):
+                return False, f"module {prefix + module_path} has no attribute '{attr}'"
+            return True, f"{prefix + module_path}:{attr}"
+        return False, last_error
+    finally:
+        sys.argv = saved_argv
 
 
 def active_components(flags: dict) -> list[Component]:
