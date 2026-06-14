@@ -29,6 +29,16 @@ except ImportError:
     )
     from core.common import prompt_path
 
+try:
+    from RepoBuilderAgent.src.core.log_utils import log_warn
+except ImportError:
+    from core.log_utils import log_warn
+
+try:
+    from langgraph.errors import GraphRecursionError
+except ImportError:  # langgraph version without a dedicated error class
+    GraphRecursionError = RecursionError
+
 
 def _hard_cap_selected_files(candidates: list[str], default_selected_files: list[str], cap: int) -> list[str]:
     """Enforce a strict final cap while keeping high-signal evidence first."""
@@ -116,17 +126,32 @@ async def select_files_by_iterative_react(
         name="l1_retrieval_agent",
     )
 
-    result = await retrieval_agent.ainvoke(
-        {"messages": [{"role": "user", "content": step1_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l1"}, "recursion_limit": max(12, int(react_max_steps) * 6)},
-    )
+    final_cap = min(max_total, max(1, int(react_final_cap)))
+    try:
+        result = await retrieval_agent.ainvoke(
+            {"messages": [{"role": "user", "content": step1_prompt}]},
+            config={"configurable": {"thread_id": f"{repo_name}:l1"}, "recursion_limit": max(30, int(react_max_steps) * 8)},
+        )
+    except GraphRecursionError:
+        # The ReAct loop never emitted a finalize action within the step budget
+        # (common when the repo surfaces no obvious manifest). Don't crash the repo
+        # — fall back to the heuristic default selection so classification can still
+        # proceed. Previously this propagated and the repo produced nothing.
+        log_warn(
+            f"[l1 {repo_name}] iterative_react hit the recursion limit without "
+            f"converging; falling back to default file selection."
+        )
+        selected_files = _hard_cap_selected_files(default_selected_files, default_selected_files, cap=final_cap)
+        if not selected_files:
+            selected_files = default_selected_files.copy()
+        return selected_files, step1_tokens_total, [], "recursion_limit_fallback"
     payload = extract_agent_payload(result)
     raw_selected = payload.get("selected_files") if isinstance(payload, dict) else []
     prelim_selected = normalize_text_list(raw_selected)[:max_total]
     selected_files = _hard_cap_selected_files(
         prelim_selected,
         default_selected_files,
-        cap=min(max_total, max(1, int(react_final_cap))),
+        cap=final_cap,
     )
     stop_reason = "model_done" if bool(payload.get("done", False)) else "agent_converged"
     react_trace = extract_agent_trace(result)
