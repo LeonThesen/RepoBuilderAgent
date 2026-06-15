@@ -133,9 +133,9 @@ async def run_architecture_state_graph(
     validation_artifact = result.get(
         "validation_artifact",
         {
-            "repo": repo_url,
+            "repo": repo.url,
             "stage": "validation",
-            "react": {"steps": 0, "max_steps": max(1, int(validation_react_max_steps)), "stop_reason": "disabled"},
+            "react": {"steps": 0, "max_steps": max(1, int(config.validation_react_max_steps)), "stop_reason": "disabled"},
             "checks": {},
             "warnings": [],
             "loop_trace": [],
