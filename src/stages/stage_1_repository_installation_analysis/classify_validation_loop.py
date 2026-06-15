@@ -1,4 +1,4 @@
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 from langgraph.checkpoint.memory import InMemorySaver
@@ -20,6 +20,7 @@ try:
         hooked_tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
     from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
     from agent_tools.react_loop_tools import (
@@ -37,6 +38,7 @@ except ImportError:
         hooked_tool_call_budget,
     )
     from core.common import prompt_path
+    from core.agent_runtime import ClassifyRuntime
     from core.log_utils import log_warn
 
 
@@ -79,13 +81,15 @@ async def run_classify_validation_loop(
     file_context_by_path: dict[str, str],
     classification_timeout: int,
     validation_react_max_steps: int,
-    model_name: str,
-    new_prebuilt_chat_model: Callable[[int], Any],
-    extract_agent_payload: Callable[[dict[str, Any]], Any],
-    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
-    normalize_text_list: Callable[[Any], list[str]],
-    normalize_validation_checks: Callable[[Any], dict[str, dict[str, str]]],
+    runtime: ClassifyRuntime,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    model_name = runtime.model_name
+    new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
+    extract_agent_payload = runtime.extract_agent_payload
+    extract_agent_trace = runtime.extract_agent_trace
+    normalize_text_list = runtime.normalize_text_list
+    normalize_validation_checks = runtime.normalize_validation_checks
+
     selected_lower = [path.lower() for path in selected_files]
     has_manifest = any(
         any(marker in path for marker in ("package.json", "requirements.txt", "pyproject.toml", "go.mod", "cargo.toml", "pom.xml", "build.gradle"))

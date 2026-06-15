@@ -18,6 +18,7 @@ try:
         tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
 except ImportError:
     from agent_tools.react_loop_tools import (
         build_finalize_tool,
@@ -32,6 +33,7 @@ except ImportError:
         tool_call_budget,
     )
     from core.common import prompt_path
+    from core.agent_runtime import ClassifyRuntime
 
 try:
     from RepoBuilderAgent.src.core.log_utils import log_warn
@@ -89,17 +91,19 @@ async def select_files_by_iterative_react(
     repo_path: "Path",
     structure_summary: str,
     default_selected_files: list[str],
-    model_name: str,
     selection_timeout: int,
     react_max_steps: int,
     react_max_total_files: int,
     react_final_cap: int,
-    new_prebuilt_chat_model: Callable[[int], Any],
-    extract_agent_payload: Callable[[dict[str, Any]], Any],
-    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
-    normalize_text_list: Callable[[Any], list[str]],
+    runtime: ClassifyRuntime,
     estimate_tokens: Callable[[str, str], int],
 ) -> tuple[list[str], int, list[dict[str, Any]], str]:
+    model_name = runtime.model_name
+    new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
+    extract_agent_payload = runtime.extract_agent_payload
+    extract_agent_trace = runtime.extract_agent_trace
+    normalize_text_list = runtime.normalize_text_list
+
     from pathlib import Path as _Path
     _repo_path = _Path(repo_path).resolve()
 

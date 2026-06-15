@@ -1,4 +1,4 @@
-from typing import Any, Callable, cast
+from typing import Any, cast
 from typing_extensions import NotRequired, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -8,9 +8,11 @@ from langgraph.graph import END, START, StateGraph
 try:
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
 except ImportError:
     from stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
     from stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
+    from core.agent_runtime import ClassifyRuntime
 
 
 class ArchitectureLoopState(TypedDict):
@@ -47,13 +49,8 @@ async def run_architecture_state_graph(
     synthesis_review_rounds: int,
     validation_react_max_steps: int,
     synthesis_subagents_enabled: bool,
+    runtime: ClassifyRuntime,
     snippet_tools_enabled: bool = False,
-    model_name: str,
-    new_prebuilt_chat_model: Callable[[int], Any],
-    extract_agent_payload: Callable[[dict[str, Any]], Any],
-    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
-    normalize_text_list: Callable[[Any], list[str]],
-    normalize_validation_checks: Callable[[Any], dict[str, dict[str, str]]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any], list[dict[str, Any]], str]:
     graph = StateGraph(ArchitectureLoopState)
 
@@ -71,11 +68,7 @@ async def run_architecture_state_graph(
             synthesis_review_rounds=synthesis_review_rounds,
             synthesis_subagents_enabled=synthesis_subagents_enabled,
             snippet_tools_enabled=snippet_tools_enabled,
-            model_name=model_name,
-            new_prebuilt_chat_model=new_prebuilt_chat_model,
-            extract_agent_payload=extract_agent_payload,
-            extract_agent_trace=extract_agent_trace,
-            normalize_text_list=normalize_text_list,
+            runtime=runtime,
         )
         transition_policy = cast(dict[str, Any], synthesis_artifact.get("transition_policy", {}))
         route_reason = "policy_default"
@@ -101,12 +94,7 @@ async def run_architecture_state_graph(
             file_context_by_path=state["file_context_by_path"],
             classification_timeout=classification_timeout,
             validation_react_max_steps=validation_react_max_steps,
-            model_name=model_name,
-            new_prebuilt_chat_model=new_prebuilt_chat_model,
-            extract_agent_payload=extract_agent_payload,
-            extract_agent_trace=extract_agent_trace,
-            normalize_text_list=normalize_text_list,
-            normalize_validation_checks=normalize_validation_checks,
+            runtime=runtime,
         )
         return {
             "validation_artifact": validation_artifact,

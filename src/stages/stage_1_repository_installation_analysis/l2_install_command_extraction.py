@@ -24,6 +24,7 @@ try:
         hooked_tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
     from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
@@ -46,6 +47,7 @@ except ImportError:
         hooked_tool_call_budget,
     )
     from core.common import prompt_path
+    from core.agent_runtime import ClassifyRuntime
     from core.llm_yaml import parse_llm_yaml_dict
     from core.log_utils import log_warn
 
@@ -368,13 +370,15 @@ async def run_l2_synthesis_loop(
     synthesis_react_max_steps: int,
     synthesis_subagents_enabled: bool,
     synthesis_review_rounds: int,
+    runtime: ClassifyRuntime,
     snippet_tools_enabled: bool = False,
-    model_name: str,
-    new_prebuilt_chat_model: Callable[[int], Any],
-    extract_agent_payload: Callable[[dict[str, Any]], Any],
-    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
-    normalize_text_list: Callable[[Any], list[str]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    model_name = runtime.model_name
+    new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
+    extract_agent_payload = runtime.extract_agent_payload
+    extract_agent_trace = runtime.extract_agent_trace
+    normalize_text_list = runtime.normalize_text_list
+
     selected_snapshot = selected_files[:]
     selected_lower = [path.lower() for path in selected_snapshot]
 

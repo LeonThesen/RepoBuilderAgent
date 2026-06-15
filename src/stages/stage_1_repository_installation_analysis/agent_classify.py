@@ -19,8 +19,6 @@ from typing_extensions import TypedDict
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
     from RepoBuilderAgent.src.core.common import (
@@ -44,13 +42,12 @@ try:
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
-    from stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop as _run_l2_synthesis_loop_impl
-    from stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop as _run_classify_validation_loop_impl
     from stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
     from stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
     from core.common import (
@@ -74,6 +71,7 @@ except ImportError:
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import preprocess_repository
     from core.llm_yaml import parse_llm_yaml
+    from core.agent_runtime import ClassifyRuntime
     from agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -810,6 +808,20 @@ def _force_prune_by_measured_budget(repo_path: Path, selected_files: list[str], 
     return picked
 
 
+def _make_classify_runtime() -> ClassifyRuntime:
+    """Bundle the per-run agent helpers (model factory + extractors/normalizers)
+    that every Stage-1 loop needs, so they are passed as one object instead of
+    threaded individually through each signature."""
+    return ClassifyRuntime(
+        model_name=args.model,
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        extract_agent_payload=_extract_agent_payload,
+        extract_agent_trace=_extract_agent_trace,
+        normalize_text_list=_normalize_text_list,
+        normalize_validation_checks=_normalize_validation_checks,
+    )
+
+
 async def _run_architecture_state_graph(
     *,
     repo_url: str,
@@ -836,12 +848,7 @@ async def _run_architecture_state_graph(
         validation_react_max_steps=args.validation_react_max_steps,
         synthesis_subagents_enabled=args.synthesis_subagents_enabled,
         snippet_tools_enabled=args.snippet_tools,
-        model_name=args.model,
-        new_prebuilt_chat_model=_new_prebuilt_chat_model,
-        extract_agent_payload=_extract_agent_payload,
-        extract_agent_trace=_extract_agent_trace,
-        normalize_text_list=_normalize_text_list,
-        normalize_validation_checks=_normalize_validation_checks,
+        runtime=_make_classify_runtime(),
     )
 
 
@@ -886,61 +893,6 @@ def _build_file_context_by_path(repo_path: Path) -> dict[str, str]:
         if normalized and normalized not in file_context:
             file_context[normalized] = content
     return file_context
-
-
-async def _run_l2_synthesis_loop(
-    *,
-    repo_url: str,
-    repo_name: str,
-    selected_files: list[str],
-    summary: str,
-    exploration_artifact: dict[str, Any],
-    file_context_by_path: dict[str, str],
-    llm_metrics: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    return await _run_l2_synthesis_loop_impl(
-        repo_url=repo_url,
-        repo_name=repo_name,
-        selected_files=selected_files,
-        summary=summary,
-        exploration_artifact=exploration_artifact,
-        file_context_by_path=file_context_by_path,
-        classification_timeout=args.classification_timeout,
-        synthesis_react_max_steps=args.synthesis_react_max_steps,
-        synthesis_review_rounds=args.synthesis_review_rounds,
-        synthesis_subagents_enabled=args.synthesis_subagents_enabled,
-        model_name=args.model,
-        new_prebuilt_chat_model=_new_prebuilt_chat_model,
-        extract_agent_payload=_extract_agent_payload,
-        extract_agent_trace=_extract_agent_trace,
-        normalize_text_list=_normalize_text_list,
-    )
-
-
-async def _run_classify_validation_loop(
-    *,
-    repo_url: str,
-    summary: str,
-    synthesis_artifact: dict[str, Any],
-    selected_files: list[str],
-    file_context_by_path: dict[str, str],
-    llm_metrics: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    return await _run_classify_validation_loop_impl(
-        repo_url=repo_url,
-        summary=summary,
-        synthesis_artifact=synthesis_artifact,
-        selected_files=selected_files,
-        file_context_by_path=file_context_by_path,
-        classification_timeout=args.classification_timeout,
-        validation_react_max_steps=args.validation_react_max_steps,
-        model_name=args.model,
-        new_prebuilt_chat_model=_new_prebuilt_chat_model,
-        extract_agent_payload=_extract_agent_payload,
-        extract_agent_trace=_extract_agent_trace,
-        normalize_text_list=_normalize_text_list,
-        normalize_validation_checks=_normalize_validation_checks,
-    )
 
 
 def _build_architecture_scratchpad_payload(
@@ -1131,15 +1083,11 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     repo_path=repo_path,
                     structure_summary=structure_summary,
                     default_selected_files=default_selected_files,
-                    model_name=args.model,
                     selection_timeout=args.selection_timeout,
                     react_max_steps=args.react_max_steps,
                     react_max_total_files=args.react_max_total_files,
                     react_final_cap=args.react_final_cap,
-                    new_prebuilt_chat_model=_new_prebuilt_chat_model,
-                    extract_agent_payload=_extract_agent_payload,
-                    extract_agent_trace=_extract_agent_trace,
-                    normalize_text_list=_normalize_text_list,
+                    runtime=_make_classify_runtime(),
                     estimate_tokens=estimate_tokens,
                 )
                 log_info(
@@ -1449,15 +1397,11 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                         repo_path=repo_path,
                         structure_summary=structure_summary,
                         default_selected_files=default_selected_files,
-                        model_name=args.model,
                         selection_timeout=args.selection_timeout,
                         react_max_steps=args.react_max_steps * 2,
                         react_max_total_files=args.react_max_total_files,
                         react_final_cap=args.react_final_cap,
-                        new_prebuilt_chat_model=_new_prebuilt_chat_model,
-                        extract_agent_payload=_extract_agent_payload,
-                        extract_agent_trace=_extract_agent_trace,
-                        normalize_text_list=_normalize_text_list,
+                        runtime=_make_classify_runtime(),
                         estimate_tokens=estimate_tokens,
                     )
                     if _rerun_files:
