@@ -20,6 +20,34 @@ from typing import Any, Callable
 
 
 @dataclass(frozen=True)
+class RepoRef:
+    """Identity of the repository under analysis. These three always travel
+    together (url + clone name + on-disk path), so they move as one value instead
+    of as three parameters on every Stage-1 signature."""
+    url: str
+    name: str
+    path: Any  # str | pathlib.Path, depending on caller
+
+
+@dataclass(frozen=True)
+class ClassifyConfig:
+    """Run-constant Stage-1 tuning knobs (sourced once from argv). Each loop reads
+    only the subset it needs; bundling them keeps the per-loop knobs out of the
+    signatures, which otherwise carried five-to-seven of these each."""
+    classification_timeout: int
+    selection_timeout: int
+    react_max_steps: int
+    react_max_total_files: int
+    react_final_cap: int
+    synthesis_react_max_steps: int
+    synthesis_review_rounds: int
+    validation_react_max_steps: int
+    synthesis_subagents_enabled: bool
+    snippet_tools_enabled: bool
+    run_validation: bool
+
+
+@dataclass(frozen=True)
 class ClassifyRuntime:
     model_name: str
     new_prebuilt_chat_model: Callable[[int], Any]

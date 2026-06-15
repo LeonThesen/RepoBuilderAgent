@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 import asyncio
 import os
+import dataclasses
 import httpx
 import ssl
 import re
@@ -42,7 +43,7 @@ try:
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml
-    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
@@ -71,7 +72,7 @@ except ImportError:
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import preprocess_repository
     from core.llm_yaml import parse_llm_yaml
-    from core.agent_runtime import ClassifyRuntime
+    from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -808,6 +809,24 @@ def _force_prune_by_measured_budget(repo_path: Path, selected_files: list[str], 
     return picked
 
 
+def _make_classify_config() -> ClassifyConfig:
+    """Snapshot the run-constant Stage-1 tuning knobs from argv into one object,
+    so each loop takes a single `config` rather than five-to-seven scalar params."""
+    return ClassifyConfig(
+        classification_timeout=args.classification_timeout,
+        selection_timeout=args.selection_timeout,
+        react_max_steps=args.react_max_steps,
+        react_max_total_files=args.react_max_total_files,
+        react_final_cap=args.react_final_cap,
+        synthesis_react_max_steps=args.synthesis_react_max_steps,
+        synthesis_review_rounds=args.synthesis_review_rounds,
+        validation_react_max_steps=args.validation_react_max_steps,
+        synthesis_subagents_enabled=args.synthesis_subagents_enabled,
+        snippet_tools_enabled=args.snippet_tools,
+        run_validation=args.validation_enabled,
+    )
+
+
 def _make_classify_runtime() -> ClassifyRuntime:
     """Bundle the per-run agent helpers (model factory + extractors/normalizers)
     that every Stage-1 loop needs, so they are passed as one object instead of
@@ -834,20 +853,12 @@ async def _run_architecture_state_graph(
     llm_metrics: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any], list[dict[str, Any]], str]:
     return await _run_architecture_state_graph_impl(
-        repo_url=repo_url,
-        repo_name=repo_name,
-        repo_path=str(repo_path),
+        repo=RepoRef(url=repo_url, name=repo_name, path=str(repo_path)),
         summary=summary,
         selected_files=selected_files,
         exploration_artifact=exploration_artifact,
         file_context_by_path=file_context_by_path,
-        run_validation=args.validation_enabled,
-        classification_timeout=args.classification_timeout,
-        synthesis_react_max_steps=args.synthesis_react_max_steps,
-        synthesis_review_rounds=args.synthesis_review_rounds,
-        validation_react_max_steps=args.validation_react_max_steps,
-        synthesis_subagents_enabled=args.synthesis_subagents_enabled,
-        snippet_tools_enabled=args.snippet_tools,
+        config=_make_classify_config(),
         runtime=_make_classify_runtime(),
     )
 
@@ -1170,15 +1181,10 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                         + prior_failure_summary
                     )
                 selected_files, step1_tokens, react_trace, react_stop_reason = await select_files_by_iterative_react(
-                    repo_url=repo_url,
-                    repo_name=repo_name,
-                    repo_path=repo_path,
+                    repo=RepoRef(url=repo_url, name=repo_name, path=repo_path),
                     structure_summary=structure_summary,
                     default_selected_files=default_selected_files,
-                    selection_timeout=args.selection_timeout,
-                    react_max_steps=args.react_max_steps,
-                    react_max_total_files=args.react_max_total_files,
-                    react_final_cap=args.react_final_cap,
+                    config=_make_classify_config(),
                     runtime=_make_classify_runtime(),
                     estimate_tokens=estimate_tokens,
                 )
@@ -1417,15 +1423,13 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                         f"(attempt {_l1_escalation_count}, react_max_steps={args.react_max_steps * 2})."
                     )
                     _rerun_files, _, _, _ = await select_files_by_iterative_react(
-                        repo_url=repo_url,
-                        repo_name=repo_name,
-                        repo_path=repo_path,
+                        repo=RepoRef(url=repo_url, name=repo_name, path=repo_path),
                         structure_summary=structure_summary,
                         default_selected_files=default_selected_files,
-                        selection_timeout=args.selection_timeout,
-                        react_max_steps=args.react_max_steps * 2,
-                        react_max_total_files=args.react_max_total_files,
-                        react_final_cap=args.react_final_cap,
+                        config=dataclasses.replace(
+                            _make_classify_config(),
+                            react_max_steps=args.react_max_steps * 2,
+                        ),
                         runtime=_make_classify_runtime(),
                         estimate_tokens=estimate_tokens,
                     )

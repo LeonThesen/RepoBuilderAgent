@@ -20,7 +20,7 @@ try:
         hooked_tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
-    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
     from agent_tools.react_loop_tools import (
@@ -38,7 +38,7 @@ except ImportError:
         hooked_tool_call_budget,
     )
     from core.common import prompt_path
-    from core.agent_runtime import ClassifyRuntime
+    from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from core.log_utils import log_warn
 
 
@@ -74,15 +74,17 @@ def _compact_synthesis_for_validation(synthesis_artifact: dict[str, Any]) -> dic
 
 async def run_classify_validation_loop(
     *,
-    repo_url: str,
+    repo: RepoRef,
     summary: str,
     synthesis_artifact: dict[str, Any],
     selected_files: list[str],
     file_context_by_path: dict[str, str],
-    classification_timeout: int,
-    validation_react_max_steps: int,
+    config: ClassifyConfig,
     runtime: ClassifyRuntime,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    repo_url = repo.url
+    classification_timeout = config.classification_timeout
+    validation_react_max_steps = config.validation_react_max_steps
     model_name = runtime.model_name
     new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
     extract_agent_payload = runtime.extract_agent_payload

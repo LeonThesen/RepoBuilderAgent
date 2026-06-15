@@ -24,7 +24,7 @@ try:
         hooked_tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
-    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
     from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
@@ -47,7 +47,7 @@ except ImportError:
         hooked_tool_call_budget,
     )
     from core.common import prompt_path
-    from core.agent_runtime import ClassifyRuntime
+    from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from core.llm_yaml import parse_llm_yaml_dict
     from core.log_utils import log_warn
 
@@ -359,20 +359,22 @@ async def _run_synthesis_subagents(
 
 async def run_l2_synthesis_loop(
     *,
-    repo_url: str,
-    repo_name: str,
-    repo_path: "Path",
+    repo: RepoRef,
     selected_files: list[str],
     summary: str,
     exploration_artifact: dict[str, Any],
     file_context_by_path: dict[str, str],
-    classification_timeout: int,
-    synthesis_react_max_steps: int,
-    synthesis_subagents_enabled: bool,
-    synthesis_review_rounds: int,
+    config: ClassifyConfig,
     runtime: ClassifyRuntime,
-    snippet_tools_enabled: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    repo_url = repo.url
+    repo_name = repo.name
+    repo_path = repo.path
+    classification_timeout = config.classification_timeout
+    synthesis_react_max_steps = config.synthesis_react_max_steps
+    synthesis_subagents_enabled = config.synthesis_subagents_enabled
+    synthesis_review_rounds = config.synthesis_review_rounds
+    snippet_tools_enabled = config.snippet_tools_enabled
     model_name = runtime.model_name
     new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
     extract_agent_payload = runtime.extract_agent_payload

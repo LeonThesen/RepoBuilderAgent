@@ -8,11 +8,11 @@ from langgraph.graph import END, START, StateGraph
 try:
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
-    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
 except ImportError:
     from stages.stage_1_repository_installation_analysis.l2_install_command_extraction import run_l2_synthesis_loop
     from stages.stage_1_repository_installation_analysis.classify_validation_loop import run_classify_validation_loop
-    from core.agent_runtime import ClassifyRuntime
+    from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
 
 
 class ArchitectureLoopState(TypedDict):
@@ -36,38 +36,24 @@ class ArchitectureLoopState(TypedDict):
 
 async def run_architecture_state_graph(
     *,
-    repo_url: str,
-    repo_name: str,
-    repo_path: str,
+    repo: RepoRef,
     summary: str,
     selected_files: list[str],
     exploration_artifact: dict[str, Any],
     file_context_by_path: dict[str, str],
-    run_validation: bool,
-    classification_timeout: int,
-    synthesis_react_max_steps: int,
-    synthesis_review_rounds: int,
-    validation_react_max_steps: int,
-    synthesis_subagents_enabled: bool,
+    config: ClassifyConfig,
     runtime: ClassifyRuntime,
-    snippet_tools_enabled: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any], list[dict[str, Any]], str]:
     graph = StateGraph(ArchitectureLoopState)
 
     async def l2_node(state: ArchitectureLoopState) -> dict[str, Any]:
         synthesis_artifact, synthesis_loop_trace, synthesis_stop_reason = await run_l2_synthesis_loop(
-            repo_url=state["repo_url"],
-            repo_name=state["repo_name"],
-            repo_path=state["repo_path"],
+            repo=RepoRef(url=state["repo_url"], name=state["repo_name"], path=state["repo_path"]),
             selected_files=state["selected_files"],
             summary=state["summary"],
             exploration_artifact=state["exploration_artifact"],
             file_context_by_path=state["file_context_by_path"],
-            classification_timeout=classification_timeout,
-            synthesis_react_max_steps=synthesis_react_max_steps,
-            synthesis_review_rounds=synthesis_review_rounds,
-            synthesis_subagents_enabled=synthesis_subagents_enabled,
-            snippet_tools_enabled=snippet_tools_enabled,
+            config=config,
             runtime=runtime,
         )
         transition_policy = cast(dict[str, Any], synthesis_artifact.get("transition_policy", {}))
@@ -87,13 +73,12 @@ async def run_architecture_state_graph(
     async def classify_validation_node(state: ArchitectureLoopState) -> dict[str, Any]:
         synthesis_artifact = cast(dict[str, Any], state.get("synthesis_artifact", {}))
         validation_artifact, validation_loop_trace, validation_stop_reason = await run_classify_validation_loop(
-            repo_url=state["repo_url"],
+            repo=RepoRef(url=state["repo_url"], name=state["repo_name"], path=state["repo_path"]),
             summary=state["summary"],
             synthesis_artifact=synthesis_artifact,
             selected_files=state["selected_files"],
             file_context_by_path=state["file_context_by_path"],
-            classification_timeout=classification_timeout,
-            validation_react_max_steps=validation_react_max_steps,
+            config=config,
             runtime=runtime,
         )
         return {
@@ -130,16 +115,16 @@ async def run_architecture_state_graph(
     compiled = graph.compile(checkpointer=InMemorySaver(), store=InMemoryStore())
     result = await compiled.ainvoke(
         {
-            "repo_url": repo_url,
-            "repo_name": repo_name,
-            "repo_path": repo_path,
+            "repo_url": repo.url,
+            "repo_name": repo.name,
+            "repo_path": repo.path,
             "summary": summary,
             "selected_files": selected_files,
             "exploration_artifact": exploration_artifact,
             "file_context_by_path": file_context_by_path,
-            "run_validation": run_validation,
+            "run_validation": config.run_validation,
         },
-        config={"configurable": {"thread_id": f"{repo_name}:architecture-loop"}},
+        config={"configurable": {"thread_id": f"{repo.name}:architecture-loop"}},
     )
 
     synthesis_artifact = result["synthesis_artifact"]

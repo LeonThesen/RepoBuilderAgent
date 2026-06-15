@@ -18,7 +18,7 @@ try:
         tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
-    from RepoBuilderAgent.src.core.agent_runtime import ClassifyRuntime
+    from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
 except ImportError:
     from agent_tools.react_loop_tools import (
         build_finalize_tool,
@@ -33,7 +33,7 @@ except ImportError:
         tool_call_budget,
     )
     from core.common import prompt_path
-    from core.agent_runtime import ClassifyRuntime
+    from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
 
 try:
     from RepoBuilderAgent.src.core.log_utils import log_warn
@@ -86,18 +86,20 @@ def _hard_cap_selected_files(candidates: list[str], default_selected_files: list
 
 async def select_files_by_iterative_react(
     *,
-    repo_url: str,
-    repo_name: str,
-    repo_path: "Path",
+    repo: RepoRef,
     structure_summary: str,
     default_selected_files: list[str],
-    selection_timeout: int,
-    react_max_steps: int,
-    react_max_total_files: int,
-    react_final_cap: int,
+    config: ClassifyConfig,
     runtime: ClassifyRuntime,
     estimate_tokens: Callable[[str, str], int],
 ) -> tuple[list[str], int, list[dict[str, Any]], str]:
+    repo_url = repo.url
+    repo_name = repo.name
+    repo_path = repo.path
+    selection_timeout = config.selection_timeout
+    react_max_steps = config.react_max_steps
+    react_max_total_files = config.react_max_total_files
+    react_final_cap = config.react_final_cap
     model_name = runtime.model_name
     new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
     extract_agent_payload = runtime.extract_agent_payload
