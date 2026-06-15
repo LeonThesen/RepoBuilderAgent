@@ -1012,6 +1012,105 @@ def _build_exploration_artifact(
     }
 
 
+async def _select_relevant_files(
+    *,
+    repo_url: str,
+    repo_name: str,
+    repo_path: "Path",
+    structure_summary: str,
+    default_selected_files: list[str],
+    prior_failure_terms: list[str],
+    prior_failure_summary: str,
+) -> tuple[list[str], str, int, list[dict[str, Any]], str, str]:
+    """Run the configured retrieval strategy (Stage-1 file selection) and return
+    (selected_files, baseline_summary, step1_tokens, react_trace, react_stop_reason,
+    structure_summary). structure_summary is returned because the iterative_react
+    path augments it with prior-failure signals before selecting."""
+    selected_files = default_selected_files.copy()
+    baseline_summary = ""
+    step1_tokens = 0
+    react_trace: list[dict[str, Any]] = []
+    react_stop_reason = "not_applicable"
+    if args.retrieval_strategy == "bm25":
+        selected_files = select_files_by_bm25(repo_path, build_bm25_query_terms(repo_name, prior_failure_terms))
+        if not selected_files:
+            log_warn(f"BM25 selection returned no files for {repo_url}; using defaults.")
+            selected_files = default_selected_files.copy()
+        log_info(f"Selected {len(selected_files)} files for {repo_name} via BM25 retrieval.")
+    elif args.retrieval_strategy == "neural_embedding":
+        selected_files = await select_files_by_neural_embedding(
+            repo_name,
+            repo_path,
+            extra_terms=prior_failure_terms,
+        )
+        if not selected_files:
+            log_warn(f"Neural embedding selection returned no files for {repo_url}; using defaults.")
+            selected_files = default_selected_files.copy()
+        log_info(f"Selected {len(selected_files)} files for {repo_name} via neural embedding retrieval.")
+    elif args.retrieval_strategy == "one_shot_fingerprint":
+        baseline_summary = fingerprint(
+            format="md",
+            repo_path=str(repo_path),
+            structure_only=False,
+            selected_files=None,
+            include_tree=True,
+            context="step2-one-shot-fingerprint",
+        )
+        baseline_summary = _truncate_to_token_budget(
+            baseline_summary, args.model, int(args.max_input_tokens * 0.8),
+            label="one-shot fingerprint",
+        )
+        selected_files = []
+        log_info(f"Using static repo fingerprint for {repo_name} via one-shot retrieval.")
+    elif args.retrieval_strategy == "one_shot_fingerprint_budgeted":
+        _budgeted_files = select_files_by_bm25_budgeted(
+            repo_path, build_bm25_query_terms(repo_name, prior_failure_terms)
+        )
+        baseline_summary = fingerprint(
+            format="md",
+            repo_path=str(repo_path),
+            structure_only=False,
+            selected_files=_budgeted_files if _budgeted_files else None,
+            include_tree=True,
+            context="step2-one-shot-fingerprint-budgeted",
+        )
+        baseline_summary = _truncate_to_token_budget(
+            baseline_summary, args.model, int(args.max_input_tokens * 0.8),
+            label="one-shot fingerprint",
+        )
+        selected_files = []
+        log_info(
+            f"Using budgeted repo fingerprint for {repo_name} via one-shot-budgeted retrieval "
+            f"({len(_budgeted_files)} files selected)."
+        )
+    elif args.retrieval_strategy == "iterative_react":
+        if prior_failure_summary:
+            structure_summary = (
+                structure_summary
+                + "\n\nPRIOR_FAILURE_SIGNALS (from shared state):\n"
+                + prior_failure_summary
+            )
+        selected_files, step1_tokens, react_trace, react_stop_reason = await select_files_by_iterative_react(
+            repo=RepoRef(url=repo_url, name=repo_name, path=repo_path),
+            structure_summary=structure_summary,
+            default_selected_files=default_selected_files,
+            config=_make_classify_config(),
+            runtime=_make_classify_runtime(),
+            estimate_tokens=estimate_tokens,
+        )
+        log_info(
+            f"Selected {len(selected_files)} files for {repo_name} via iterative ReAct retrieval "
+            f"(stop_reason={react_stop_reason})."
+        )
+    else:
+        log_warn(
+            f"Unknown retrieval strategy '{args.retrieval_strategy}' for {repo_url}; using default file selection."
+        )
+        selected_files = default_selected_files.copy()
+
+    return selected_files, baseline_summary, step1_tokens, react_trace, react_stop_reason, structure_summary
+
+
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
@@ -1064,87 +1163,22 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 label="structure summary",
             )
 
-            selected_files = default_selected_files.copy()
-            baseline_summary = ""
-            step1_tokens = 0
-            react_trace: list[dict[str, Any]] = []
-            react_stop_reason = "not_applicable"
-            if args.retrieval_strategy == "bm25":
-                selected_files = select_files_by_bm25(repo_path, build_bm25_query_terms(repo_name, prior_failure_terms))
-                if not selected_files:
-                    log_warn(f"BM25 selection returned no files for {repo_url}; using defaults.")
-                    selected_files = default_selected_files.copy()
-                log_info(f"Selected {len(selected_files)} files for {repo_name} via BM25 retrieval.")
-            elif args.retrieval_strategy == "neural_embedding":
-                selected_files = await select_files_by_neural_embedding(
-                    repo_name,
-                    repo_path,
-                    extra_terms=prior_failure_terms,
-                )
-                if not selected_files:
-                    log_warn(f"Neural embedding selection returned no files for {repo_url}; using defaults.")
-                    selected_files = default_selected_files.copy()
-                log_info(f"Selected {len(selected_files)} files for {repo_name} via neural embedding retrieval.")
-            elif args.retrieval_strategy == "one_shot_fingerprint":
-                baseline_summary = fingerprint(
-                    format="md",
-                    repo_path=str(repo_path),
-                    structure_only=False,
-                    selected_files=None,
-                    include_tree=True,
-                    context="step2-one-shot-fingerprint",
-                )
-                baseline_summary = _truncate_to_token_budget(
-                    baseline_summary, args.model, int(args.max_input_tokens * 0.8),
-                    label="one-shot fingerprint",
-                )
-                selected_files = []
-                log_info(f"Using static repo fingerprint for {repo_name} via one-shot retrieval.")
-            elif args.retrieval_strategy == "one_shot_fingerprint_budgeted":
-                _budgeted_files = select_files_by_bm25_budgeted(
-                    repo_path, build_bm25_query_terms(repo_name, prior_failure_terms)
-                )
-                baseline_summary = fingerprint(
-                    format="md",
-                    repo_path=str(repo_path),
-                    structure_only=False,
-                    selected_files=_budgeted_files if _budgeted_files else None,
-                    include_tree=True,
-                    context="step2-one-shot-fingerprint-budgeted",
-                )
-                baseline_summary = _truncate_to_token_budget(
-                    baseline_summary, args.model, int(args.max_input_tokens * 0.8),
-                    label="one-shot fingerprint",
-                )
-                selected_files = []
-                log_info(
-                    f"Using budgeted repo fingerprint for {repo_name} via one-shot-budgeted retrieval "
-                    f"({len(_budgeted_files)} files selected)."
-                )
-            elif args.retrieval_strategy == "iterative_react":
-                if prior_failure_summary:
-                    structure_summary = (
-                        structure_summary
-                        + "\n\nPRIOR_FAILURE_SIGNALS (from shared state):\n"
-                        + prior_failure_summary
-                    )
-                selected_files, step1_tokens, react_trace, react_stop_reason = await select_files_by_iterative_react(
-                    repo=RepoRef(url=repo_url, name=repo_name, path=repo_path),
-                    structure_summary=structure_summary,
-                    default_selected_files=default_selected_files,
-                    config=_make_classify_config(),
-                    runtime=_make_classify_runtime(),
-                    estimate_tokens=estimate_tokens,
-                )
-                log_info(
-                    f"Selected {len(selected_files)} files for {repo_name} via iterative ReAct retrieval "
-                    f"(stop_reason={react_stop_reason})."
-                )
-            else:
-                log_warn(
-                    f"Unknown retrieval strategy '{args.retrieval_strategy}' for {repo_url}; using default file selection."
-                )
-                selected_files = default_selected_files.copy()
+            (
+                selected_files,
+                baseline_summary,
+                step1_tokens,
+                react_trace,
+                react_stop_reason,
+                structure_summary,
+            ) = await _select_relevant_files(
+                repo_url=repo_url,
+                repo_name=repo_name,
+                repo_path=repo_path,
+                structure_summary=structure_summary,
+                default_selected_files=default_selected_files,
+                prior_failure_terms=prior_failure_terms,
+                prior_failure_summary=prior_failure_summary,
+            )
 
             selected_files_before_budget = selected_files.copy()
             budget_behavior = {
