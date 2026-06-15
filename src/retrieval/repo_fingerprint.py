@@ -20,6 +20,19 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     from core.log_utils import log_info, log_trace
 
+# High-signal repository filenames (lowercased) used across the retrieval passes to
+# recognise docs, manifests, lockfiles and container/build descriptors. Defined once
+# here; previously this identical set was inlined in three separate functions.
+HIGH_SIGNAL_FILENAMES: frozenset[str] = frozenset({
+    "readme.md", "readme.rst", "readme.txt", "install.md", "install.txt",
+    "pyproject.toml", "requirements.txt", "package.json", "package-lock.json",
+    "yarn.lock", "pnpm-lock.yaml", "go.mod", "cargo.toml", "dockerfile",
+    "docker-compose.yml", "docker-compose.yaml", "makefile", "cmakelists.txt",
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "settings.gradle.kts", "gradlew", "gemfile", "composer.json",
+    "setup.py", "setup.cfg", "pipfile", "pipfile.lock", ".env.example",
+})
+
 # ---------------------------------------------------------------------------
 # Config Loading
 # ---------------------------------------------------------------------------
@@ -170,39 +183,7 @@ def _iter_selected_file_matches(root: Path, pattern: str):
 
 def collect_retrieval_candidates(root: Path, max_bytes: int = 4096) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
-    exact_names = {
-        "readme.md",
-        "readme.rst",
-        "readme.txt",
-        "install.md",
-        "install.txt",
-        "pyproject.toml",
-        "requirements.txt",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "go.mod",
-        "cargo.toml",
-        "dockerfile",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "makefile",
-        "cmakelists.txt",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "gradlew",
-        "gemfile",
-        "composer.json",
-        "setup.py",
-        "setup.cfg",
-        "pipfile",
-        "pipfile.lock",
-        ".env.example",
-    }
+    exact_names = HIGH_SIGNAL_FILENAMES
     relevant_tokens = (
         "readme",
         "install",
@@ -423,39 +404,7 @@ def select_files_by_bm25(root: Path, query_terms: list[str], top_k: int = 12) ->
     if not candidates:
         return []
 
-    high_signal_names = {
-        "readme.md",
-        "readme.rst",
-        "readme.txt",
-        "install.md",
-        "install.txt",
-        "pyproject.toml",
-        "requirements.txt",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "go.mod",
-        "cargo.toml",
-        "dockerfile",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "makefile",
-        "cmakelists.txt",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "gradlew",
-        "gemfile",
-        "composer.json",
-        "setup.py",
-        "setup.cfg",
-        "pipfile",
-        "pipfile.lock",
-        ".env.example",
-    }
+    high_signal_names = HIGH_SIGNAL_FILENAMES
 
     normalized_terms = []
     seen_terms: set[str] = set()
@@ -534,15 +483,7 @@ def select_files_by_bm25_budgeted(
     if not candidates:
         return []
 
-    high_signal_names = {
-        "readme.md", "readme.rst", "readme.txt", "install.md", "install.txt",
-        "pyproject.toml", "requirements.txt", "package.json", "package-lock.json",
-        "yarn.lock", "pnpm-lock.yaml", "go.mod", "cargo.toml", "dockerfile",
-        "docker-compose.yml", "docker-compose.yaml", "makefile", "cmakelists.txt",
-        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
-        "settings.gradle.kts", "gradlew", "gemfile", "composer.json",
-        "setup.py", "setup.cfg", "pipfile", "pipfile.lock", ".env.example",
-    }
+    high_signal_names = HIGH_SIGNAL_FILENAMES
 
     normalized_terms: list[str] = []
     seen_terms: set[str] = set()
