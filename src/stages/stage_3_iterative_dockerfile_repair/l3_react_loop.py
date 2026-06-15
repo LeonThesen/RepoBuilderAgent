@@ -14,7 +14,7 @@ try:
         extract_finalize_answer,
         hit_step_limit,
         make_history_trim_hook,
-        tool_call_budget,
+        hooked_tool_call_budget,
     )
 except ImportError:
     from core.common import prompt_path
@@ -27,7 +27,7 @@ except ImportError:
         extract_finalize_answer,
         hit_step_limit,
         make_history_trim_hook,
-        tool_call_budget,
+        hooked_tool_call_budget,
     )
 
 
@@ -154,7 +154,7 @@ async def run_l3_dockerfile_repair_react(
         prompt=(
             prompt_path("PROMPT_L3_REPAIR_SYSTEM.md").read_text(encoding="utf-8")
             .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint)
-            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
+            .replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(recursion_limit)))
             .strip()
         ),
         pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
@@ -211,7 +211,7 @@ async def run_l3_verification_command_react(
     verify_agent = create_react_agent(
         model=new_prebuilt_chat_model(verify_timeout),
         tools=[think, build_finalize_tool()],
-        prompt=system_prompt.replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit))),
+        prompt=system_prompt.replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(recursion_limit))),
         pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 

@@ -1,6 +1,7 @@
 from typing import Any, Callable
 
 import yaml
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import create_react_agent
 
 try:
@@ -15,7 +16,8 @@ try:
         extract_finalize_answer,
         hit_step_limit,
         make_history_trim_hook,
-        tool_call_budget,
+        make_overflow_salvage,
+        hooked_tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.log_utils import log_warn
@@ -31,10 +33,22 @@ except ImportError:
         extract_finalize_answer,
         hit_step_limit,
         make_history_trim_hook,
-        tool_call_budget,
+        make_overflow_salvage,
+        hooked_tool_call_budget,
     )
     from core.common import prompt_path
     from core.log_utils import log_warn
+
+
+# Forced-finalize instruction used when the validation ReAct loop exhausts its
+# step budget without calling finalize(): salvage the gathered evidence into the
+# expected YAML rather than discarding the loop's work. See make_overflow_salvage.
+_VALIDATION_FINALIZE_INSTRUCTION = (
+    "You have used all available tool calls. Do NOT call any tool now. Using only the "
+    "evidence already gathered above, output your final answer immediately as YAML with "
+    "keys: thought, checks (map of check_name -> {status: pass|warn|fail, detail}), "
+    "warnings (list), selected_files (list), done (true). Output only the YAML."
+)
 
 
 def _truncate_for_prompt(text: str, max_chars: int = 12000) -> str:
@@ -115,6 +129,12 @@ async def run_classify_validation_loop(
         tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
         prompt=prompt_path("PROMPT_L1_VALIDATION_SYSTEM.md").read_text(encoding="utf-8").strip(),
         pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
+        checkpointer=InMemorySaver(),
+    )
+    overflow_salvage = make_overflow_salvage(
+        model=new_prebuilt_chat_model(classification_timeout),
+        model_name=model_name,
+        instruction=_VALIDATION_FINALIZE_INSTRUCTION,
     )
 
     compact_synthesis = _compact_synthesis_for_validation(synthesis_artifact)
@@ -125,7 +145,7 @@ async def run_classify_validation_loop(
         .replace("{{REPO_URL}}", repo_url)
         .replace("{{CURRENT_CHECKS}}", yaml.dump(checks, sort_keys=False, allow_unicode=True))
         .replace("{{SYNTHESIS_ARTIFACT}}", yaml.dump(compact_synthesis, sort_keys=False, allow_unicode=True))
-        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
+        .replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", compact_summary)
     )
 
@@ -133,6 +153,7 @@ async def run_classify_validation_loop(
         validation_agent,
         {"messages": [{"role": "user", "content": validation_prompt}]},
         {"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": recursion_limit},
+        on_overflow=overflow_salvage,
     )
     payload = extract_agent_payload(result)
     parsed_checks = normalize_validation_checks(payload.get("checks") if isinstance(payload, dict) else {})

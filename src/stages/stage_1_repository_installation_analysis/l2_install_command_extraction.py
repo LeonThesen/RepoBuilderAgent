@@ -1,5 +1,6 @@
 from typing import Any, Callable, Optional, TypedDict
 
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 
@@ -19,7 +20,8 @@ try:
         extract_finalize_answer,
         hit_step_limit,
         make_history_trim_hook,
-        tool_call_budget,
+        make_overflow_salvage,
+        hooked_tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
@@ -40,11 +42,31 @@ except ImportError:
         extract_finalize_answer,
         hit_step_limit,
         make_history_trim_hook,
-        tool_call_budget,
+        make_overflow_salvage,
+        hooked_tool_call_budget,
     )
     from core.common import prompt_path
     from core.llm_yaml import parse_llm_yaml_dict
     from core.log_utils import log_warn
+
+
+# Forced-finalize instructions used when a synthesis ReAct loop exhausts its step
+# budget without calling finalize(). Models routinely ignore the advertised tool-call
+# budget and never finalize on their own; rather than throw the loop's exploration
+# away and fall back to a deterministic guess, salvage it into the expected YAML.
+# See make_overflow_salvage in react_loop_tools.
+_GENERATOR_FINALIZE_INSTRUCTION = (
+    "You have used all available tool calls. Do NOT call any tool now. Using only the "
+    "evidence already gathered above, output your final answer immediately as YAML with "
+    "keys: thought, hypothesis_updates (list), risk_updates (list), selected_files (list), "
+    "done (true). Output only the YAML."
+)
+_REVIEWER_FINALIZE_INSTRUCTION = (
+    "You have used all available tool calls. Do NOT call any tool now. Using only the "
+    "evidence already gathered above, output your final answer immediately as YAML with "
+    "keys: thought, revised_hypotheses (list), revised_risks (list), critique_notes (list), "
+    "accepted (bool), done (true). Output only the YAML."
+)
 
 
 def _deterministic_signal_scan(selected_files: list[str], markers: tuple[str, ...], limit: int = 8) -> list[str]:
@@ -416,10 +438,16 @@ async def run_l2_synthesis_loop(
         prompt=(
             prompt_path("PROMPT_L2_SYNTHESIS_GENERATOR_SYSTEM.md").read_text(encoding="utf-8")
             .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint_generator)
-            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
+            .replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(synthesis_recursion_limit)))
             .strip()
         ),
         pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
+        checkpointer=InMemorySaver(),
+    )
+    generator_salvage = make_overflow_salvage(
+        model=new_prebuilt_chat_model(classification_timeout),
+        model_name=model_name,
+        instruction=_GENERATOR_FINALIZE_INSTRUCTION,
     )
 
     synthesis_prompt = (
@@ -428,7 +456,7 @@ async def run_l2_synthesis_loop(
         .replace("{{CURRENT_HYPOTHESES}}", "\n".join(f"- {item}" for item in base_hypotheses[:20]))
         .replace("{{CURRENT_RISKS}}", "\n".join(f"- {item}" for item in risk_notes[:20]) if risk_notes else "- (none)")
         .replace("{{SUBAGENT_SIGNALS}}", str(subagent_outputs[:4]))
-        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
+        .replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(synthesis_recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
@@ -436,6 +464,7 @@ async def run_l2_synthesis_loop(
         synthesis_generator,
         {"messages": [{"role": "user", "content": synthesis_prompt}]},
         {"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": synthesis_recursion_limit},
+        on_overflow=generator_salvage,
     )
     generation_payload = extract_agent_payload(generation_result)
     updates = normalize_text_list(generation_payload.get("hypothesis_updates") if isinstance(generation_payload, dict) else [])
@@ -467,10 +496,16 @@ async def run_l2_synthesis_loop(
         prompt=(
             prompt_path("PROMPT_L2_SYNTHESIS_REVIEWER_SYSTEM.md").read_text(encoding="utf-8")
             .replace("{{SNIPPET_TOOL_HINT}}", _snippet_hint_reviewer)
-            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
+            .replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(synthesis_recursion_limit)))
             .strip()
         ),
         pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
+        checkpointer=InMemorySaver(),
+    )
+    reviewer_salvage = make_overflow_salvage(
+        model=new_prebuilt_chat_model(classification_timeout),
+        model_name=model_name,
+        instruction=_REVIEWER_FINALIZE_INSTRUCTION,
     )
 
     review_hypotheses = generated_hypotheses[:]
@@ -490,7 +525,7 @@ async def run_l2_synthesis_loop(
             .replace("{{GENERATOR_HYPOTHESES}}", "\n".join(f"- {item}" for item in review_hypotheses[:30]))
             .replace("{{GENERATOR_RISKS}}", "\n".join(f"- {item}" for item in review_risks[:30]) if review_risks else "- (none)")
             .replace("{{SUBAGENT_SIGNALS}}", str(subagent_outputs[:4]))
-            .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(synthesis_recursion_limit)))
+            .replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(synthesis_recursion_limit)))
             .replace("{{SUMMARY_EVIDENCE}}", summary)
         )
 
@@ -501,6 +536,7 @@ async def run_l2_synthesis_loop(
                 "configurable": {"thread_id": f"{repo_name}:l2-review:r{round_index + 1}"},
                 "recursion_limit": synthesis_recursion_limit,
             },
+            on_overflow=reviewer_salvage,
         )
         review_rounds_executed += 1
         review_payload = extract_agent_payload(review_result)

@@ -12,13 +12,35 @@ from langchain_core.tools import tool
 HISTORY_BUDGET = 48000
 
 
-def tool_call_budget(recursion_limit: int) -> int:
-    """Max tool calls an agent can make under a given LangGraph recursion_limit.
+# Graph supersteps consumed per ReAct cycle. A bare agent runs two nodes per cycle
+# (model -> tools); a create_react_agent with a pre_model_hook runs three
+# (hook -> model -> tools), so the same recursion_limit buys ~1/3 fewer cycles. The
+# advertised tool-call budget MUST divide by the matching value: dividing a hooked
+# loop's limit by 2 tells the model it has ~80% more calls than the graph allows, so
+# it paces its finalize() past the cut-off and burns the whole budget producing
+# nothing. Verified empirically in tests/test_react_input_budget.py.
+SUPERSTEPS_PER_CYCLE = 2
+SUPERSTEPS_PER_CYCLE_WITH_HISTORY_HOOK = 3
 
-    Each tool call costs ~2 graph nodes (the model turn + the tool turn); we leave
-    one node for the finalize call. Floored at 1 so prompts never advertise 0 calls.
+
+def tool_call_budget(recursion_limit: int, supersteps_per_cycle: int = SUPERSTEPS_PER_CYCLE) -> int:
+    """Max tool calls (including the closing finalize) an agent may make under a
+    given LangGraph recursion_limit. Each ReAct cycle costs `supersteps_per_cycle`
+    graph supersteps; we reserve one cycle for the finalize turn. Floored at 1 so
+    prompts never advertise 0 calls.
+
+    Use the default for a hook-free agent (langchain create_agent / a bare
+    create_react_agent). For a create_react_agent carrying the history-trim
+    pre_model_hook, call hooked_tool_call_budget() instead.
     """
-    return max(1, int(recursion_limit) // 2 - 1)
+    return max(1, int(recursion_limit) // int(supersteps_per_cycle) - 1)
+
+
+def hooked_tool_call_budget(recursion_limit: int) -> int:
+    """tool_call_budget for a create_react_agent that carries the history-trim
+    pre_model_hook (three supersteps per cycle). Every create_react_agent in this
+    codebase uses that hook; only L1's create_agent does not."""
+    return tool_call_budget(recursion_limit, SUPERSTEPS_PER_CYCLE_WITH_HISTORY_HOOK)
 
 
 def _message_token_counter(model_name: str) -> "Callable[[list[Any]], int]":
@@ -428,7 +450,62 @@ def hit_step_limit(result) -> bool:
     return text.strip() == RECURSION_LIMIT_PLACEHOLDER
 
 
-async def ainvoke_with_recursion_guard(agent, payload, config):
+async def _checkpointed_messages(agent, config) -> "list[Any]":
+    """Return the messages a create_react_agent accumulated under `config`, read from
+    its checkpointer. Empty list when the agent has no checkpointer / no saved state."""
+    try:
+        snapshot = await agent.aget_state(config)
+    except Exception:
+        return []
+    values = getattr(snapshot, "values", None) or {}
+    return list(values.get("messages", []) or [])
+
+
+def make_overflow_salvage(*, model, model_name: str, instruction: str):
+    """Build an `on_overflow` callback for ainvoke_with_recursion_guard that salvages
+    a cut-off ReAct loop instead of discarding it.
+
+    When a hooked create_react_agent exhausts its recursion_limit, LangGraph raises
+    and the loop would otherwise return an empty payload — every tool call it made
+    (reading files, searching commits) is thrown away and the stage falls back to a
+    deterministic guess. Models frequently ignore the advertised tool-call budget and
+    never call finalize() on their own, so this is the common case, not the rare one.
+
+    This salvage recovers the agent's accumulated exploration from its checkpointer,
+    trims it under the same history budget, and makes ONE tools-free model call that
+    forces the final YAML answer. The cut-off loop's work becomes usable output.
+    `model` must be a tools-free chat model (so it cannot loop again). Requires the
+    agent to have a checkpointer; returns None (-> empty placeholder) otherwise.
+    """
+    from langchain_core.messages import HumanMessage
+
+    try:  # lazy import keeps this low-level tools module import-light
+        from RepoBuilderAgent.src.core.log_utils import log_warn
+    except ImportError:  # pragma: no cover - path varies by entrypoint
+        try:
+            from core.log_utils import log_warn
+        except ImportError:  # pragma: no cover
+            def log_warn(_msg: str) -> None:
+                return None
+
+    async def salvage(agent, config):
+        prior = await _checkpointed_messages(agent, config)
+        if not prior:
+            return None
+        log_warn(
+            f"[react] step budget exhausted without finalize; salvaging "
+            f"{len(prior)} accumulated messages via one forced-finalize model call."
+        )
+        trimmed = make_history_trim_hook(model_name, HISTORY_BUDGET)(
+            {"messages": prior}
+        ).get("llm_input_messages") or prior
+        response = await model.ainvoke(list(trimmed) + [HumanMessage(content=instruction)])
+        return {"messages": list(prior) + [response]}
+
+    return salvage
+
+
+async def ainvoke_with_recursion_guard(agent, payload, config, *, on_overflow=None):
     """Invoke a create_react_agent, converting a *raised* GraphRecursionError into
     the same placeholder result LangGraph emits when it instead *returns* at the
     limit. This makes recursion-limit handling uniform across every ReAct loop:
@@ -438,12 +515,19 @@ async def ainvoke_with_recursion_guard(agent, payload, config):
     Previously only L1 wrapped its agent in try/except; the generator, reviewer,
     validation and L3 loops relied on a non-raising placeholder this LangGraph
     version does not produce, so they crashed on repos that exhausted the budget.
+
+    Pass `on_overflow` (see make_overflow_salvage) to recover the cut-off loop's
+    exploration into a forced final answer instead of returning the empty placeholder.
     """
     from langchain_core.messages import AIMessage
 
     try:
         return await agent.ainvoke(payload, config=config)
     except GraphRecursionError:
+        if on_overflow is not None:
+            salvaged = await on_overflow(agent, config)
+            if salvaged is not None:
+                return salvaged
         return {"messages": [AIMessage(content=RECURSION_LIMIT_PLACEHOLDER)]}
 
 
