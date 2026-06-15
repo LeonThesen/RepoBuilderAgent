@@ -266,6 +266,22 @@ _new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
 )
 
 
+async def _reset_repo_for_repair(repo_path: "Path", repo_name: str) -> None:
+    """Reset the checkout to a clean state (git reset --hard + git clean -fdx) so each
+    repair run starts reproducibly. Failures are logged, not fatal."""
+    try:
+        result = await asyncio.create_subprocess_exec("git", "-C", str(repo_path), "reset", "--hard", "HEAD", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        returncode = await result.wait()
+        if returncode == 0:
+            log_info(f"[git-reset {repo_name}] git reset --hard HEAD successful")
+        result = await asyncio.create_subprocess_exec("git", "-C", str(repo_path), "clean", "-fdx", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        returncode = await result.wait()
+        if returncode == 0:
+            log_info(f"[git-clean {repo_name}] git clean -fdx successful")
+    except Exception as e:
+        log_warn(f"[git-reset {repo_name}] Failed to reset/clean repo: {e}")
+
+
 def _make_repair_runtime() -> RepairRuntime:
     """Bundle the model factory + tool-builder callables the L3 repair/verify loops
     need, so they pass one object instead of five separate params."""
@@ -1173,17 +1189,7 @@ async def repair_repository(
                 return
 
             # Reset repo to clean state for reproducibility
-            try:
-                result = await asyncio.create_subprocess_exec("git", "-C", str(repo_path), "reset", "--hard", "HEAD", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                returncode = await result.wait()
-                if returncode == 0:
-                    log_info(f"[git-reset {repo_name}] git reset --hard HEAD successful")
-                result = await asyncio.create_subprocess_exec("git", "-C", str(repo_path), "clean", "-fdx", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                returncode = await result.wait()
-                if returncode == 0:
-                    log_info(f"[git-clean {repo_name}] git clean -fdx successful")
-            except Exception as e:
-                log_warn(f"[git-reset {repo_name}] Failed to reset/clean repo: {e}")
+            await _reset_repo_for_repair(repo_path, repo_name)
 
             if not args.skip_delete_docs:
                 await asyncio.to_thread(delete_docs_build_context, repo_path, repo_name)

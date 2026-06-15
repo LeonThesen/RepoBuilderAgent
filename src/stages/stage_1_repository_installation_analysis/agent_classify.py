@@ -1111,6 +1111,87 @@ async def _select_relevant_files(
     return selected_files, baseline_summary, step1_tokens, react_trace, react_stop_reason, structure_summary
 
 
+def _build_step2_summary(
+    *,
+    repo_url: str,
+    repo_name: str,
+    repo_path: "Path",
+    selected_files: list[str],
+    selected_files_before_budget: list[str],
+    baseline_summary: str,
+    budget_behavior: dict[str, Any],
+) -> tuple[str, list[str]]:
+    """Build the Step-2 classification summary — the one-shot baseline fingerprint,
+    or a selected-files fingerprint with step2 token-budget enforcement — and return
+    (summary, selected_files). budget_behavior is updated in place."""
+    # Step 2: only selected file contents are provided to the classification prompt.
+    if args.retrieval_strategy in {"one_shot_fingerprint", "one_shot_fingerprint_budgeted"}:
+        summary = baseline_summary
+    else:
+        summary = fingerprint(
+            format="md",
+            repo_path=str(repo_path),
+            selected_files=selected_files,
+            include_tree=False,
+            context="step2-selected",
+        )
+        if args.step2_token_budget > 0:
+            budget_prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", summary)
+            budget_tokens = estimate_tokens(budget_prompt, args.model)
+            budget_behavior["measured_prompt_tokens_before_enforcement"] = budget_tokens
+            if budget_tokens > args.step2_token_budget:
+                hard_pruned = _force_prune_by_measured_budget(
+                    repo_path,
+                    selected_files,
+                    args.step2_token_budget,
+                    budget_tokens,
+                )
+                if hard_pruned != selected_files:
+                    selected_files = hard_pruned
+                    summary = fingerprint(
+                        format="md",
+                        repo_path=str(repo_path),
+                        selected_files=selected_files,
+                        include_tree=False,
+                        context="step2-selected",
+                    )
+                    budget_prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", summary)
+                    budget_tokens = estimate_tokens(budget_prompt, args.model)
+                    budget_behavior["hard_enforcement_applied"] = True
+
+                budget_behavior["measured_prompt_tokens_after_enforcement"] = budget_tokens
+                if budget_tokens > args.step2_token_budget:
+                    log_warn(
+                        f"Step 2 prompt for {repo_name} still exceeded budget after hard enforcement "
+                        f"(prompt_tokens={budget_tokens}, budget={args.step2_token_budget})."
+                    )
+                else:
+                    log_info(
+                        f"Hard budget enforcement succeeded for {repo_name}: "
+                        f"prompt_tokens={budget_tokens}, selected_files={len(selected_files)}"
+                    )
+            else:
+                budget_behavior["measured_prompt_tokens_after_enforcement"] = budget_tokens
+                log_info(
+                    f"Applied Step 2 token budget packing for {repo_name}: "
+                    f"prompt_tokens={budget_tokens}, selected_files={len(selected_files)}"
+                )
+
+            budget_behavior["post_budget_selected_files_count"] = len(selected_files)
+            budget_behavior["pruned_files_count"] = max(0, len(selected_files_before_budget) - len(selected_files))
+            budget_behavior["applied"] = selected_files != selected_files_before_budget
+            final_estimated = _estimate_step2_prompt_tokens_from_selected_files(
+                repo_path,
+                repo_url,
+                selected_files,
+            )
+            budget_behavior["estimated_prompt_tokens_after_budget"] = final_estimated
+            before_estimated = budget_behavior.get("estimated_prompt_tokens_before_budget")
+            if isinstance(before_estimated, int):
+                budget_behavior["estimated_saved_tokens"] = max(0, before_estimated - final_estimated)
+    return summary, selected_files
+
+
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
@@ -1298,71 +1379,15 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                     yaml.dump(exploration_artifact, exploration_file, sort_keys=False, allow_unicode=True)
                 log_info(f"Exploration artifact saved at {exploration_path}")
 
-            # Step 2: only selected file contents are provided to the classification prompt.
-            if args.retrieval_strategy in {"one_shot_fingerprint", "one_shot_fingerprint_budgeted"}:
-                summary = baseline_summary
-            else:
-                summary = fingerprint(
-                    format="md",
-                    repo_path=str(repo_path),
-                    selected_files=selected_files,
-                    include_tree=False,
-                    context="step2-selected",
-                )
-                if args.step2_token_budget > 0:
-                    budget_prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", summary)
-                    budget_tokens = estimate_tokens(budget_prompt, args.model)
-                    budget_behavior["measured_prompt_tokens_before_enforcement"] = budget_tokens
-                    if budget_tokens > args.step2_token_budget:
-                        hard_pruned = _force_prune_by_measured_budget(
-                            repo_path,
-                            selected_files,
-                            args.step2_token_budget,
-                            budget_tokens,
-                        )
-                        if hard_pruned != selected_files:
-                            selected_files = hard_pruned
-                            summary = fingerprint(
-                                format="md",
-                                repo_path=str(repo_path),
-                                selected_files=selected_files,
-                                include_tree=False,
-                                context="step2-selected",
-                            )
-                            budget_prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", summary)
-                            budget_tokens = estimate_tokens(budget_prompt, args.model)
-                            budget_behavior["hard_enforcement_applied"] = True
-
-                        budget_behavior["measured_prompt_tokens_after_enforcement"] = budget_tokens
-                        if budget_tokens > args.step2_token_budget:
-                            log_warn(
-                                f"Step 2 prompt for {repo_name} still exceeded budget after hard enforcement "
-                                f"(prompt_tokens={budget_tokens}, budget={args.step2_token_budget})."
-                            )
-                        else:
-                            log_info(
-                                f"Hard budget enforcement succeeded for {repo_name}: "
-                                f"prompt_tokens={budget_tokens}, selected_files={len(selected_files)}"
-                            )
-                    else:
-                        budget_behavior["measured_prompt_tokens_after_enforcement"] = budget_tokens
-                        log_info(
-                            f"Applied Step 2 token budget packing for {repo_name}: "
-                            f"prompt_tokens={budget_tokens}, selected_files={len(selected_files)}"
-                        )
-
-                    budget_behavior["post_budget_selected_files_count"] = len(selected_files)
-                    budget_behavior["pruned_files_count"] = max(0, len(selected_files_before_budget) - len(selected_files))
-                    budget_behavior["applied"] = selected_files != selected_files_before_budget
-                    final_estimated = _estimate_step2_prompt_tokens_from_selected_files(
-                        repo_path,
-                        repo_url,
-                        selected_files,
-                    )
-                    budget_behavior["estimated_prompt_tokens_after_budget"] = final_estimated
-                    before_estimated = budget_behavior.get("estimated_prompt_tokens_before_budget")
-                    if isinstance(before_estimated, int):
-                        budget_behavior["estimated_saved_tokens"] = max(0, before_estimated - final_estimated)
+            summary, selected_files = _build_step2_summary(
+                repo_url=repo_url,
+                repo_name=repo_name,
+                repo_path=repo_path,
+                selected_files=selected_files,
+                selected_files_before_budget=selected_files_before_budget,
+                baseline_summary=baseline_summary,
+                budget_behavior=budget_behavior,
+            )
             summary_path = summary_dir / f"{repo_name}.md"
             with open(summary_path, "w") as f:
                 f.write(summary)
