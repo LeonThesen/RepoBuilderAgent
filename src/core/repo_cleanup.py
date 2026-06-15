@@ -194,6 +194,10 @@ def delete_docs_build_context(
                 if match.is_dir():
                     shutil.rmtree(match)
                     removed_dirs.append(str(rel))
+                elif _is_build_metadata_doc(match):
+                    # LICENSE/CHANGELOG/NOTICE/… are build inputs, not install docs;
+                    # preserved even if a broad glob (e.g. **/*.md) would match them.
+                    continue
                 else:
                     match.unlink()
                     removed_files.append(str(rel))
