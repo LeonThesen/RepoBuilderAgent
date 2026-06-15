@@ -406,18 +406,45 @@ def extract_finalize_answer(messages) -> "str | None":
     return None
 
 
-def hit_step_limit(result) -> bool:
-    """True if the ReAct loop ended on LangGraph's recursion-limit placeholder.
+# LangGraph's recursion-limit placeholder. Depending on version/config it either
+# RETURNS this as the last message OR raises GraphRecursionError. We normalize both
+# to the same returned result (see ainvoke_with_recursion_guard) so every call site
+# detects the limit uniformly via hit_step_limit() instead of crashing the stage.
+RECURSION_LIMIT_PLACEHOLDER = "Sorry, need more steps to process this request."
 
-    LangGraph emits the message content "Sorry, need more steps to process this
-    request." as the last message when the agent exhausts its recursion_limit.
-    """
+try:  # pragma: no cover - import shape varies across langgraph versions
+    from langgraph.errors import GraphRecursionError
+except Exception:  # pragma: no cover
+    GraphRecursionError = RecursionError
+
+
+def hit_step_limit(result) -> bool:
+    """True if the ReAct loop ended on LangGraph's recursion-limit placeholder."""
     messages = (result or {}).get("messages") or [] if isinstance(result, dict) else []
     if not messages:
         return False
     content = getattr(messages[-1], "content", "")
     text = content if isinstance(content, str) else str(content)
-    return text.strip() == "Sorry, need more steps to process this request."
+    return text.strip() == RECURSION_LIMIT_PLACEHOLDER
+
+
+async def ainvoke_with_recursion_guard(agent, payload, config):
+    """Invoke a create_react_agent, converting a *raised* GraphRecursionError into
+    the same placeholder result LangGraph emits when it instead *returns* at the
+    limit. This makes recursion-limit handling uniform across every ReAct loop:
+    callers detect it with hit_step_limit() / get an empty payload and fall back,
+    rather than letting the exception escape and crash the whole stage.
+
+    Previously only L1 wrapped its agent in try/except; the generator, reviewer,
+    validation and L3 loops relied on a non-raising placeholder this LangGraph
+    version does not produce, so they crashed on repos that exhausted the budget.
+    """
+    from langchain_core.messages import AIMessage
+
+    try:
+        return await agent.ainvoke(payload, config=config)
+    except GraphRecursionError:
+        return {"messages": [AIMessage(content=RECURSION_LIMIT_PLACEHOLDER)]}
 
 
 def build_think_tool() -> Callable[[str], str]:

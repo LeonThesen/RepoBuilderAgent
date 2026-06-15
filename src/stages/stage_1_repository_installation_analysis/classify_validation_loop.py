@@ -6,6 +6,7 @@ from langgraph.prebuilt import create_react_agent
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
+        ainvoke_with_recursion_guard,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_list_selected_files_tool,
@@ -21,6 +22,7 @@ try:
 except ImportError:
     from agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
+        ainvoke_with_recursion_guard,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_list_selected_files_tool,
@@ -127,9 +129,10 @@ async def run_classify_validation_loop(
         .replace("{{SUMMARY_EVIDENCE}}", compact_summary)
     )
 
-    result = await validation_agent.ainvoke(
+    result = await ainvoke_with_recursion_guard(
+        validation_agent,
         {"messages": [{"role": "user", "content": validation_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": recursion_limit},
+        {"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": recursion_limit},
     )
     payload = extract_agent_payload(result)
     parsed_checks = normalize_validation_checks(payload.get("checks") if isinstance(payload, dict) else {})

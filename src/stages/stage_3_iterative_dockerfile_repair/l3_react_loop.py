@@ -9,6 +9,7 @@ try:
     from RepoBuilderAgent.src.core.log_utils import log_warn
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
+        ainvoke_with_recursion_guard,
         build_finalize_tool,
         extract_finalize_answer,
         hit_step_limit,
@@ -20,6 +21,7 @@ except ImportError:
     from core.log_utils import log_warn
     from agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
+        ainvoke_with_recursion_guard,
         build_finalize_tool,
         extract_finalize_answer,
         hit_step_limit,
@@ -170,9 +172,10 @@ async def run_l3_dockerfile_repair_react(
         pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
-    result = await repair_agent.ainvoke(
+    result = await ainvoke_with_recursion_guard(
+        repair_agent,
         {"messages": [{"role": "user", "content": prompt}]},
-        config={
+        {
             "configurable": {"thread_id": f"{repo_url}:l3-repair:{attempt_number}"},
             "recursion_limit": recursion_limit,
         },
@@ -224,9 +227,10 @@ async def run_l3_verification_command_react(
         pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
     )
 
-    result = await verify_agent.ainvoke(
+    result = await ainvoke_with_recursion_guard(
+        verify_agent,
         {"messages": [{"role": "user", "content": prompt}]},
-        config={
+        {
             "configurable": {"thread_id": f"{repo_url}:{thread_suffix}"},
             "recursion_limit": recursion_limit,
         },

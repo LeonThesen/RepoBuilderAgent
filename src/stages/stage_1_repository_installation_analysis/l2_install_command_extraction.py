@@ -8,6 +8,7 @@ from langgraph.prebuilt import create_react_agent
 try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
+        ainvoke_with_recursion_guard,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_get_dockerfile_snippet_tool,
@@ -27,6 +28,7 @@ try:
 except ImportError:
     from agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
+        ainvoke_with_recursion_guard,
         build_fetch_file_context_tool,
         build_finalize_tool,
         build_get_dockerfile_snippet_tool,
@@ -446,9 +448,10 @@ async def run_l2_synthesis_loop(
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
-    generation_result = await synthesis_generator.ainvoke(
+    generation_result = await ainvoke_with_recursion_guard(
+        synthesis_generator,
         {"messages": [{"role": "user", "content": synthesis_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": synthesis_recursion_limit},
+        {"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": synthesis_recursion_limit},
     )
     generation_payload = extract_agent_payload(generation_result)
     updates = normalize_text_list(generation_payload.get("hypothesis_updates") if isinstance(generation_payload, dict) else [])
@@ -507,9 +510,10 @@ async def run_l2_synthesis_loop(
             .replace("{{SUMMARY_EVIDENCE}}", summary)
         )
 
-        review_result = await synthesis_reviewer.ainvoke(
+        review_result = await ainvoke_with_recursion_guard(
+            synthesis_reviewer,
             {"messages": [{"role": "user", "content": reviewer_prompt}]},
-            config={
+            {
                 "configurable": {"thread_id": f"{repo_name}:l2-review:r{round_index + 1}"},
                 "recursion_limit": synthesis_recursion_limit,
             },
