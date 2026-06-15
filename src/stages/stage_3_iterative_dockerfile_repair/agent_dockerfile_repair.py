@@ -23,7 +23,7 @@ try:
     from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
     from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
     from RepoBuilderAgent.src.core.file_io import write_text
-    from RepoBuilderAgent.src.core.repo_cleanup import delete_docs_build_context
+    from RepoBuilderAgent.src.core.repo_cleanup import delete_docs_build_context, get_docs_to_delete
     from RepoBuilderAgent.src.stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
         run_l3_dockerfile_repair_react,
         run_l3_verification_command_react,
@@ -66,7 +66,7 @@ except ImportError:
     from core.agent_runtime import RepairRuntime
     from core.dockerfile_utils import extract_dockerfile, get_base_template
     from core.file_io import write_text
-    from core.repo_cleanup import delete_docs_build_context
+    from core.repo_cleanup import delete_docs_build_context, get_docs_to_delete
     from stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
         run_l3_dockerfile_repair_react,
         run_l3_verification_command_react,
@@ -1192,7 +1192,9 @@ async def repair_repository(
             await _reset_repo_for_repair(repo_path, repo_name)
 
             if not args.skip_delete_docs:
-                await asyncio.to_thread(delete_docs_build_context, repo_path, repo_name)
+                await asyncio.to_thread(
+                    delete_docs_build_context, repo_path, repo_name, get_docs_to_delete(gt_doc)
+                )
             else:
                 log_info(f"[delete-docs {repo_name}] Skipping docs/CI deletion (--skip-delete-docs set)")
 
