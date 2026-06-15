@@ -5,6 +5,7 @@ from langgraph.prebuilt import create_react_agent
 
 try:
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
     from RepoBuilderAgent.src.core.log_utils import log_warn
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
@@ -18,6 +19,7 @@ try:
     )
 except ImportError:
     from core.common import prompt_path
+    from core.agent_runtime import RepairRuntime
     from core.llm_yaml import parse_llm_yaml_dict
     from core.log_utils import log_warn
     from agent_tools.react_loop_tools import (
@@ -124,14 +126,16 @@ async def run_l3_dockerfile_repair_react(
     prompt: str,
     repair_timeout: int,
     l3_react_max_steps: int,
-    model_name: str,
-    new_prebuilt_chat_model: Callable[[int], Any],
-    build_think_tool: Callable[[], Any],
-    build_hadolint_snippet_tool: Callable[[], Any],
-    extract_dockerfile: Callable[[str], str],
+    runtime: RepairRuntime,
     build_snippet_tool: "Callable[[], Any] | None" = None,
     repo_tools: "list[Any] | None" = None,
 ) -> tuple[str, int, list[dict]]:
+    model_name = runtime.model_name
+    new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
+    build_think_tool = runtime.build_think_tool
+    build_hadolint_snippet_tool = runtime.build_hadolint_snippet_tool
+    extract_dockerfile = runtime.extract_dockerfile
+
     think = build_think_tool()
     hadolint_tool = build_hadolint_snippet_tool()
     tools: list[Any] = [think, hadolint_tool, build_finalize_tool()]
@@ -202,10 +206,12 @@ async def run_l3_verification_command_react(
     thread_suffix: str,
     system_prompt: str,
     candidate_keys: list[str],
-    model_name: str,
-    new_prebuilt_chat_model: Callable[[int], Any],
-    build_think_tool: Callable[[], Any],
+    runtime: RepairRuntime,
 ) -> tuple[str, int]:
+    model_name = runtime.model_name
+    new_prebuilt_chat_model = runtime.new_prebuilt_chat_model
+    build_think_tool = runtime.build_think_tool
+
     think = build_think_tool()
     recursion_limit = max(8, int(l3_react_max_steps) * 4)
     verify_agent = create_react_agent(

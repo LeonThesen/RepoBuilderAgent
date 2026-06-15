@@ -20,6 +20,7 @@ try:
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
+    from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
     from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
     from RepoBuilderAgent.src.core.file_io import write_text
     from RepoBuilderAgent.src.core.repo_cleanup import delete_docs_build_context
@@ -62,6 +63,7 @@ except ImportError:
     from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool
     from metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from core.chat_model_factory import make_prebuilt_chat_model_factory
+    from core.agent_runtime import RepairRuntime
     from core.dockerfile_utils import extract_dockerfile, get_base_template
     from core.file_io import write_text
     from core.repo_cleanup import delete_docs_build_context
@@ -262,6 +264,18 @@ _new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
     max_retries=args.llm_max_retries,
     http_async_client=_http_client,
 )
+
+
+def _make_repair_runtime() -> RepairRuntime:
+    """Bundle the model factory + tool-builder callables the L3 repair/verify loops
+    need, so they pass one object instead of five separate params."""
+    return RepairRuntime(
+        model_name=args.model,
+        new_prebuilt_chat_model=_new_prebuilt_chat_model,
+        build_think_tool=build_think_tool,
+        build_hadolint_snippet_tool=build_hadolint_snippet_tool,
+        extract_dockerfile=extract_dockerfile,
+    )
 
 
 def sanitize_image_tag(value: str) -> str:
@@ -912,11 +926,7 @@ async def request_repair(
         prompt=prompt,
         repair_timeout=args.repair_timeout,
         l3_react_max_steps=args.l3_react_max_steps,
-        model_name=args.model,
-        new_prebuilt_chat_model=_new_prebuilt_chat_model,
-        build_think_tool=build_think_tool,
-        build_hadolint_snippet_tool=build_hadolint_snippet_tool,
-        extract_dockerfile=extract_dockerfile,
+        runtime=_make_repair_runtime(),
         build_snippet_tool=build_get_dockerfile_snippet_tool if args.snippet_tools else None,
         repo_tools=repo_tools,
     )
@@ -1015,9 +1025,7 @@ async def request_verification_command_repair(
         thread_suffix="l3-verify-repair",
         system_prompt=VERIFY_REPAIR_SYSTEM_PROMPT,
         candidate_keys=["verification_command", "verify_command", "repaired_verification_command", "command"],
-        model_name=args.model,
-        new_prebuilt_chat_model=_new_prebuilt_chat_model,
-        build_think_tool=build_think_tool,
+        runtime=_make_repair_runtime(),
     )
     if not command:
         log_warn(f"L3 ReAct verify-repair agent returned empty command for {repo_url}")
@@ -1069,9 +1077,7 @@ async def request_verification_command_refresh(
         thread_suffix="l3-verify-refresh",
         system_prompt=VERIFY_REFRESH_SYSTEM_PROMPT,
         candidate_keys=["verification_command", "verify_command", "refreshed_verification_command", "command"],
-        model_name=args.model,
-        new_prebuilt_chat_model=_new_prebuilt_chat_model,
-        build_think_tool=build_think_tool,
+        runtime=_make_repair_runtime(),
     )
     if not command:
         log_warn(f"L3 ReAct verify-refresh agent returned empty command for {repo_url}")

@@ -55,3 +55,16 @@ class ClassifyRuntime:
     extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]]
     normalize_text_list: Callable[[Any], list[str]]
     normalize_validation_checks: Callable[[Any], Any]
+
+
+@dataclass(frozen=True)
+class RepairRuntime:
+    """Stage-3 (L3 repair) analogue of ClassifyRuntime: the model factory plus the
+    tool-builder callables the repair/verify ReAct loops need. Passed as one object
+    because l3_react_loop can't import these directly from agent_dockerfile_repair
+    (circular). build_snippet_tool / repo_tools stay per-call (config-dependent)."""
+    model_name: str
+    new_prebuilt_chat_model: Callable[[int], Any]
+    build_think_tool: Callable[[], Any]
+    build_hadolint_snippet_tool: Callable[[], Any]
+    extract_dockerfile: Callable[[str], str]

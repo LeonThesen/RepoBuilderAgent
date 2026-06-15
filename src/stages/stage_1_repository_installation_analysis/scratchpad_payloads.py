@@ -1,5 +1,32 @@
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+@dataclass(frozen=True)
+class LoopOutcome:
+    """One Stage-1 loop's result: where its artifact was written (if at all), the
+    artifact dict, its ReAct loop trace, and why the loop stopped. The three loops
+    (exploration, synthesis, validation) share this shape, so the scratchpad builder
+    takes three of these instead of twelve scalar params."""
+    path: Path | None
+    artifact: dict[str, Any]
+    loop_trace: list[dict[str, Any]]
+    stop_reason: str
+
+
+@dataclass(frozen=True)
+class TokenCounts:
+    step1_selection: int
+    step2_classification: int
+    two_step_total: int
+
+
+@dataclass(frozen=True)
+class SummaryPaths:
+    structure_summary: Path
+    selected_summary: Path
+    selected_files: Path
 
 
 def build_architecture_scratchpad_payload(
@@ -7,24 +34,11 @@ def build_architecture_scratchpad_payload(
     repo_url: str,
     retrieval_strategy: str,
     selected_files: list[str],
-    react_trace: list[dict[str, Any]],
-    react_stop_reason: str,
-    exploration_path: Path | None,
-    exploration_artifact: dict[str, Any],
-    synthesis_path: Path | None,
-    synthesis_artifact: dict[str, Any],
-    synthesis_loop_trace: list[dict[str, Any]],
-    synthesis_stop_reason: str,
-    validation_path: Path | None,
-    validation_artifact: dict[str, Any],
-    validation_loop_trace: list[dict[str, Any]],
-    validation_stop_reason: str,
-    step1_tokens: int,
-    step2_tokens: int,
-    two_step_total_tokens: int,
-    summary_path: Path,
-    structure_summary_path: Path,
-    selected_files_path: Path,
+    exploration: LoopOutcome,
+    synthesis: LoopOutcome,
+    validation: LoopOutcome,
+    tokens: TokenCounts,
+    paths: SummaryPaths,
     subagents_enabled: bool,
     budget_behavior: dict[str, Any],
 ) -> dict[str, Any]:
@@ -41,47 +55,47 @@ def build_architecture_scratchpad_payload(
             "exploration": {
                 "selected_files_count": len(selected_files),
                 "selected_files": selected_files,
-                "react_steps": len(react_trace),
-                "react_stop_reason": react_stop_reason,
-                "exploration_artifact_path": str(exploration_path) if exploration_path else None,
-                "evidence_gaps": exploration_artifact["evidence_gaps"],
-                "files_read_by_l1": exploration_artifact.get("files_read_by_l1", []),
-                "react_trace": react_trace,
+                "react_steps": len(exploration.loop_trace),
+                "react_stop_reason": exploration.stop_reason,
+                "exploration_artifact_path": str(exploration.path) if exploration.path else None,
+                "evidence_gaps": exploration.artifact["evidence_gaps"],
+                "files_read_by_l1": exploration.artifact.get("files_read_by_l1", []),
+                "react_trace": exploration.loop_trace,
             },
             "synthesis": {
-                "selected_summary_path": str(summary_path),
-                "structure_summary_path": str(structure_summary_path),
-                "selected_files_path": str(selected_files_path),
-                "synthesis_artifact_path": str(synthesis_path) if synthesis_path else None,
-                "react_steps": len(synthesis_loop_trace),
-                "react_stop_reason": synthesis_stop_reason,
+                "selected_summary_path": str(paths.selected_summary),
+                "structure_summary_path": str(paths.structure_summary),
+                "selected_files_path": str(paths.selected_files),
+                "synthesis_artifact_path": str(synthesis.path) if synthesis.path else None,
+                "react_steps": len(synthesis.loop_trace),
+                "react_stop_reason": synthesis.stop_reason,
                 "subagents_enabled": subagents_enabled,
-                "subagent_outputs": synthesis_artifact["subagent_outputs"],
-                "abstraction": synthesis_artifact.get("abstraction_l2", {}),
-                "per_source_confidence": synthesis_artifact.get("per_source_confidence", {}),
-                "unknown_markers": synthesis_artifact.get("unknown_markers", []),
-                "transition_policy": synthesis_artifact.get("transition_policy", {}),
-                "loop_checkpoint": synthesis_artifact.get("loop_checkpoint", {}),
-                "react_trace": synthesis_loop_trace,
-                "build_strategy_hypotheses": synthesis_artifact["build_strategy_hypotheses"],
-                "risk_notes": synthesis_artifact["risk_notes"],
+                "subagent_outputs": synthesis.artifact["subagent_outputs"],
+                "abstraction": synthesis.artifact.get("abstraction_l2", {}),
+                "per_source_confidence": synthesis.artifact.get("per_source_confidence", {}),
+                "unknown_markers": synthesis.artifact.get("unknown_markers", []),
+                "transition_policy": synthesis.artifact.get("transition_policy", {}),
+                "loop_checkpoint": synthesis.artifact.get("loop_checkpoint", {}),
+                "react_trace": synthesis.loop_trace,
+                "build_strategy_hypotheses": synthesis.artifact["build_strategy_hypotheses"],
+                "risk_notes": synthesis.artifact["risk_notes"],
                 "prompt_tokens": {
-                    "step1_selection": step1_tokens,
-                    "step2_classification": step2_tokens,
-                    "two_step_total": two_step_total_tokens,
+                    "step1_selection": tokens.step1_selection,
+                    "step2_classification": tokens.step2_classification,
+                    "two_step_total": tokens.two_step_total,
                 },
                 "budget_behavior": budget_behavior,
             },
             "validation": {
-                "validation_artifact_path": str(validation_path) if validation_path else None,
-                "react_steps": len(validation_loop_trace),
-                "react_stop_reason": validation_stop_reason,
-                "abstraction": validation_artifact.get("abstraction_classify_validation", {}),
-                "outcome_state": validation_artifact.get("outcome_state", "unknown"),
-                "loop_checkpoint": validation_artifact.get("loop_checkpoint", {}),
-                "react_trace": validation_loop_trace,
-                "checks": validation_artifact["checks"],
-                "warnings": validation_artifact["warnings"],
+                "validation_artifact_path": str(validation.path) if validation.path else None,
+                "react_steps": len(validation.loop_trace),
+                "react_stop_reason": validation.stop_reason,
+                "abstraction": validation.artifact.get("abstraction_classify_validation", {}),
+                "outcome_state": validation.artifact.get("outcome_state", "unknown"),
+                "loop_checkpoint": validation.artifact.get("loop_checkpoint", {}),
+                "react_trace": validation.loop_trace,
+                "checks": validation.artifact["checks"],
+                "warnings": validation.artifact["warnings"],
             },
         },
     }

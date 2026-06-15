@@ -21,7 +21,7 @@ try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
+    from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload, LoopOutcome, TokenCounts, SummaryPaths
     from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -50,7 +50,7 @@ except ImportError:
     import core.config as _config
     from stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
     from stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
-    from stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload
+    from stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload, LoopOutcome, TokenCounts, SummaryPaths
     from core.common import (
         chat_completion_with_retries,
         finalize_llm_metrics,
@@ -906,58 +906,6 @@ def _build_file_context_by_path(repo_path: Path) -> dict[str, str]:
     return file_context
 
 
-def _build_architecture_scratchpad_payload(
-    *,
-    repo_url: str,
-    retrieval_strategy: str,
-    selected_files: list[str],
-    react_trace: list[dict[str, Any]],
-    react_stop_reason: str,
-    exploration_path: Path | None,
-    exploration_artifact: dict[str, Any],
-    synthesis_path: Path | None,
-    synthesis_artifact: dict[str, Any],
-    synthesis_loop_trace: list[dict[str, Any]],
-    synthesis_stop_reason: str,
-    validation_path: Path | None,
-    validation_artifact: dict[str, Any],
-    validation_loop_trace: list[dict[str, Any]],
-    validation_stop_reason: str,
-    step1_tokens: int,
-    step2_tokens: int,
-    two_step_total_tokens: int,
-    summary_path: Path,
-    structure_summary_path: Path,
-    selected_files_path: Path,
-    subagents_enabled: bool,
-    budget_behavior: dict[str, Any],
-) -> dict[str, Any]:
-    return build_architecture_scratchpad_payload(
-        repo_url=repo_url,
-        retrieval_strategy=retrieval_strategy,
-        selected_files=selected_files,
-        react_trace=react_trace,
-        react_stop_reason=react_stop_reason,
-        exploration_path=exploration_path,
-        exploration_artifact=exploration_artifact,
-        synthesis_path=synthesis_path,
-        synthesis_artifact=synthesis_artifact,
-        synthesis_loop_trace=synthesis_loop_trace,
-        synthesis_stop_reason=synthesis_stop_reason,
-        validation_path=validation_path,
-        validation_artifact=validation_artifact,
-        validation_loop_trace=validation_loop_trace,
-        validation_stop_reason=validation_stop_reason,
-        step1_tokens=step1_tokens,
-        step2_tokens=step2_tokens,
-        two_step_total_tokens=two_step_total_tokens,
-        summary_path=summary_path,
-        structure_summary_path=structure_summary_path,
-        selected_files_path=selected_files_path,
-        subagents_enabled=subagents_enabled,
-        budget_behavior=budget_behavior,
-    )
-
 # Conservative default file selection used when a retrieval strategy returns
 # nothing (or is unknown). High-signal manifests/docs/CI across the dataset's languages.
 _DEFAULT_SELECTED_FILES = [
@@ -1530,28 +1478,32 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 scratchpad_dir = Path(args.scratchpad_dir)
                 scratchpad_dir.mkdir(parents=True, exist_ok=True)
                 scratchpad_path = scratchpad_dir / f"{repo_name}.architecture-scratchpad.yaml"
-                scratchpad_payload = _build_architecture_scratchpad_payload(
+                scratchpad_payload = build_architecture_scratchpad_payload(
                     repo_url=repo_url,
                     retrieval_strategy=args.retrieval_strategy,
                     selected_files=selected_files,
-                    react_trace=react_trace,
-                    react_stop_reason=react_stop_reason,
-                    exploration_path=exploration_path,
-                    exploration_artifact=exploration_artifact,
-                    synthesis_path=synthesis_path,
-                    synthesis_artifact=synthesis_artifact,
-                    synthesis_loop_trace=synthesis_loop_trace,
-                    synthesis_stop_reason=synthesis_stop_reason,
-                    validation_path=validation_path,
-                    validation_artifact=validation_artifact,
-                    validation_loop_trace=validation_loop_trace,
-                    validation_stop_reason=validation_stop_reason,
-                    step1_tokens=step1_tokens,
-                    step2_tokens=step2_tokens,
-                    two_step_total_tokens=two_step_total_tokens,
-                    summary_path=Path(summary_path),
-                    structure_summary_path=structure_summary_path,
-                    selected_files_path=selected_files_path,
+                    exploration=LoopOutcome(
+                        path=exploration_path, artifact=exploration_artifact,
+                        loop_trace=react_trace, stop_reason=react_stop_reason,
+                    ),
+                    synthesis=LoopOutcome(
+                        path=synthesis_path, artifact=synthesis_artifact,
+                        loop_trace=synthesis_loop_trace, stop_reason=synthesis_stop_reason,
+                    ),
+                    validation=LoopOutcome(
+                        path=validation_path, artifact=validation_artifact,
+                        loop_trace=validation_loop_trace, stop_reason=validation_stop_reason,
+                    ),
+                    tokens=TokenCounts(
+                        step1_selection=step1_tokens,
+                        step2_classification=step2_tokens,
+                        two_step_total=two_step_total_tokens,
+                    ),
+                    paths=SummaryPaths(
+                        structure_summary=structure_summary_path,
+                        selected_summary=Path(summary_path),
+                        selected_files=selected_files_path,
+                    ),
                     subagents_enabled=args.synthesis_subagents_enabled,
                     budget_behavior=budget_behavior,
                 )
