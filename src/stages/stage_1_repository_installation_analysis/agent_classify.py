@@ -43,6 +43,7 @@ try:
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
+    from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
@@ -72,6 +73,7 @@ except ImportError:
     from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import preprocess_repository
+    from core.llm_yaml import parse_llm_yaml
     from agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -286,12 +288,6 @@ async def update_progress(progress_state: dict, repo_name: str) -> None:
     async with progress_state["lock"]:
         progress_state["bar"].set_postfix_str(repo_name)
         progress_state["bar"].update(1)
-
-def parse_llm_yaml(raw: str) -> Any:
-    match = re.search(r"```(?:yaml)?\n(.*?)```", raw, re.DOTALL)
-    content = match.group(1) if match else raw
-    return yaml.safe_load(content)
-
 
 def extract_selected_files(raw: str) -> list[str]:
     """Parse file paths from step-1 model output (YAML preferred, text fallback)."""

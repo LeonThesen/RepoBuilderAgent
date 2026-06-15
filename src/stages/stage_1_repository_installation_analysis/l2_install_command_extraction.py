@@ -1,7 +1,5 @@
-import re
 from typing import Any, Callable, Optional, TypedDict
 
-import yaml
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 
@@ -24,6 +22,7 @@ try:
         tool_call_budget,
     )
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
     from RepoBuilderAgent.src.core.log_utils import log_warn
 except ImportError:
     from agent_tools.react_loop_tools import (
@@ -44,27 +43,12 @@ except ImportError:
         tool_call_budget,
     )
     from core.common import prompt_path
+    from core.llm_yaml import parse_llm_yaml_dict
     from core.log_utils import log_warn
 
 
 def _deterministic_signal_scan(selected_files: list[str], markers: tuple[str, ...], limit: int = 8) -> list[str]:
     return [path for path in selected_files if any(marker in path.lower() for marker in markers)][: max(1, int(limit))]
-
-
-def _parse_yaml_payload(content: str) -> dict[str, Any]:
-    """Parse a single-pass subagent reply (fenced or bare YAML) into a dict.
-
-    Returns {} for an unusable reply so callers fall back to their deterministic
-    scan rather than crash. (Local copy of agent_classify.parse_llm_yaml; importing
-    it would be circular — agent_classify imports this module.)
-    """
-    match = re.search(r"```(?:yaml)?\n(.*?)```", content or "", re.DOTALL)
-    raw = match.group(1) if match else (content or "")
-    try:
-        parsed = yaml.safe_load(raw)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
 
 
 async def _invoke_model_once(
@@ -86,7 +70,7 @@ async def _invoke_model_once(
         ]
     )
     content = response.content if isinstance(response.content, str) else str(response.content)
-    return _parse_yaml_payload(content)
+    return parse_llm_yaml_dict(content)
 
 
 async def _invoke_signal_subagent(

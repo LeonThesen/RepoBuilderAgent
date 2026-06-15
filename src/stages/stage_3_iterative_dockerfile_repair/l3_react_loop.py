@@ -1,11 +1,11 @@
 import re
 from typing import Any, Callable
 
-import yaml
 from langgraph.prebuilt import create_react_agent
 
 try:
     from RepoBuilderAgent.src.core.common import prompt_path
+    from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
     from RepoBuilderAgent.src.core.log_utils import log_warn
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
@@ -18,6 +18,7 @@ try:
     )
 except ImportError:
     from core.common import prompt_path
+    from core.llm_yaml import parse_llm_yaml_dict
     from core.log_utils import log_warn
     from agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
@@ -28,19 +29,6 @@ except ImportError:
         make_history_trim_hook,
         tool_call_budget,
     )
-
-
-def _parse_react_yaml(text: str) -> dict:
-    """Parse a YAML payload from raw model/tool text (fenced block preferred)."""
-    if not isinstance(text, str) or not text.strip():
-        return {}
-    match = re.search(r"```(?:yaml)?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    yaml_text = match.group(1) if match else text
-    try:
-        parsed = yaml.safe_load(yaml_text)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
 
 
 def _extract_repair_trace(result: dict, *, max_content_chars: int = 2000) -> list[dict]:
@@ -82,14 +70,14 @@ def _extract_react_payload(result: dict) -> dict:
     # (2) prefer the finalize tool-call's answer when present.
     finalize_answer = extract_finalize_answer(messages)
     if finalize_answer is not None:
-        parsed = _parse_react_yaml(finalize_answer)
+        parsed = parse_llm_yaml_dict(finalize_answer)
         if isinstance(parsed, dict) and parsed:
             return parsed
 
     # (3) trailing-message YAML fallback.
     if messages:
         content = getattr(messages[-1], "content", "")
-        parsed = _parse_react_yaml(content)
+        parsed = parse_llm_yaml_dict(content)
         if isinstance(parsed, dict) and parsed:
             return parsed
 
