@@ -947,6 +947,112 @@ def _build_architecture_scratchpad_payload(
         budget_behavior=budget_behavior,
     )
 
+# Conservative default file selection used when a retrieval strategy returns
+# nothing (or is unknown). High-signal manifests/docs/CI across the dataset's languages.
+_DEFAULT_SELECTED_FILES = [
+    "README.md",
+    "README.rst",
+    "pyproject.toml",
+    "requirements.txt",
+    "package.json",
+    "go.mod",
+    "Cargo.toml",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    ".env.example",
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+]
+
+
+def _build_exploration_artifact(
+    *,
+    repo_url: str,
+    retrieval_strategy: str,
+    selected_files: list[str],
+    react_trace: list[dict[str, Any]],
+    react_stop_reason: str,
+) -> dict[str, Any]:
+    """Derive the L1 exploration artifact — evidence-gap flags, high-signal files,
+    and the files the ReAct agent actually read — from the selected files and trace.
+    Pure: the caller decides whether/where to persist the returned dict."""
+    selected_lower = [str(path).lower() for path in selected_files]
+    manifest_markers = (
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "go.mod",
+        "cargo.toml",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+    )
+    has_manifest = any(any(marker in path for marker in manifest_markers) for path in selected_lower)
+    has_ci = any(path.startswith(".github/workflows/") for path in selected_lower)
+    has_docker = any("dockerfile" in path or "docker-compose" in path for path in selected_lower)
+    has_tests = any(
+        "/test" in path
+        or path.startswith("test/")
+        or path.startswith("tests/")
+        or path.endswith(".spec.ts")
+        or path.endswith("_test.go")
+        for path in selected_lower
+    )
+
+    high_signal_files = [
+        path
+        for path in selected_files
+        if any(
+            marker in path.lower()
+            for marker in (
+                "package.json",
+                "pyproject.toml",
+                "requirements",
+                "go.mod",
+                "cargo.toml",
+                "pom.xml",
+                "build.gradle",
+                "dockerfile",
+                "docker-compose",
+                ".github/workflows",
+            )
+        )
+    ]
+
+    # SP1: extract files the L1 agent actually read/listed from the trace.
+    files_read_by_l1: list[dict[str, str]] = []
+    for evt in react_trace:
+        for tc in (evt.get("tool_calls") or []):
+            if isinstance(tc, dict) and tc.get("name") in {"read_file", "list_tree"}:
+                path = (tc.get("args") or {}).get("path")
+                if path:
+                    files_read_by_l1.append({"tool": tc["name"], "path": str(path)})
+
+    return {
+        "repo": repo_url,
+        "stage": "exploration",
+        "retrieval_strategy": retrieval_strategy,
+        "react": {
+            "steps": len(react_trace),
+            "stop_reason": react_stop_reason,
+        },
+        "high_signal_files": high_signal_files,
+        "files_read_by_l1": files_read_by_l1,
+        "evidence_gaps": {
+            "manifest_evidence_missing": not has_manifest,
+            "ci_workflow_evidence_missing": not has_ci,
+            "docker_evidence_missing": not has_docker,
+            "test_evidence_missing": not has_tests,
+        },
+        "focus_questions": [
+            "Which build tool and entrypoints are required for reproducible builds?",
+            "Which system dependencies are likely required inside container builds?",
+            "What is the minimal verification command that proves runtime correctness?",
+        ],
+    }
+
+
 async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
@@ -977,21 +1083,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 log_info(f"Preprocessing {repo_name}...")
                 preprocess_repository(repo_path, args.deletion_patterns)
             
-            default_selected_files = [
-                "README.md",
-                "README.rst",
-                "pyproject.toml",
-                "requirements.txt",
-                "package.json",
-                "go.mod",
-                "Cargo.toml",
-                "Dockerfile",
-                "docker-compose.yml",
-                "docker-compose.yaml",
-                ".env.example",
-                ".github/workflows/*.yml",
-                ".github/workflows/*.yaml",
-            ]
+            default_selected_files = list(_DEFAULT_SELECTED_FILES)
 
             log_trace(f"Begin analysis for {repo_name}")
             # Step 1: structure-only context -> select relevant files.
@@ -1204,80 +1296,13 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             with open(selected_files_path, "w") as f:
                 yaml.dump({"retrieval_strategy": args.retrieval_strategy, "selected_files": selected_files}, f, sort_keys=False, allow_unicode=True)
 
-            selected_lower = [str(path).lower() for path in selected_files]
-            manifest_markers = (
-                "package.json",
-                "pyproject.toml",
-                "requirements.txt",
-                "go.mod",
-                "cargo.toml",
-                "pom.xml",
-                "build.gradle",
-                "build.gradle.kts",
+            exploration_artifact = _build_exploration_artifact(
+                repo_url=repo_url,
+                retrieval_strategy=args.retrieval_strategy,
+                selected_files=selected_files,
+                react_trace=react_trace,
+                react_stop_reason=react_stop_reason,
             )
-            has_manifest = any(any(marker in path for marker in manifest_markers) for path in selected_lower)
-            has_ci = any(path.startswith(".github/workflows/") for path in selected_lower)
-            has_docker = any("dockerfile" in path or "docker-compose" in path for path in selected_lower)
-            has_tests = any(
-                "/test" in path
-                or path.startswith("test/")
-                or path.startswith("tests/")
-                or path.endswith(".spec.ts")
-                or path.endswith("_test.go")
-                for path in selected_lower
-            )
-
-            high_signal_files = [
-                path
-                for path in selected_files
-                if any(
-                    marker in path.lower()
-                    for marker in (
-                        "package.json",
-                        "pyproject.toml",
-                        "requirements",
-                        "go.mod",
-                        "cargo.toml",
-                        "pom.xml",
-                        "build.gradle",
-                        "dockerfile",
-                        "docker-compose",
-                        ".github/workflows",
-                    )
-                )
-            ]
-
-            # SP1: extract files the L1 agent actually read/listed from the trace.
-            _files_read_by_l1: list[dict[str, str]] = []
-            for _evt in react_trace:
-                for _tc in (_evt.get("tool_calls") or []):
-                    if isinstance(_tc, dict) and _tc.get("name") in {"read_file", "list_tree"}:
-                        _path = (_tc.get("args") or {}).get("path")
-                        if _path:
-                            _files_read_by_l1.append({"tool": _tc["name"], "path": str(_path)})
-
-            exploration_artifact = {
-                "repo": repo_url,
-                "stage": "exploration",
-                "retrieval_strategy": args.retrieval_strategy,
-                "react": {
-                    "steps": len(react_trace),
-                    "stop_reason": react_stop_reason,
-                },
-                "high_signal_files": high_signal_files,
-                "files_read_by_l1": _files_read_by_l1,
-                "evidence_gaps": {
-                    "manifest_evidence_missing": not has_manifest,
-                    "ci_workflow_evidence_missing": not has_ci,
-                    "docker_evidence_missing": not has_docker,
-                    "test_evidence_missing": not has_tests,
-                },
-                "focus_questions": [
-                    "Which build tool and entrypoints are required for reproducible builds?",
-                    "Which system dependencies are likely required inside container builds?",
-                    "What is the minimal verification command that proves runtime correctness?",
-                ],
-            }
             exploration_path = None
             if args.exploration_enabled:
                 exploration_path = summary_dir / f"{repo_name}.exploration.yaml"

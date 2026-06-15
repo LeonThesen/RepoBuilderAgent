@@ -1088,6 +1088,28 @@ async def request_verification_command_refresh(
     return command
 
 
+def _init_repair_report(repo_url: str, dockerfile_path: Path) -> dict:
+    """Build the initial repair-report skeleton: target, attempt budget, and a
+    snapshot of the stateful-repair config. Attempts/success are filled in by the
+    repair loop. Pure (reads the parsed args + active prompt profile)."""
+    return {
+        "repo": repo_url,
+        "dockerfile": str(dockerfile_path),
+        "max_attempts": args.max_attempts,
+        "success": False,
+        "attempts": [],
+        "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
+        "stateful_repair": {
+            "enabled": args.stateful_repair,
+            "tree_enabled": args.stateful_repair_tree,
+            "history_window": args.stateful_history_window,
+            "history_max_chars": args.stateful_history_max_chars,
+            "tree_max_chars": args.stateful_tree_max_chars,
+            "tree_max_children": args.stateful_tree_max_children,
+        },
+    }
+
+
 async def repair_repository(
     repo_url: str,
     repos_dir: Path,
@@ -1106,22 +1128,7 @@ async def repair_repository(
         llm_metrics = init_llm_metrics(repo_url, args.model, args.endpoint, args.timeout, args.llm_max_retries)
         llm_metrics["prompt_profile"] = prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE)
 
-        report: dict = {
-            "repo": repo_url,
-            "dockerfile": str(dockerfile_path),
-            "max_attempts": args.max_attempts,
-            "success": False,
-            "attempts": [],
-            "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
-            "stateful_repair": {
-                "enabled": args.stateful_repair,
-                "tree_enabled": args.stateful_repair_tree,
-                "history_window": args.stateful_history_window,
-                "history_max_chars": args.stateful_history_max_chars,
-                "tree_max_chars": args.stateful_tree_max_chars,
-                "tree_max_children": args.stateful_tree_max_children,
-            },
-        }
+        report: dict = _init_repair_report(repo_url, dockerfile_path)
 
         try:
             classification_path = results_dir / f"{repo_name}.yaml"
