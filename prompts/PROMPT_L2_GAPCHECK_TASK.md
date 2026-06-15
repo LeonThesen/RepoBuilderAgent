@@ -1,8 +1,7 @@
 Repository: {{REPO_NAME}}
-The four parallel signal scanners have completed. Analyze their outputs for conflicts and gaps.
-Use think between major decisions.
+The four parallel signal scanners have completed. Analyze their outputs for conflicts and gaps in a single pass — no tools, no follow-up turns.
 
-Return keys: thought, has_manifest (bool), has_docker (bool), has_scripts (bool), has_source_deps (bool), conflicts (list of objects with keys source_a, source_b, field, detail, resolution), gaps (list of strings describing missing evidence), notes (list), done (bool).
+Return keys: thought, has_manifest (bool), has_docker (bool), has_scripts (bool), has_source_deps (bool), conflicts (list of objects with keys source_a, source_b, field, detail, resolution), gaps (list of strings describing missing evidence), notes (list).
 
 Priority for conflict resolution: Dockerfile > Manifest > Build scripts > Source code
 

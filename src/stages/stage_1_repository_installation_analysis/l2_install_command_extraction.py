@@ -1,5 +1,7 @@
+import re
 from typing import Any, Callable, Optional, TypedDict
 
+import yaml
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 
@@ -47,6 +49,44 @@ def _deterministic_signal_scan(selected_files: list[str], markers: tuple[str, ..
     return [path for path in selected_files if any(marker in path.lower() for marker in markers)][: max(1, int(limit))]
 
 
+def _parse_yaml_payload(content: str) -> dict[str, Any]:
+    """Parse a single-pass subagent reply (fenced or bare YAML) into a dict.
+
+    Returns {} for an unusable reply so callers fall back to their deterministic
+    scan rather than crash. (Local copy of agent_classify.parse_llm_yaml; importing
+    it would be circular — agent_classify imports this module.)
+    """
+    match = re.search(r"```(?:yaml)?\n(.*?)```", content or "", re.DOTALL)
+    raw = match.group(1) if match else (content or "")
+    try:
+        parsed = yaml.safe_load(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def _invoke_model_once(
+    *,
+    classification_timeout: int,
+    new_prebuilt_chat_model: Callable[[int], Any],
+    system_prompt: str,
+    user_prompt: str,
+) -> dict[str, Any]:
+    """One non-iterative LLM call → parsed YAML dict. The L2 signal/gap agents are
+    single-pass extractors (per the architecture diagram: one Act, not a ReAct
+    loop): L1 has already selected the relevant files, so they only label existing
+    evidence and need no exploration tools — and cannot exhaust a recursion budget."""
+    model = new_prebuilt_chat_model(classification_timeout)
+    response = await model.ainvoke(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+    content = response.content if isinstance(response.content, str) else str(response.content)
+    return _parse_yaml_payload(content)
+
+
 async def _invoke_signal_subagent(
     *,
     name: str,
@@ -55,53 +95,37 @@ async def _invoke_signal_subagent(
     prompt_body: str,
     deterministic_fallback: list[str],
     classification_timeout: int,
-    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
-    extract_agent_payload: Callable[[dict[str, Any]], Any],
-    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
     normalize_text_list: Callable[[Any], list[str]],
-    think,
-    list_selected_files,
-    search_selected_files,
-    fetch_file_context,
 ) -> dict[str, Any]:
-    recursion_limit = 16
-    signal_agent = create_react_agent(
-        model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
-        prompt=prompt_path("PROMPT_L2_SIGNAL_SYSTEM.md").read_text(encoding="utf-8").strip(),
-        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
-    )
-
     subagent_prompt = (
         prompt_path("PROMPT_L2_SIGNAL_TASK.md").read_text(encoding="utf-8")
         .replace("{{REPO_NAME}}", repo_name)
         .replace("{{SUBAGENT_NAME}}", name)
         .replace("{{PROMPT_BODY}}", prompt_body)
-        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
-    result = await signal_agent.ainvoke(
-        {"messages": [{"role": "user", "content": subagent_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:{name}"}, "recursion_limit": recursion_limit},
+    payload = await _invoke_model_once(
+        classification_timeout=classification_timeout,
+        new_prebuilt_chat_model=new_prebuilt_chat_model,
+        system_prompt=prompt_path("PROMPT_L2_SIGNAL_SYSTEM.md").read_text(encoding="utf-8").strip(),
+        user_prompt=subagent_prompt,
     )
-    payload = extract_agent_payload(result)
-    signal = normalize_text_list(payload.get("signal") if isinstance(payload, dict) else [])
-    notes = normalize_text_list(payload.get("notes") if isinstance(payload, dict) else [])
-    done_flag = bool(payload.get("done", False)) if isinstance(payload, dict) else False
-    trace = extract_agent_trace(result)
+    signal = normalize_text_list(payload.get("signal"))
+    notes = normalize_text_list(payload.get("notes"))
 
-    if not signal:
+    used_fallback = not signal
+    if used_fallback:
         signal = deterministic_fallback
 
     return {
         "name": name,
-        "mode": "llm_subagent",
+        "mode": "llm_single_pass",
         "signal": signal[:8],
         "notes": notes[:8],
-        "steps": len(trace),
-        "stop_reason": "model_done" if done_flag else "agent_converged",
+        "steps": 1,
+        "stop_reason": "deterministic_fallback" if used_fallback else "model_done",
     }
 
 
@@ -115,24 +139,9 @@ async def _invoke_gap_subagent(
     scripts_signals: dict[str, Any],
     source_signals: dict[str, Any],
     classification_timeout: int,
-    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
-    extract_agent_payload: Callable[[dict[str, Any]], Any],
-    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
     normalize_text_list: Callable[[Any], list[str]],
-    think,
-    list_selected_files,
-    search_selected_files,
-    fetch_file_context,
 ) -> dict[str, Any]:
-    recursion_limit = 16
-    gap_agent = create_react_agent(
-        model=new_prebuilt_chat_model(classification_timeout),
-        tools=[think, list_selected_files, search_selected_files, fetch_file_context, build_finalize_tool()],
-        prompt=prompt_path("PROMPT_L2_GAPCHECK_SYSTEM.md").read_text(encoding="utf-8").strip(),
-        pre_model_hook=make_history_trim_hook(model_name, HISTORY_BUDGET),
-    )
-
     def _format_signal(sig: dict) -> str:
         if not sig:
             return "  (no output)"
@@ -150,18 +159,16 @@ async def _invoke_gap_subagent(
         .replace("{{RUNTIME_SIGNALS}}", _format_signal(runtime_signals))
         .replace("{{SCRIPTS_SIGNALS}}", _format_signal(scripts_signals))
         .replace("{{SOURCE_SIGNALS}}", _format_signal(source_signals))
-        .replace("{{MAX_TOOL_CALLS}}", str(tool_call_budget(recursion_limit)))
         .replace("{{SUMMARY_EVIDENCE}}", summary)
     )
 
-    result = await gap_agent.ainvoke(
-        {"messages": [{"role": "user", "content": gap_prompt}]},
-        config={"configurable": {"thread_id": f"{repo_name}:l2-signal:gap-check"}, "recursion_limit": recursion_limit},
+    payload = await _invoke_model_once(
+        classification_timeout=classification_timeout,
+        new_prebuilt_chat_model=new_prebuilt_chat_model,
+        system_prompt=prompt_path("PROMPT_L2_GAPCHECK_SYSTEM.md").read_text(encoding="utf-8").strip(),
+        user_prompt=gap_prompt,
     )
-    payload = extract_agent_payload(result)
-    trace = extract_agent_trace(result)
-    notes = normalize_text_list(payload.get("notes") if isinstance(payload, dict) else [])
-    done_flag = bool(payload.get("done", False)) if isinstance(payload, dict) else False
+    notes = normalize_text_list(payload.get("notes"))
 
     def _as_bool(field: str, fallback: bool) -> bool:
         if not isinstance(payload, dict):
@@ -191,7 +198,7 @@ async def _invoke_gap_subagent(
 
     return {
         "name": "gap-check",
-        "mode": "llm_subagent",
+        "mode": "llm_single_pass",
         "signal": {
             "has_manifest": _as_bool("has_manifest", fallback_manifest),
             "has_docker": _as_bool("has_docker", fallback_docker),
@@ -201,8 +208,8 @@ async def _invoke_gap_subagent(
             "gaps": _as_list("gaps"),
         },
         "notes": notes[:8],
-        "steps": len(trace),
-        "stop_reason": "model_done" if done_flag else "agent_converged",
+        "steps": 1,
+        "stop_reason": "model_done" if payload else "deterministic_fallback",
     }
 
 
@@ -212,15 +219,8 @@ async def _run_synthesis_subagents(
     selected_files: list[str],
     summary: str,
     classification_timeout: int,
-    model_name: str,
     new_prebuilt_chat_model: Callable[[int], Any],
-    extract_agent_payload: Callable[[dict[str, Any]], Any],
-    extract_agent_trace: Callable[[dict[str, Any]], list[dict[str, Any]]],
     normalize_text_list: Callable[[Any], list[str]],
-    think,
-    list_selected_files,
-    search_selected_files,
-    fetch_file_context,
 ) -> list[dict[str, Any]]:
     class SignalSubagentState(TypedDict, total=False):
         build: Optional[dict]
@@ -257,15 +257,8 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify top manifest/build-declaration files (e.g. package.json, pyproject.toml, Cargo.toml, pom.xml, go.mod) relevant for build and dependency planning.",
                 deterministic_fallback=build_fallback,
                 classification_timeout=classification_timeout,
-                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
-                extract_agent_payload=extract_agent_payload,
-                extract_agent_trace=extract_agent_trace,
                 normalize_text_list=normalize_text_list,
-                think=think,
-                list_selected_files=list_selected_files,
-                search_selected_files=search_selected_files,
-                fetch_file_context=fetch_file_context,
             )
         }
 
@@ -278,15 +271,8 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify containerization and runtime files (e.g. Dockerfile, docker-compose.yml, Nix flakes, Vagrantfile) that describe the full execution stack.",
                 deterministic_fallback=runtime_fallback,
                 classification_timeout=classification_timeout,
-                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
-                extract_agent_payload=extract_agent_payload,
-                extract_agent_trace=extract_agent_trace,
                 normalize_text_list=normalize_text_list,
-                think=think,
-                list_selected_files=list_selected_files,
-                search_selected_files=search_selected_files,
-                fetch_file_context=fetch_file_context,
             )
         }
 
@@ -299,15 +285,8 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify build/install helper scripts (e.g. Makefile, setup.sh, install.sh, files in /bin or /scripts) that document manual installation steps.",
                 deterministic_fallback=scripts_fallback,
                 classification_timeout=classification_timeout,
-                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
-                extract_agent_payload=extract_agent_payload,
-                extract_agent_trace=extract_agent_trace,
                 normalize_text_list=normalize_text_list,
-                think=think,
-                list_selected_files=list_selected_files,
-                search_selected_files=search_selected_files,
-                fetch_file_context=fetch_file_context,
             )
         }
 
@@ -320,15 +299,8 @@ async def _run_synthesis_subagents(
                 prompt_body="Identify source files that reveal implicit dependencies: files with import statements, .env / config files listing required ENV variables, or source files containing error strings that hint at missing system dependencies.",
                 deterministic_fallback=source_fallback,
                 classification_timeout=classification_timeout,
-                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
-                extract_agent_payload=extract_agent_payload,
-                extract_agent_trace=extract_agent_trace,
                 normalize_text_list=normalize_text_list,
-                think=think,
-                list_selected_files=list_selected_files,
-                search_selected_files=search_selected_files,
-                fetch_file_context=fetch_file_context,
             )
         }
 
@@ -344,15 +316,8 @@ async def _run_synthesis_subagents(
                 scripts_signals=state.get("scripts") or {},
                 source_signals=state.get("source") or {},
                 classification_timeout=classification_timeout,
-                model_name=model_name,
                 new_prebuilt_chat_model=new_prebuilt_chat_model,
-                extract_agent_payload=extract_agent_payload,
-                extract_agent_trace=extract_agent_trace,
                 normalize_text_list=normalize_text_list,
-                think=think,
-                list_selected_files=list_selected_files,
-                search_selected_files=search_selected_files,
-                fetch_file_context=fetch_file_context,
             )
         }
 
@@ -441,15 +406,8 @@ async def run_l2_synthesis_loop(
             selected_files=selected_snapshot,
             summary=summary,
             classification_timeout=classification_timeout,
-            model_name=model_name,
             new_prebuilt_chat_model=new_prebuilt_chat_model,
-            extract_agent_payload=extract_agent_payload,
-            extract_agent_trace=extract_agent_trace,
             normalize_text_list=normalize_text_list,
-            think=think,
-            list_selected_files=list_selected_files,
-            search_selected_files=search_selected_files,
-            fetch_file_context=fetch_file_context,
         )
         if synthesis_subagents_enabled
         else []
