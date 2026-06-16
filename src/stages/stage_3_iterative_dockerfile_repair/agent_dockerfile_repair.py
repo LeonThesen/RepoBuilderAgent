@@ -23,7 +23,7 @@ try:
     from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
     from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
     from RepoBuilderAgent.src.core.file_io import write_text
-    from RepoBuilderAgent.src.core.repo_cleanup import delete_docs_build_context, get_docs_to_delete
+    from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from RepoBuilderAgent.src.stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
         run_l3_dockerfile_repair_react,
         run_l3_verification_command_react,
@@ -66,7 +66,7 @@ except ImportError:
     from core.agent_runtime import RepairRuntime
     from core.dockerfile_utils import extract_dockerfile, get_base_template
     from core.file_io import write_text
-    from core.repo_cleanup import delete_docs_build_context, get_docs_to_delete
+    from core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
         run_l3_dockerfile_repair_react,
         run_l3_verification_command_react,
@@ -145,9 +145,8 @@ parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory 
 parser.add_argument("--reports-dir", default="repair-reports", help="Directory where repair attempt logs and reports will be written")
 parser.add_argument("--dataset-dir", default=None, help="Path to RepoBuilderDataset directory; enables GT verify command injection and binary metrics collection")
 parser.add_argument("--container-cli", default="docker", help="Container CLI to use for builds")
-parser.add_argument("--max-attempts", type=int, default=3, help="Maximum number of build and repair attempts per repository")
+parser.add_argument("--max-attempts", type=int, default=5, help="Maximum number of build and repair attempts per repository")
 parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum number of build log characters to send to the model")
-parser.add_argument("--skip-delete-docs", action="store_true", help="Skip deleting documentation and CI/CD files from the build context before building")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint before docker build")
 parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside the built image to verify the build produced working software")
 parser.add_argument("--verify-timeout", type=int, default=int(TIMEOUTS["verify_timeout"]), help="Timeout in seconds for build verification container execution")
@@ -1191,12 +1190,11 @@ async def repair_repository(
             # Reset repo to clean state for reproducibility
             await _reset_repo_for_repair(repo_path, repo_name)
 
-            if not args.skip_delete_docs:
-                await asyncio.to_thread(
-                    delete_docs_build_context, repo_path, repo_name, get_docs_to_delete(gt_doc)
-                )
-            else:
-                log_info(f"[delete-docs {repo_name}] Skipping docs/CI deletion (--skip-delete-docs set)")
+            # Docs/CI are ALWAYS stripped before the build — no opt-out. Mirrors the
+            # Stage-1 strip; the hard reset above restored the files, so re-strip here.
+            await asyncio.to_thread(
+                delete_files_build_context, repo_path, repo_name, get_files_to_delete(gt_doc)
+            )
 
             # Load the build verification command: GT dataset > LLM-generated sidecar > CLI arg.
             verify_command_path = dockerfiles_dir / f"{repo_name}.verify-command"

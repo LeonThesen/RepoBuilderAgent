@@ -552,9 +552,9 @@ def build_think_tool() -> Callable[[str], str]:
 
 def build_get_dockerfile_snippet_tool() -> Callable:
     try:
-        from RepoBuilderAgent.src.agent_tools.dockerfile_snippets import get_snippet, list_actions as _list_actions
+        from RepoBuilderAgent.src.agent_tools.dockerfile_snippets import get_snippet
     except ImportError:
-        from agent_tools.dockerfile_snippets import get_snippet, list_actions as _list_actions
+        from agent_tools.dockerfile_snippets import get_snippet
 
     @tool
     def get_dockerfile_snippet(action: str, version: str = "") -> str:

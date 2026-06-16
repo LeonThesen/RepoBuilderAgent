@@ -6,7 +6,7 @@ import yaml
 from tqdm import tqdm
 
 try:
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from RepoBuilderAgent.src.core.common import (
         load_repo_urls,
         read_yaml_file,
@@ -17,7 +17,7 @@ try:
         validate_dockerfile_syntax,
     )
 except ImportError:
-    from core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
+    from core.log_utils import log_error, log_info, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
     from core.common import (
         load_repo_urls,
         read_yaml_file,

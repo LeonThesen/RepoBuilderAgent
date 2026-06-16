@@ -665,7 +665,7 @@ async def validate_dockerfile_syntax(dockerfile_path: Path, repo_name: str = "")
             log_warn(f"[hadolint {repo_name}] Dockerfile syntax error: {error_msg[:500]}")
             return False, error_msg
     except subprocess.TimeoutExpired:
-        error_msg = f"hadolint timeout after 10s"
+        error_msg = "hadolint timeout after 10s"
         log_warn(f"[hadolint {repo_name}] {error_msg}")
         return False, error_msg
     except Exception as e:

@@ -10,27 +10,27 @@ from pathlib import Path
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.common import upsert_shared_repository_state
-    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_trace_enabled
+    from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.core.variant_policy import VARIANT_POLICY_TABLE, resolve_variant_policy
+    from RepoBuilderAgent.src.core.variant_policy import resolve_variant_policy
     from RepoBuilderAgent.src.core import architecture_manifest as arch_manifest
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.common import upsert_shared_repository_state
-    from core.log_utils import log_error, log_info, log_warn, set_dump_prompts_dir, set_trace_enabled
+    from core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from core.variant_policy import VARIANT_POLICY_TABLE, resolve_variant_policy
+    from core.variant_policy import resolve_variant_policy
     from core import architecture_manifest as arch_manifest
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -86,8 +86,6 @@ parser.add_argument("--trace", action="store_true", help="Enable verbose trace l
 parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--force", action="store_true", help="Overwrite existing generated artifacts where supported")
 parser.add_argument("--learn", action="store_true", help="Enable learning of new manifest file patterns during classification")
-parser.add_argument("--preprocess", action="store_true", help="Enable repository preprocessing during classification")
-parser.add_argument("--deletion-patterns", default="config/deletion-patterns.yaml", help="Path to YAML file with deletion patterns for preprocessing")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
@@ -97,9 +95,8 @@ parser.add_argument("--dataset-dir", default=None, help="Path to RepoBuilderData
 parser.add_argument("--install-guides-dir", default="install-guides", help="Directory where generated INSTALL.md guides are written")
 parser.add_argument("--analysis-dir", default="analysis", help="Directory where analysis outputs are written when --run-analysis is enabled")
 parser.add_argument("--container-cli", default="docker", help="Container CLI to use for repair builds")
-parser.add_argument("--max-attempts", type=int, default=3, help="Maximum number of repair attempts per repository")
+parser.add_argument("--max-attempts", type=int, default=5, help="Maximum number of repair attempts per repository")
 parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum number of build log characters to send to the repair model")
-parser.add_argument("--skip-delete-docs", action="store_true", help="Skip deleting documentation and CI/CD files from the build context before building")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint before docker build")
 parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside built images to verify the build produced working software")
 parser.add_argument("--verify-timeout", type=int, default=int(TIMEOUTS["verify_timeout"]), help="Timeout in seconds for build verification container execution")
@@ -826,10 +823,9 @@ def build_classify_command(python_executable: str, script_path: Path) -> list[st
         command.append("--force")
     if args.learn:
         command.append("--learn")
-    if args.preprocess:
-        command.append("--preprocess")
+    if args.dataset_dir:
+        command.extend(["--dataset-dir", args.dataset_dir])
     command.extend([
-        "--deletion-patterns", args.deletion_patterns,
         "--selection-timeout", str(args.selection_timeout),
         "--classification-timeout", str(args.classification_timeout),
         "--retrieval-strategy", resolve_classify_retrieval_strategy(),
@@ -891,8 +887,6 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
         "--max-attempts", str(args.max_attempts),
         "--max-log-chars", str(args.max_log_chars),
     ])
-    if args.skip_delete_docs:
-        command.append("--skip-delete-docs")
     if args.skip_hadolint:
         command.append("--skip-hadolint")
     command.extend([

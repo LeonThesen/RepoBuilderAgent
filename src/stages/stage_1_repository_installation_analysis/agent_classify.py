@@ -41,7 +41,8 @@ try:
     )
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
-    from RepoBuilderAgent.src.core.repo_cleanup import preprocess_repository
+    from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
+    from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml
     from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
@@ -70,7 +71,8 @@ except ImportError:
     )
     from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
-    from core.repo_cleanup import preprocess_repository
+    from core.repo_cleanup import delete_files_build_context, get_files_to_delete
+    from metrics.eval_metrics_lib import load_gt_for_repo
     from core.llm_yaml import parse_llm_yaml
     from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from agent_tools.react_loop_tools import extract_finalize_answer, hit_step_limit
@@ -112,8 +114,7 @@ parser.add_argument("--trace", action="store_true", help="Enable verbose trace l
 parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--force", action="store_true", help="Overwrite existing analysis results")
 parser.add_argument("--learn", action="store_true", help="Learn new files from LLM selections and update config")
-parser.add_argument("--preprocess", action="store_true", help="Remove docs and unnecessary files after cloning")
-parser.add_argument("--deletion-patterns", default="config/deletion-patterns.yaml", help="Path to YAML file with deletion patterns for preprocessing")
+parser.add_argument("--dataset-dir", default=None, help="Path to RepoBuilderDataset; the repo's declarative files_to_delete (docs + CI) is stripped after clone so the classifier never sees install docs.")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
@@ -1217,11 +1218,13 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
                 log_info(f"Cloning {repo_url} -> {repo_path}")
                 os.system(f"git clone {repo_url} {repo_path}")
             
-            # Preprocess repository if flag is enabled
-            if args.preprocess:
-                log_info(f"Preprocessing {repo_name}...")
-                preprocess_repository(repo_path, args.deletion_patterns)
-            
+            # Strip the repo's declarative files_to_delete (docs + CI) so the classifier
+            # never reads install instructions — the same per-repo list the build strip
+            # uses (no global heuristic). The repair stage re-strips after its hard reset.
+            if args.dataset_dir:
+                gt_doc = load_gt_for_repo(Path(args.dataset_dir), repo_url)
+                delete_files_build_context(repo_path, repo_name, get_files_to_delete(gt_doc))
+
             default_selected_files = list(_DEFAULT_SELECTED_FILES)
 
             log_trace(f"Begin analysis for {repo_name}")
