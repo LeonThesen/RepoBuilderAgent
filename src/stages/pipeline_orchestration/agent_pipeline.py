@@ -261,7 +261,6 @@ parser.add_argument(
 parser.add_argument("--run-analysis", action="store_true", help="Run parse_results.py after classification completes")
 parser.add_argument("--pipeline-reports-dir", default="pipeline-reports", help="Directory where pipeline logs and summary are written")
 parser.add_argument("--pipeline-summary-path", default="", help="Optional explicit path for the pipeline summary YAML")
-parser.add_argument("--print-summary", action="store_true", help="Print planned pipeline summary and exit without running phases")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
@@ -1525,9 +1524,7 @@ def main() -> int:
         log_error(str(error))
         return 1
 
-    if args.print_summary:
-        print_planned_summary()
-        return 0
+    print_planned_summary()
 
     phases_selected = not (
         phase_skips["classify"]
