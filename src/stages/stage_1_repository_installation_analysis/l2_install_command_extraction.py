@@ -25,7 +25,7 @@ try:
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
-    from RepoBuilderAgent.src.core.log_utils import log_warn
+    from RepoBuilderAgent.src.core.log_utils import log_warn, dump_metadata
 except ImportError:
     from agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
@@ -47,7 +47,7 @@ except ImportError:
     from core.common import prompt_path
     from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
     from core.llm_yaml import parse_llm_yaml_dict
-    from core.log_utils import log_warn
+    from core.log_utils import log_warn, dump_metadata
 
 
 # Forced-finalize instructions used when a synthesis ReAct loop exhausts its step
@@ -348,9 +348,14 @@ async def _run_synthesis_subagents(
     subgraph.add_edge("gap", END)
     compiled = subgraph.compile()
 
+    # Metadata set here also reaches the per-node single-pass model.ainvoke calls:
+    # LangGraph runs nodes under this run config, so their nested LLM calls inherit it.
     results = await compiled.ainvoke(
         {},
-        config={"configurable": {"thread_id": f"{repo_name}:l2-signals"}},
+        config={
+            "configurable": {"thread_id": f"{repo_name}:l2-signals"},
+            "metadata": dump_metadata(repo_name, "l2-signals"),
+        },
     )
     return [results["build"], results["runtime"], results["scripts"], results["source"], results["gap"]]
 
@@ -469,6 +474,7 @@ async def run_l2_synthesis_loop(
         {"messages": [{"role": "user", "content": synthesis_prompt}]},
         {"configurable": {"thread_id": f"{repo_name}:l2"}, "recursion_limit": synthesis_recursion_limit},
         on_overflow=generator_salvage,
+        metadata=dump_metadata(repo_name, "l2-generator"),
     )
     generation_payload = extract_agent_payload(generation_result)
     updates = normalize_text_list(generation_payload.get("hypothesis_updates") if isinstance(generation_payload, dict) else [])
@@ -541,6 +547,7 @@ async def run_l2_synthesis_loop(
                 "recursion_limit": synthesis_recursion_limit,
             },
             on_overflow=reviewer_salvage,
+            metadata=dump_metadata(repo_name, "l2-reviewer"),
         )
         review_rounds_executed += 1
         review_payload = extract_agent_payload(review_result)

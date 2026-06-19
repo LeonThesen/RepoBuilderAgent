@@ -4,6 +4,12 @@ from typing import Any, Callable
 
 from langchain_openai import ChatOpenAI
 
+from .prompt_dump_callback import PromptDumpCallbackHandler
+
+# One handler instance is enough: it is stateless and reads per-invocation repo/
+# phase from run metadata. It no-ops unless a prompt-dump dir is configured.
+_PROMPT_DUMP_HANDLER = PromptDumpCallbackHandler()
+
 
 def make_prebuilt_chat_model_factory(
     *,
@@ -25,6 +31,7 @@ def make_prebuilt_chat_model_factory(
             "timeout": timeout_seconds,
             "max_retries": max_retries,
             "http_async_client": http_async_client,
+            "callbacks": [_PROMPT_DUMP_HANDLER],
         }
         if model == "gpt-5-codex":
             kwargs["use_responses_api"] = True

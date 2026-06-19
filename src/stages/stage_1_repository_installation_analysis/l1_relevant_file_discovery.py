@@ -36,9 +36,9 @@ except ImportError:
     from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
 
 try:
-    from RepoBuilderAgent.src.core.log_utils import log_warn
+    from RepoBuilderAgent.src.core.log_utils import log_warn, dump_metadata
 except ImportError:
-    from core.log_utils import log_warn
+    from core.log_utils import log_warn, dump_metadata
 
 try:
     from langgraph.errors import GraphRecursionError
@@ -149,7 +149,11 @@ async def select_files_by_iterative_react(
     try:
         result = await retrieval_agent.ainvoke(
             {"messages": [{"role": "user", "content": step1_prompt}]},
-            config={"configurable": {"thread_id": f"{repo_name}:l1"}, "recursion_limit": recursion_limit},
+            config={
+                "configurable": {"thread_id": f"{repo_name}:l1"},
+                "recursion_limit": recursion_limit,
+                "metadata": dump_metadata(repo_name, "l1-discovery"),
+            },
         )
     except GraphRecursionError:
         # The ReAct loop never emitted a finalize action within the step budget

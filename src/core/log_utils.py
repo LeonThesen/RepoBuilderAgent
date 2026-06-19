@@ -69,6 +69,19 @@ def dump_prompt(repo_url: str, phase: str, messages: list[dict]) -> None:
     (out_dir / f"{phase}.{n}.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
+def prompt_dump_enabled() -> bool:
+    """True when a prompt-dump directory has been configured for this run."""
+    return _DUMP_PROMPTS_DIR is not None
+
+
+def dump_metadata(repo_url: str, phase: str) -> dict:
+    """LangChain run metadata that carries repo + phase to the prompt-dump
+    callback. Threaded through each ReAct invocation's config so every LLM turn
+    (not just the seed prompt) is attributed and dumped. Keys are namespaced to
+    avoid colliding with other metadata."""
+    return {"dump_repo": repo_url, "dump_phase": phase}
+
+
 def log_info(msg: str) -> None:
     _emit(f"{_CYAN}[*]{_RESET} {msg}")
 

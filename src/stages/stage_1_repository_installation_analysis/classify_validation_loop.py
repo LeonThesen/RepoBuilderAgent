@@ -20,7 +20,7 @@ try:
     )
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
-    from RepoBuilderAgent.src.core.log_utils import log_warn
+    from RepoBuilderAgent.src.core.log_utils import log_warn, dump_metadata
 except ImportError:
     from agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
@@ -37,7 +37,7 @@ except ImportError:
     )
     from core.common import prompt_path
     from core.agent_runtime import ClassifyConfig, ClassifyRuntime, RepoRef
-    from core.log_utils import log_warn
+    from core.log_utils import log_warn, dump_metadata
 
 
 # Forced-finalize instruction used when the validation ReAct loop exhausts its
@@ -158,6 +158,7 @@ async def run_classify_validation_loop(
         {"messages": [{"role": "user", "content": validation_prompt}]},
         {"configurable": {"thread_id": f"{repo_url}:classify-validation"}, "recursion_limit": recursion_limit},
         on_overflow=overflow_salvage,
+        metadata=dump_metadata(repo_url, "classify-validation"),
     )
     payload = extract_agent_payload(result)
     parsed_checks = normalize_validation_checks(payload.get("checks") if isinstance(payload, dict) else {})

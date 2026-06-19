@@ -7,7 +7,7 @@ try:
     from RepoBuilderAgent.src.core.common import prompt_path
     from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
     from RepoBuilderAgent.src.core.llm_yaml import parse_llm_yaml_dict
-    from RepoBuilderAgent.src.core.log_utils import log_warn
+    from RepoBuilderAgent.src.core.log_utils import log_warn, dump_metadata
     from RepoBuilderAgent.src.agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
         ainvoke_with_recursion_guard,
@@ -21,7 +21,7 @@ except ImportError:
     from core.common import prompt_path
     from core.agent_runtime import RepairRuntime
     from core.llm_yaml import parse_llm_yaml_dict
-    from core.log_utils import log_warn
+    from core.log_utils import log_warn, dump_metadata
     from agent_tools.react_loop_tools import (
         HISTORY_BUDGET,
         ainvoke_with_recursion_guard,
@@ -171,6 +171,7 @@ async def run_l3_dockerfile_repair_react(
             "configurable": {"thread_id": f"{repo_url}:l3-repair:{attempt_number}"},
             "recursion_limit": recursion_limit,
         },
+        metadata=dump_metadata(repo_url, "l3-repair"),
     )
 
     payload = _extract_react_payload(result)
@@ -228,6 +229,7 @@ async def run_l3_verification_command_react(
             "configurable": {"thread_id": f"{repo_url}:{thread_suffix}"},
             "recursion_limit": recursion_limit,
         },
+        metadata=dump_metadata(repo_url, "l3-verify"),
     )
 
     command = _extract_react_command(result, candidate_keys)

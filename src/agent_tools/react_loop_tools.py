@@ -505,7 +505,7 @@ def make_overflow_salvage(*, model, model_name: str, instruction: str):
     return salvage
 
 
-async def ainvoke_with_recursion_guard(agent, payload, config, *, on_overflow=None):
+async def ainvoke_with_recursion_guard(agent, payload, config, *, on_overflow=None, metadata=None):
     """Invoke a create_react_agent, converting a *raised* GraphRecursionError into
     the same placeholder result LangGraph emits when it instead *returns* at the
     limit. This makes recursion-limit handling uniform across every ReAct loop:
@@ -520,6 +520,9 @@ async def ainvoke_with_recursion_guard(agent, payload, config, *, on_overflow=No
     exploration into a forced final answer instead of returning the empty placeholder.
     """
     from langchain_core.messages import AIMessage
+
+    if metadata:
+        config = {**(config or {}), "metadata": {**(config or {}).get("metadata", {}), **metadata}}
 
     try:
         return await agent.ainvoke(payload, config=config)
