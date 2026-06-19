@@ -1,7 +1,12 @@
-# Base Dockerfile for Python projects
-# Includes: Debian, CA bootstrap, Python 3, venv, pip, build-essential
+# Base Dockerfile for C projects
+# Includes: Debian, CA bootstrap, build-essential, make, standard dev tools
 
 FROM debian:forky-slim
+
+# Make builds (as) reproducible (as possible)
+ENV SOURCE_DATE_EPOCH=0
+ENV NODE_ENV=production
+ENV CARGO_INCREMENTAL=0
 
 # Install CA certificates and corporate CA if provided
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -14,13 +19,11 @@ RUN if [ -n "$MANUALREPOS_CA_CERT_B64" ]; then \
       update-ca-certificates; \
     fi
 
-# Install Python and build tools
+# Install base build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-venv \
-    python3-pip \
     build-essential \
     git \
+    curl \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,11 +35,8 @@ WORKDIR /home/manualrepos/repo
 COPY . .
 RUN chown -R manualrepos:manualrepos /home/manualrepos/repo
 
-# Create and activate venv, install dependencies
-# [PLACEHOLDER: python3 -m venv /home/manualrepos/venv && source /home/manualrepos/venv/bin/activate && pip install -r requirements.txt]
-
-# Build or setup instructions
-# [PLACEHOLDER: Repo-specific build commands (setup.py, pyproject.toml, Makefile, etc.)]
+# Build instructions
+# [PLACEHOLDER: Repo-specific build commands (make, cmake, autoreconf, etc.)]
 
 # Final CMD or ENTRYPOINT
-# [PLACEHOLDER: Entry point or binary path]
+# [PLACEHOLDER: Binary path or entry point]
