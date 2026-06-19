@@ -632,6 +632,27 @@ async def ensure_repo_checkout(repo_url: str, repo_path: Path, skip_reason: str 
     return True
 
 
+def resolve_repo_checkout_dir(repos_dir: Path, repo_name: str) -> Path:
+    """Resolve ``repos_dir/<repo_name>`` against existing directories case-insensitively.
+
+    Checkouts are prepared (by eval.py) under language subfolders using the
+    repository's canonical name, whose casing can differ from the URL-derived
+    name (e.g. on-disk ``cjson`` vs URL segment ``cJSON``). Returning the actual
+    existing directory keeps every stage pointed at the prepared checkout and
+    prevents re-cloning into a mis-cased path. Falls back to the literal
+    ``repos_dir/<repo_name>`` when nothing matches.
+    """
+    candidate = repos_dir / repo_name
+    if candidate.exists():
+        return candidate
+    if repos_dir.exists():
+        target = repo_name.lower()
+        for child in repos_dir.iterdir():
+            if child.is_dir() and child.name.lower() == target:
+                return child
+    return candidate
+
+
 async def validate_dockerfile_syntax(dockerfile_path: Path, repo_name: str = "") -> tuple[bool, str]:
     """
     Validate Dockerfile syntax using hadolint.

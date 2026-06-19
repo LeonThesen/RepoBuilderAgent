@@ -31,7 +31,8 @@ try:
         upsert_shared_repository_state,
         prompt_path,
         should_use_progress,
-        ensure_repo_checkout
+        ensure_repo_checkout,
+        resolve_repo_checkout_dir,
     )
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
@@ -62,7 +63,8 @@ except ImportError:
         upsert_shared_repository_state,
         prompt_path,
         should_use_progress,
-        ensure_repo_checkout
+        ensure_repo_checkout,
+        resolve_repo_checkout_dir,
     )
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.timeout_config import load_timeout_defaults
@@ -1190,7 +1192,7 @@ async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, 
             shared_repository_state = load_shared_repository_state(repo_name, summary_dir)
             prior_failure_terms, prior_failure_summary = build_prior_failure_retrieval_hints(shared_repository_state)
 
-            repo_path = repos_dir / repo_name
+            repo_path = resolve_repo_checkout_dir(repos_dir, repo_name)
             if not await ensure_repo_checkout(repo_url, repo_path, "skipping classify"):
                 return
 
@@ -1201,7 +1203,7 @@ async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, 
             if output_path.exists() and force:
                 log_info(f"Overwriting existing result for {repo_url}")
 
-            repo_path = output_dir / repo_name
+            repo_path = resolve_repo_checkout_dir(output_dir, repo_name)
             if not repo_path.exists():
                 log_error(f"Cannot find directory for {repo_url} at {repo_path}")
             

@@ -37,6 +37,7 @@ try:
     )
     from RepoBuilderAgent.src.core.common import (
         ensure_repo_checkout,
+        resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
@@ -80,6 +81,7 @@ except ImportError:
     )
     from core.common import (
         ensure_repo_checkout,
+        resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
@@ -1183,7 +1185,7 @@ async def repair_repository(
                     log_info(f"Skipping {repo_url}: existing successful repair report found at {report_path}")
                     return
 
-            repo_path = repos_dir / repo_name
+            repo_path = resolve_repo_checkout_dir(repos_dir, repo_name)
             if not await ensure_repo_checkout(repo_url, repo_path, "skipping Dockerfile repair"):
                 return
 

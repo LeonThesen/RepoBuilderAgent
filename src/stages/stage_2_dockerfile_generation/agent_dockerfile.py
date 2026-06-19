@@ -24,6 +24,7 @@ try:
     from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
+        resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
@@ -59,6 +60,7 @@ except ImportError:
     from core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
+        resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
@@ -302,7 +304,7 @@ async def generate_dockerfile(
                 log_info(f"Skipping {repo_url}: existing Dockerfile found at {output_path}")
                 return
 
-            repo_path = repos_dir / repo_name
+            repo_path = resolve_repo_checkout_dir(repos_dir, repo_name)
             if not await ensure_repo_checkout(repo_url, repo_path, "skipping Dockerfile generation"):
                 return
 

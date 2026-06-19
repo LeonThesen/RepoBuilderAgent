@@ -23,6 +23,7 @@ try:
     from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
+        resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
         load_architecture_scratchpad,
@@ -54,6 +55,7 @@ except ImportError:
     from core.common import (
         chat_completion_with_retries,
         ensure_repo_checkout,
+        resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
         load_architecture_scratchpad,
@@ -202,7 +204,7 @@ async def generate_install_guide(
                 )
                 return
 
-            repo_path = repos_dir / repo_name
+            repo_path = resolve_repo_checkout_dir(repos_dir, repo_name)
             if not await ensure_repo_checkout(repo_url, repo_path, "skipping install guide generation"):
                 return
 
