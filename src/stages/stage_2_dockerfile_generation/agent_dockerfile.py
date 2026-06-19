@@ -311,6 +311,14 @@ async def generate_dockerfile(
             if args.one_shot_direct:
                 inferred_language = infer_language_from_repo(repo_path)
                 classification = build_synthetic_classification(repo_url, inferred_language)
+                # one_shot_direct skips Stage 1, so nothing else writes the
+                # classification YAML. Persist the synthetic record here so
+                # downstream consumers (install guide, metrics aggregation,
+                # eval reporting) that key off results_dir/{repo}.yaml find it
+                # instead of reporting "no classification data available".
+                results_dir.mkdir(parents=True, exist_ok=True)
+                with open(results_dir / f"{repo_name}.yaml", "w", encoding="utf-8") as classification_file:
+                    classification_file.write(render_yaml(classification))
                 summary = fingerprint(
                     format="md",
                     repo_path=str(repo_path),
