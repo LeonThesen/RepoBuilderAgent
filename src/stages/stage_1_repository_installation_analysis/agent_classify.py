@@ -28,6 +28,7 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         load_shared_repository_state,
+        render_initial_user_request_for_prompt,
         upsert_shared_repository_state,
         prompt_path,
         should_use_progress,
@@ -60,6 +61,7 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         load_shared_repository_state,
+        render_initial_user_request_for_prompt,
         upsert_shared_repository_state,
         prompt_path,
         should_use_progress,
@@ -1501,9 +1503,11 @@ async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, 
             selected_file_names = [name for name, _ in selected_files_tuples]
             log_file_delta(repo_name, baseline_file_names, selected_file_names)
             
-            baseline_prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", baseline_summary)
+            initial_user_request_block = render_initial_user_request_for_prompt(shared_repository_state)
 
-            prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", summary)
+            baseline_prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", baseline_summary) + initial_user_request_block
+
+            prompt = PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url).replace("{{SUMMARY_CONTENT}}", summary) + initial_user_request_block
             step2_tokens = estimate_tokens(prompt, args.model)
             baseline_tokens = estimate_tokens(baseline_prompt, args.model)
             two_step_total_tokens = step1_tokens + step2_tokens

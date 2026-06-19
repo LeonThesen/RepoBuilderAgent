@@ -9,7 +9,7 @@ from pathlib import Path
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state, ensure_repo_checkout
+    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state, ensure_repo_checkout, build_initial_user_request
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
@@ -22,7 +22,7 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from core.common import upsert_shared_repository_state
+    from core.common import upsert_shared_repository_state, build_initial_user_request
     from core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
@@ -71,6 +71,8 @@ parser.add_argument("--endpoint", default="", help="Custom API endpoint URL")
 parser.add_argument("--model", default="", help="Model name")
 parser.add_argument("--api-key", default="", help="API key")
 parser.add_argument("--prompt-profile", default=os.getenv("PROMPT_PROFILE", "P*"), help="Prompt profile name from RepoBuilderAgent/config/prompt_profiles.yaml (supports alias P*)")
+parser.add_argument("--config-hint", default="", help="Initial user request (TODO 18): the target build configuration the user wants for this repo. Seeded into the agent's internal representation and surfaced to the classify + dockerfile prompts.")
+parser.add_argument("--user-language", default="", help="Programming language the user states for this repo, paired with --config-hint in the initial user request.")
 parser.add_argument("--temperature", type=float, default=None, help="Temperature override for model calls; defaults to selected prompt profile value")
 parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), help="Timeout for API requests in seconds")
 parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
@@ -1669,10 +1671,14 @@ def main() -> int:
         log_error(str(error))
         return 1
 
+    seeded_constraints = dict(agent_config_applied.get("user_constraints", {}))
+    initial_request = build_initial_user_request(args.config_hint, args.user_language)
+    if initial_request:
+        seeded_constraints["initial_user_request"] = initial_request
     constraints_seeded = _seed_user_constraints(
         repo_urls_for_run,
         Path(args.summaries_dir),
-        agent_config_applied.get("user_constraints", {}),
+        seeded_constraints,
     )
     if constraints_seeded:
         log_info(f"Seeded user constraints into shared state for {constraints_seeded} repositories")

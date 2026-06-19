@@ -35,6 +35,7 @@ try:
         prompt_path,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
+        render_initial_user_request_for_prompt,
         render_shared_repository_state_for_prompt,
         render_validation_findings_for_prompt,
         render_yaml,
@@ -71,6 +72,7 @@ except ImportError:
         prompt_path,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
+        render_initial_user_request_for_prompt,
         render_shared_repository_state_for_prompt,
         render_validation_findings_for_prompt,
         render_yaml,
@@ -367,6 +369,7 @@ async def generate_dockerfile(
                     .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
                     .replace("{{SUMMARY_CONTENT}}", summary)
                 )
+                prompt += render_initial_user_request_for_prompt(shared_repository_state)
                 if synthesis_artifact:
                     prompt += "\n\nSYNTHESIS_ARTIFACT:\n" + render_yaml(synthesis_artifact)
                 prompt += render_validation_findings_for_prompt(validation_artifact)
@@ -453,6 +456,7 @@ async def generate_dockerfile(
                 .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
                 .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
             )
+            verify_prompt += render_initial_user_request_for_prompt(shared_repository_state)
             verify_prompt += render_shared_repository_state_for_prompt(shared_repository_state)
             log_info(f"Generating build verification command for {repo_url}...")
             verify_response = await chat_completion_with_retries(

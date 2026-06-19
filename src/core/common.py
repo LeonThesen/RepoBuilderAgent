@@ -589,6 +589,45 @@ def render_validation_findings_for_prompt(validation_artifact: dict | None) -> s
     )
 
 
+def build_initial_user_request(config_hint: str, language: str = "") -> dict:
+    """Structured internal representation of the per-repo initial user request
+    (TODO 18): the build configuration the user wants plus the stated language.
+    Returns {} when no config_hint was provided so callers can skip seeding."""
+    hint = (config_hint or "").strip()
+    if not hint:
+        return {}
+    request = {"config_hint": hint}
+    lang = (language or "").strip()
+    if lang:
+        request["language"] = lang
+    return request
+
+
+def render_initial_user_request_for_prompt(shared_state: dict | None) -> str:
+    """Surface the seeded initial user request (TODO 18) as a first-class prompt
+    block. Reads it from shared repository state so every consuming stage shows
+    the same target the user asked for. Returns '' when none was seeded."""
+    if not isinstance(shared_state, dict):
+        return ""
+    stages = shared_state.get("stages")
+    pipeline_stage = stages.get("pipeline") if isinstance(stages, dict) else None
+    constraints = pipeline_stage.get("user_constraints") if isinstance(pipeline_stage, dict) else None
+    request = constraints.get("initial_user_request") if isinstance(constraints, dict) else None
+    if not isinstance(request, dict):
+        return ""
+    config_hint = str(request.get("config_hint", "")).strip()
+    if not config_hint:
+        return ""
+    language = str(request.get("language", "")).strip()
+    lang_clause = f"This is a {language} project. " if language else ""
+    return (
+        "\n\nINITIAL_USER_REQUEST:\n"
+        "The user asked for this specific build outcome. Treat it as the goal your "
+        "classification and Dockerfile must serve.\n"
+        f"{lang_clause}{config_hint}\n"
+    )
+
+
 def render_yaml(data: dict) -> str:
     return yaml.dump(data, sort_keys=False, allow_unicode=True)
 
