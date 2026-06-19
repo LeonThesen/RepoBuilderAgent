@@ -5,8 +5,8 @@ FROM debian:forky-slim
 
 # Make builds (as) reproducible (as possible)
 ENV SOURCE_DATE_EPOCH=0
-ENV NODE_ENV=production
 ENV CARGO_INCREMENTAL=0
+ENV RUSTFLAGS="-C codegen-units=1"
 
 # Install CA certificates and corporate CA if provided
 RUN apt-get update && apt-get install -y --no-install-recommends \
