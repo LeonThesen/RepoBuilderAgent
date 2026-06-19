@@ -718,7 +718,7 @@ def fingerprint(
         f"{meta['source_files']} source files, "
         f"~{meta['approx_lines']:,} lines{ctx}"
     )
-
+    
     if format == "md":
         return format_markdown(root, tree, manifests, meta, include_tree=include_tree)
     return format_xml(root, tree, manifests, meta, include_tree=include_tree)

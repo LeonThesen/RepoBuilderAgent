@@ -17,6 +17,7 @@ from tqdm import tqdm
 from typing import Any, cast
 from typing_extensions import TypedDict
 
+
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.l1_relevant_file_discovery import select_files_by_iterative_react
@@ -30,6 +31,7 @@ try:
         upsert_shared_repository_state,
         prompt_path,
         should_use_progress,
+        ensure_repo_checkout
     )
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
@@ -60,6 +62,7 @@ except ImportError:
         upsert_shared_repository_state,
         prompt_path,
         should_use_progress,
+        ensure_repo_checkout
     )
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.timeout_config import load_timeout_defaults
@@ -907,25 +910,6 @@ def _build_file_context_by_path(repo_path: Path) -> dict[str, str]:
     return file_context
 
 
-# Conservative default file selection used when a retrieval strategy returns
-# nothing (or is unknown). High-signal manifests/docs/CI across the dataset's languages.
-_DEFAULT_SELECTED_FILES = [
-    "README.md",
-    "README.rst",
-    "pyproject.toml",
-    "requirements.txt",
-    "package.json",
-    "go.mod",
-    "Cargo.toml",
-    "Dockerfile",
-    "docker-compose.yml",
-    "docker-compose.yaml",
-    ".env.example",
-    ".github/workflows/*.yml",
-    ".github/workflows/*.yaml",
-]
-
-
 def _build_exploration_artifact(
     *,
     repo_url: str,
@@ -1193,7 +1177,7 @@ def _build_step2_summary(
     return summary, selected_files
 
 
-async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
+async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, output_dir: Path, results_dir: Path, progress_state: dict, force: bool = False, learn: bool = False) -> None:
     async with sem:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
         llm_metrics_path = results_dir / f"{repo_name}.llm-metrics.yaml"
@@ -1206,6 +1190,10 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             shared_repository_state = load_shared_repository_state(repo_name, summary_dir)
             prior_failure_terms, prior_failure_summary = build_prior_failure_retrieval_hints(shared_repository_state)
 
+            repo_path = repos_dir / repo_name
+            if not await ensure_repo_checkout(repo_url, repo_path, "skipping classify"):
+                return
+
             if output_path.exists() and not force:
                 log_info(f"Skipping {repo_url}: existing result found at {output_path}")
                 return
@@ -1215,8 +1203,7 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
 
             repo_path = output_dir / repo_name
             if not repo_path.exists():
-                log_info(f"Cloning {repo_url} -> {repo_path}")
-                os.system(f"git clone {repo_url} {repo_path}")
+                log_error(f"Cannot find directory for {repo_url} at {repo_path}")
             
             # Strip the repo's declarative files_to_delete (docs + CI) so the classifier
             # never reads install instructions — the same per-repo list the build strip
@@ -1224,8 +1211,29 @@ async def analyze_repository(repo_url: str, summary_dir: Path, output_dir: Path,
             if args.dataset_dir:
                 gt_doc = load_gt_for_repo(Path(args.dataset_dir), repo_url)
                 delete_files_build_context(repo_path, repo_name, get_files_to_delete(gt_doc))
+            # TODO: stripping docs is mandatory we need to abort the FULL pipeline if we cant load gt_doc
+            # TODO: this code needs to be in agent_pipeline.py because one_shot_direct currently skips 
+            # TODO: things like git checkout/clone and docs delete need to be done before any stage or agent config is run
 
-            default_selected_files = list(_DEFAULT_SELECTED_FILES)
+            # Conservative default file selection used when a retrieval strategy returns
+            # nothing (or is unknown). High-signal manifests/docs/CI across the dataset's languages.
+            
+            # TODO: this is way too small, prompt LLM (not dynamically but for code change) for more complete list for all 6 languages
+            default_selected_files = list([
+                "README.md",
+                "README.rst",
+                "pyproject.toml",
+                "requirements.txt",
+                "package.json",
+                "go.mod",
+                "Cargo.toml",
+                "Dockerfile",
+                "docker-compose.yml",
+                "docker-compose.yaml",
+                ".env.example",
+                ".github/workflows/*.yml",
+                ".github/workflows/*.yaml",
+            ])
 
             log_trace(f"Begin analysis for {repo_name}")
             # Step 1: structure-only context -> select relevant files.
@@ -1720,7 +1728,7 @@ async def main():
     }
     set_tqdm_bar(progress_state["bar"])
     log_info(f"Starting analysis for {len(repos)} repositories")
-    tasks = [analyze_repository(repo, summaries_dir, repos_dir, results_dir, progress_state, force=args.force, learn=args.learn) for repo in repos]
+    tasks = [analyze_repository(repo, repos_dir, summaries_dir, repos_dir, results_dir, progress_state, force=args.force, learn=args.learn) for repo in repos]
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     finally:

@@ -28,29 +28,18 @@ def delete_files_build_context(
     repo_name: str,
     files_to_delete: "list[str] | None" = None,
 ) -> None:
-    """Remove the repo's declared ``files_to_delete`` globs before the image build.
+    """Remove or overwrite the repo's declared ``files_to_delete`` globs before the image build.
 
-    The benchmark's premise is that the agent builds WITHOUT install documentation, so
-    docs (and CI/CD config) are stripped here. The strip-list is fully declarative and
-    per-repo, sourced from the dataset YAML:
+    Pattern prefixes:
+    - "!" protects matching files/directories from deletion.
+    - ">" overwrites matching files with an empty file instead of deleting them.
 
-      * Every path removed is on the repo's ``files_to_delete`` list — no implicit CI
-        deletion, no legacy doc-dir heuristic, no build-metadata carve-out. What you
-        see in the YAML is exactly what is removed.
-      * Globs are file-scoped by convention so build-referenced files survive (e.g.
-        curl's docs/examples, add_subdirectory'd by CMake): list ``docs/**/*.md``, not
-        ``docs``. A glob that matches a directory rmtree's it — used deliberately for
-        CI dirs like ``.github``.
-      * Build-input docs (fmt's README.md in add_library, curl's man-page sources,
-        git's command-list .adoc) are simply NOT listed, so they remain for the build.
-
-    When ``files_to_delete`` is empty/None nothing is removed (and a warning is logged):
-    an un-curated repo is left intact rather than silently over-stripped.
+    All other patterns are deleted.
     """
-    log_info(f"[delete-files {repo_name}] Starting declarative file deletion in {repo_path}")
+    print(f"[delete-files {repo_name}] Starting declarative file deletion in {repo_path}")
 
     if not files_to_delete:
-        log_warn(
+        print(
             f"[delete-files {repo_name}] No files_to_delete in dataset YAML; nothing "
             f"removed. Curate the repo's files_to_delete list to strip docs/CI."
         )
@@ -58,22 +47,115 @@ def delete_files_build_context(
 
     removed_files: list[str] = []
     removed_dirs: list[str] = []
+    overwritten_files: list[str] = []
+
+    delete_patterns: list[str] = []
+    protected_patterns: list[str] = []
+    overwrite_patterns: list[str] = []
+
     for pattern in files_to_delete:
-        # Patterns are repo-root-relative globs; recursive so ** works.
+        if pattern.startswith("!"):
+            protected_patterns.append(pattern[1:])
+        elif pattern.startswith(">"):
+            overwrite_patterns.append(pattern[1:])
+        else:
+            delete_patterns.append(pattern)
+
+    protected_paths: set[Path] = set()
+    protected_dirs: set[Path] = set()
+    overwrite_paths: set[Path] = set()
+
+    # Expand protected glob patterns first.
+    for pattern in protected_patterns:
+        for protected_match in repo_path.glob(pattern):
+            if not protected_match.exists():
+                continue
+
+            rel = protected_match.relative_to(repo_path)
+            protected_paths.add(rel)
+
+            if protected_match.is_dir():
+                protected_dirs.add(rel)
+
+    # Expand overwrite glob patterns next.
+    # Overwritten files are also protected from later delete patterns.
+    for pattern in overwrite_patterns:
+        for overwrite_match in repo_path.glob(pattern):
+            if not overwrite_match.exists():
+                continue
+
+            rel = overwrite_match.relative_to(repo_path)
+            overwrite_paths.add(rel)
+            protected_paths.add(rel)
+
+            if overwrite_match.is_dir():
+                protected_dirs.add(rel)
+
+    def is_protected(match: Path) -> bool:
+        rel = match.relative_to(repo_path)
+
+        # Exact protected file/dir match.
+        if rel in protected_paths:
+            return True
+
+        # Anything inside a protected directory is protected.
+        for protected_dir in protected_dirs:
+            if rel == protected_dir or protected_dir in rel.parents:
+                return True
+
+        # Do not delete a directory if it contains a protected file/dir.
+        if match.is_dir():
+            for protected_path in protected_paths:
+                if protected_path == rel or rel in protected_path.parents:
+                    return True
+
+        return False
+
+    # Apply overwrite patterns.
+    for rel in sorted(overwrite_paths):
+        match = repo_path / rel
+
+        if not match.exists():
+            continue
+
+        if match.is_dir():
+            log_trace(f"[delete-files {repo_name}] skipped overwrite for directory {rel}")
+            continue
+
+        match.write_text("", encoding="utf-8")
+        overwritten_files.append(str(rel))
+
+        log_trace(f"[delete-files {repo_name}] overwritten {rel}")
+
+    # Apply delete patterns.
+    for pattern in delete_patterns:
         for match in repo_path.glob(pattern):
             if not match.exists():
                 continue
+
+            if is_protected(match):
+                log_trace(
+                    f"[delete-files {repo_name}] protected "
+                    f"{match.relative_to(repo_path)}"
+                )
+                continue
+
             rel = match.relative_to(repo_path)
+
             if match.is_dir():
                 shutil.rmtree(match)
                 removed_dirs.append(str(rel))
             else:
                 match.unlink()
                 removed_files.append(str(rel))
+
             log_trace(f"[delete-files {repo_name}] removed {rel}")
 
-    log_info(
+    log_trace(
         f"[delete-files {repo_name}] Done — removed {len(removed_files)} file(s), "
-        f"{len(removed_dirs)} director{'ies' if len(removed_dirs) != 1 else 'y'} "
-        f"({len(files_to_delete)} pattern(s))"
+        f"{len(removed_dirs)} director{'ies' if len(removed_dirs) != 1 else 'y'}, "
+        f"overwritten {len(overwritten_files)} file(s) "
+        f"({len(files_to_delete)} pattern(s), "
+        f"{len(protected_patterns)} protection pattern(s), "
+        f"{len(overwrite_patterns)} overwrite pattern(s))"
     )

@@ -9,7 +9,7 @@ from pathlib import Path
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state
+    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state, ensure_repo_checkout
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
@@ -1543,6 +1543,7 @@ def main() -> int:
 
     variant_policy = resolve_variant_policy(args.variant)
 
+    # TODO: extract this dict instantiation somewhere else
     summary: dict = {
         "run_id": run_id,
         "started_at": pipeline_started_at,
@@ -1702,12 +1703,16 @@ def main() -> int:
         if record.get("status") in ("no_output", "missing") and args.output_audit == "fail":
             raise RuntimeError(record.get("message", f"output audit failed for stage '{stage}'"))
 
+    # NOTE: Start of actual pipeline
+    # TODO: turn the prints below of commands into logs, or if they are already logged elsewhere delete them
     try:
+        
         if not phase_skips["classify"]:
+            classify_command = build_classify_command(python_executable, classify_script)
             summary["phases"].append(
                 run_step(
                     "classification",
-                    build_classify_command(python_executable, classify_script),
+                    classify_command,
                     run_logs_dir / "classification.log",
                 )
             )
@@ -1723,40 +1728,45 @@ def main() -> int:
             )
 
         if not phase_skips["dockerfile"]:
+            dockerfile_cmd = build_dockerfile_command(python_executable, dockerfile_script)
+            print(f"Dockerfile cmd: {dockerfile_cmd}")
             summary["phases"].append(
                 run_step(
                     "dockerfile generation",
-                    build_dockerfile_command(python_executable, dockerfile_script),
+                    dockerfile_cmd,
                     run_logs_dir / "dockerfile-generation.log",
                 )
             )
             _audit("dockerfile generation")
 
         if not phase_skips["validation_gate"]:
+            validation_gate_command = build_validation_gate_command(python_executable, validation_gate_script)
             summary["phases"].append(
                 run_step(
                     "post-generation validation gate",
-                    build_validation_gate_command(python_executable, validation_gate_script),
+                    validation_gate_command,
                     run_logs_dir / "post-generation-validation-gate.log",
                 )
             )
             _audit("post-generation validation gate")
 
         if not phase_skips["repair"]:
+            repair_command = build_repair_command(python_executable, repair_script)
             summary["phases"].append(
                 run_step(
                     "dockerfile repair",
-                    build_repair_command(python_executable, repair_script),
+                    repair_command,
                     run_logs_dir / "dockerfile-repair.log",
                 )
             )
             _audit("dockerfile repair")
 
         if not phase_skips["install_guide"]:
+            install_guide_command = build_install_guide_command(python_executable, install_guide_script)
             summary["phases"].append(
                 run_step(
                     "install guide generation",
-                    build_install_guide_command(python_executable, install_guide_script),
+                    install_guide_command,
                     run_logs_dir / "install-guide-generation.log",
                 )
             )

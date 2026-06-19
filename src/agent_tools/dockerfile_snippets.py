@@ -16,18 +16,18 @@ def _apt(packages: str, extras: str = "") -> str:
     return f"RUN {body}"
 
 
-def install_jdk(version: str = "17") -> str:
+def install_jdk(version: str = "21") -> str:
     """Install OpenJDK Development Kit from apt.
 
-    Common versions: 11, 17, 21. Use install_jre for a smaller runtime-only image.
+    Common versions: 11, 17, 21, 25. Use install_jre for a smaller runtime-only image.
     """
-    v = (version or "17").strip()
+    v = (version or "21").strip()
     return _apt(f"openjdk-{v}-jdk")
 
 
-def install_jre(version: str = "17") -> str:
+def install_jre(version: str = "21") -> str:
     """Install OpenJDK Runtime Environment from apt (smaller than full JDK)."""
-    v = (version or "17").strip()
+    v = (version or "21").strip()
     return _apt(f"openjdk-{v}-jre-headless")
 
 
@@ -62,27 +62,7 @@ def install_cargo(version: str = "") -> str:
     )
 
 
-def install_go(version: str = "1.22") -> str:
-    """Install the Go toolchain from the official tarball.
-
-    Downloads go<version>.linux-amd64.tar.gz from go.dev. Adds /usr/local/go/bin
-    to PATH. Common versions: 1.21, 1.22, 1.23.
-    """
-    v = (version or "1.22").strip()
-    return (
-        "RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && \\\n"
-        f"    wget -q https://go.dev/dl/go{v}.linux-amd64.tar.gz && \\\n"
-        f"    tar -C /usr/local -xzf go{v}.linux-amd64.tar.gz && \\\n"
-        f"    rm go{v}.linux-amd64.tar.gz && \\\n"
-        "    rm -rf /var/lib/apt/lists/*\n"
-        "ENV PATH=$PATH:/usr/local/go/bin"
-    )
-
-
-def install_ruby(version: str = "") -> str:
-    """Install Ruby from apt (uses the distribution's default Ruby version)."""
-    return _apt("ruby ruby-dev")
-
+# TODO: install helper for arbitrary apt packets
 
 def install_cmake(version: str = "") -> str:
     """Install CMake and the C/C++ build toolchain from apt."""
