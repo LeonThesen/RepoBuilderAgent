@@ -748,6 +748,9 @@ def compute_aggregate_metrics(
     soft_verify = [r for r in results if r.get("metrics", {}).get("repair", {}).get("soft_verify")]
     hard_applicable = [r for r in results if r.get("metrics", {}).get("repair", {}).get("hard_verify") is not None]
     hard_pass = [r for r in hard_applicable if r["metrics"]["repair"]["hard_verify"] is True]
+    # MID verify (LLM judge): rated only over repos with a conclusive verdict (legit not None).
+    mid_applicable = [r for r in results if isinstance(r.get("metrics", {}).get("repair", {}).get("mid_verify"), dict) and r["metrics"]["repair"]["mid_verify"].get("legit") is not None]
+    mid_legit = [r for r in mid_applicable if r["metrics"]["repair"]["mid_verify"]["legit"] is True]
     # binary_size_plausible: only count repos where GT binary info was available (not None)
     binary_plausible_applicable = [r for r in results if r.get("metrics", {}).get("repair", {}).get("binary_size_plausible") is not None]
     binary_plausible_pass = [r for r in binary_plausible_applicable if r["metrics"]["repair"]["binary_size_plausible"] is True]
@@ -857,6 +860,8 @@ def compute_aggregate_metrics(
         "soft_verify_rate": round(len(soft_verify) / total, 4),
         "hard_verify_rate": round(len(hard_pass) / len(hard_applicable), 4) if hard_applicable else None,
         "hard_verify_applicable": len(hard_applicable),
+        "mid_verify_legit_rate": round(len(mid_legit) / len(mid_applicable), 4) if mid_applicable else None,
+        "mid_verify_applicable": len(mid_applicable),
         "first_attempt_success_rate": round(len(first_attempt) / total, 4),
         "repair_salvage_rate": round(len(repair_salvaged) / total, 4),
         "verification_pass_rate": round(len(verify_passed) / total, 4),
