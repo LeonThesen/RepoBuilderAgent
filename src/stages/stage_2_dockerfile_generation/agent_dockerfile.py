@@ -384,8 +384,6 @@ async def generate_dockerfile(
                     prompt += render_repeated_lint_guardrail(failed_lint_attempts)
 
                 log_info(f"Generating Dockerfile for {repo_url} (lint attempt {lint_attempt})...")
-                # TODO: remove this log again, or better yet write all used prompts to files
-                log_info(prompt)
                 response = await chat_completion_with_retries(
                     client=client,
                     model=args.model,
@@ -399,8 +397,6 @@ async def generate_dockerfile(
                     retry_backoff_seconds=args.llm_retry_backoff_seconds,
                 )
                 raw = response.choices[0].message.content.strip()
-                # TODO: remove this log 
-                log_info(raw)
                 dockerfile_content = extract_dockerfile(raw)
                 if response.usage:
                     log_info(f"[TOKENS] {json.dumps({'phase': 'dockerfile', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")

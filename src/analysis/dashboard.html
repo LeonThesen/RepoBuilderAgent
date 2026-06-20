@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dataset Analysis Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/simple-datatables@9.0.3/dist/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/simple-datatables@9.0.3"></script>
+    <style>
+        :root {
+            --bg: #f5f4ef;
+            --ink: #172321;
+            --muted: #4b5b57;
+            --card: #ffffff;
+            --accent: #005f73;
+            --accent-2: #ca6702;
+            --line: #d6d7d1;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+            color: var(--ink);
+            background: radial-gradient(circle at top right, #e9f2f3, var(--bg) 40%);
+        }
+        .wrap { max-width: 1200px; margin: 0 auto; padding: 28px 18px 42px; }
+        .hero { display: flex; justify-content: space-between; align-items: end; gap: 12px; flex-wrap: wrap; }
+        h1 { margin: 0; font-size: 1.9rem; letter-spacing: 0.02em; }
+        .sub { margin: 6px 0 0; color: var(--muted); }
+        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 18px; }
+        .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+        .k { font-size: 0.86rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+        .v { font-size: 1.5rem; margin-top: 6px; font-weight: 700; color: var(--accent); }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+        .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; overflow: auto; }
+        .panel h2 { margin: 0 0 10px; font-size: 1.05rem; }
+        .chart-wrap { height: 280px; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.93rem; }
+        th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; }
+        th { font-size: 0.82rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+        tr:nth-child(even) td { background: #fafaf7; }
+        .datatable-wrapper { margin-top: 8px; }
+        .datatable-top, .datatable-bottom { gap: 8px; }
+        .datatable-input {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 6px 10px;
+            background: #fff;
+        }
+        .datatable-selector {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 4px 6px;
+            background: #fff;
+        }
+        .flow {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(120px, 1fr));
+            gap: 10px;
+            align-items: center;
+            margin-top: 14px;
+        }
+        .flow-step {
+            background: linear-gradient(180deg, #ffffff, #f7f7f2);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 12px;
+            min-height: 92px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .flow-step strong {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--accent);
+            margin-bottom: 6px;
+        }
+        .flow-arrow {
+            text-align: center;
+            color: var(--muted);
+            font-size: 1.4rem;
+            font-weight: 700;
+        }
+        .compare-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-top: 14px;
+        }
+        .compare-box {
+            background: linear-gradient(180deg, #ffffff, #f7f7f2);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 14px;
+        }
+        .compare-box h3 {
+            margin: 0 0 8px;
+            font-size: 0.95rem;
+        }
+        .formula {
+            margin-top: 12px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: #f1f6f6;
+            border: 1px solid #d6e4e5;
+            font-family: "IBM Plex Mono", "Consolas", monospace;
+            font-size: 0.92rem;
+        }
+        .accent { color: var(--accent-2); }
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: 1fr; }
+            .flow { grid-template-columns: 1fr; }
+            .compare-grid { grid-template-columns: 1fr; }
+            .flow-arrow { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="hero">
+            <div>
+                <h1>Dataset Analysis Dashboard</h1>
+                <p class="sub">Generated from results, token metrics, and selected-files summaries.</p>
+            </div>
+            <div class="sub">Files processed: 1/2</div>
+        </div>
+
+        <section class="grid" style="margin-top: 16px;">
+            <article class="panel">
+                <h2>Top Programming Languages (Chart.js)</h2>
+                <div class="chart-wrap"><canvas id="langChart"></canvas></div>
+            </article>
+            <article class="panel">
+                <h2>Top Build Tools (Chart.js)</h2>
+                <div class="chart-wrap"><canvas id="buildChart"></canvas></div>
+            </article>
+        </section>
+
+        <section class="panel" style="margin-top: 14px;">
+            <h2>Average Confidence Score by Category</h2>
+            <p class="sub" style="margin: 0 0 10px;">Mean confidence score (0–1) reported by the model across all classified repositories.</p>
+            <div class="chart-wrap"><canvas id="confidenceChart"></canvas></div>
+        </section>
+
+        <section class="grid">
+            <article class="panel">
+                <h2>Top File Names</h2>
+                <table id="fileNamesTable">
+                    <thead><tr><th>File Name</th><th>Count</th></tr></thead>
+                    <tbody>
+                        
+                    </tbody>
+                </table>
+            </article>
+            <article class="panel">
+                <h2>Top File Extensions</h2>
+                <table id="fileExtTable">
+                    <thead><tr><th>Extension</th><th>Count</th></tr></thead>
+                    <tbody>
+                        
+                    </tbody>
+                </table>
+            </article>
+        </section>
+
+        <section class="panel" style="margin-top: 14px;">
+            <h2>Prompt Comparison And Workflow Context</h2>
+            <div class="compare-grid">
+                <div class="compare-box">
+                    <h3>One-Shot Baseline</h3>
+                    <p class="sub" style="margin: 0;">
+                        A single classification prompt receives the full repository fingerprint at once.
+                    </p>
+                </div>
+                <div class="compare-box">
+                    <h3>Sequential Two-Prompt Pipeline</h3>
+                    <p class="sub" style="margin: 0;">
+                        Step 1 uses an LLM to pre-filter likely relevant files from the structure summary.
+                        Step 2 runs the final classification only on those selected files.
+                    </p>
+                </div>
+            </div>
+            <div class="formula">two-step total = step1 pre-filter prompt + step2 final classification prompt</div>
+            <div class="flow">
+                <div class="flow-step">
+                    <strong>Input</strong>
+                    <span>Repository structure summary and metadata.</span>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <strong>Step 1</strong>
+                    <span>LLM pre-filters and selects likely relevant files.</span>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <strong>Step 2</strong>
+                    <span>Final classification prompt runs on the reduced file set.</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="cards">
+            <article class="card"><div class="k">One-Shot Baseline Full Prompt</div><div class="v">7,581</div></article>
+            <article class="card"><div class="k">Step 1 LLM Pre-Filter Prompt</div><div class="v">0</div></article>
+            <article class="card"><div class="k">Step 2 Final Prompt After Pre-Filtering</div><div class="v">7,581</div></article>
+            <article class="card"><div class="k">Full Two-Prompt Pipeline</div><div class="v">7,581</div></article>
+            <article class="card"><div class="k">Full Two-Prompt Savings vs Baseline</div><div class="v accent">0</div></article>
+        </section>
+
+        <section class="panel" style="margin-top: 14px;">
+            <h2>Repositories With The Highest Two-Step Token Savings</h2>
+            <p class="sub" style="margin: 0 0 10px;">
+                Savings are baseline - full two-step pipeline total (step1 + step2). Negative values mean no savings for that repository.
+            </p>
+            <table id="repoTokensTable">
+                <thead>
+                    <tr><th>Repo</th><th>One-Shot Baseline</th><th>Step 1</th><th>Step 2</th><th>Full Two-Prompt Pipeline</th><th>Savings vs Baseline</th><th>Savings %</th></tr>
+                </thead>
+                <tbody>
+                    
+                    <tr>
+                        <td>cyclang</td>
+                        <td>7,581</td>
+                        <td>0</td>
+                        <td>7,581</td>
+                        <td>7,581</td>
+                        <td>0</td>
+                        <td>0.000%</td>
+                    </tr>
+                    
+                </tbody>
+            </table>
+        </section>
+    </div>
+
+    <script>
+        const langLabels = ["Rust", "C", "Shell", "JavaScript"];
+        const langValues = [1, 1, 1, 1];
+        const buildLabels = ["cargo", "clang"];
+        const buildValues = [1, 1];
+        const confLabels = [];
+        const confValues = [];
+
+        const commonOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+                x: { ticks: { color: '#4b5b57' }, grid: { color: '#e7e8e2' } },
+                y: { ticks: { color: '#4b5b57' }, grid: { color: '#e7e8e2' } }
+            }
+        };
+
+        new Chart(document.getElementById('langChart'), {
+            type: 'bar',
+            data: {
+                labels: langLabels,
+                datasets: [{ data: langValues, backgroundColor: '#005f73' }]
+            },
+            options: commonOptions
+        });
+
+        new Chart(document.getElementById('buildChart'), {
+            type: 'bar',
+            data: {
+                labels: buildLabels,
+                datasets: [{ data: buildValues, backgroundColor: '#ca6702' }]
+            },
+            options: commonOptions
+        });
+
+        new Chart(document.getElementById('confidenceChart'), {
+            type: 'bar',
+            data: {
+                labels: confLabels,
+                datasets: [{ data: confValues, backgroundColor: '#005f73' }]
+            },
+            options: {
+                ...commonOptions,
+                scales: {
+                    ...commonOptions.scales,
+                    y: { ...commonOptions.scales.y, min: 0, max: 1 }
+                }
+            }
+        });
+
+        const tableOptions = {
+            perPage: 10,
+            perPageSelect: [5, 10, 20, 50],
+            searchable: true,
+            sortable: true,
+            labels: {
+                placeholder: 'Search...',
+                perPage: ' rows per table',
+                noRows: 'No rows to display',
+                info: 'Showing {start} to {end} of {rows} rows'
+            }
+        };
+
+        new simpleDatatables.DataTable('#repoTokensTable', tableOptions);
+        new simpleDatatables.DataTable('#fileNamesTable', tableOptions);
+        new simpleDatatables.DataTable('#fileExtTable', tableOptions);
+    </script>
+</body>
+</html>

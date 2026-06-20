@@ -1,0 +1,44 @@
+total_metric_files: 1
+processed_metric_files: 1
+yaml_or_schema_errors: 0
+baseline_full_classification:
+  sum: 7581
+  avg: 7581.0
+  median: 7581.0
+  min: 7581
+  max: 7581
+step1_selection_prompt:
+  sum: 0
+  avg: 0.0
+  median: 0.0
+  min: 0
+  max: 0
+step2_reduced_classification:
+  sum: 7581
+  avg: 7581.0
+  median: 7581.0
+  min: 7581
+  max: 7581
+two_step_total:
+  sum: 7581
+  avg: 7581.0
+  median: 7581.0
+  min: 7581
+  max: 7581
+aggregate_savings:
+  step2_vs_baseline: 0
+  two_step_total_vs_baseline: 0
+parse_error_files: []
+top_repos_by_step2_tokens:
+- &id001
+  repo: cyclang
+  baseline_full_classification: 7581
+  step1_selection_prompt: 0
+  step2_reduced_classification: 7581
+  two_step_total: 7581
+  step2_savings_vs_baseline: 0
+  step2_savings_percent_vs_baseline: 0.0
+  two_step_savings_vs_baseline: 0
+  two_step_savings_percent_vs_baseline: 0.0
+top_repos_by_two_step_savings:
+- *id001
