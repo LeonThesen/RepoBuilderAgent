@@ -43,7 +43,7 @@ try:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
+    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo
@@ -76,7 +76,7 @@ except ImportError:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted
+    from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from metrics.eval_metrics_lib import load_gt_for_repo
@@ -335,42 +335,6 @@ def extract_selected_files(raw: str) -> list[str]:
         seen.add(p)
         cleaned.append(p)
     return cleaned
-
-
-def build_bm25_query_terms(repo_name: str, extra_terms: list[str] | None = None) -> list[str]:
-    fixed_terms = [
-        "install",
-        "installation",
-        "build",
-        "setup",
-        "dependency",
-        "dependencies",
-        "requirements",
-        "package",
-        "docker",
-        "workflow",
-        "ci",
-        "compile",
-        "test",
-        "make",
-        "cmake",
-        "gradle",
-        "maven",
-        "cargo",
-        "npm",
-        "pip",
-    ]
-    repo_terms = re.findall(r"[a-z0-9]+", repo_name.lower())
-    merged = fixed_terms + repo_terms + (extra_terms or [])
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for term in merged:
-        normalized = str(term).strip().lower()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        deduped.append(normalized)
-    return deduped
 
 
 def build_embedding_query_text(repo_name: str, extra_terms: list[str] | None = None) -> str:

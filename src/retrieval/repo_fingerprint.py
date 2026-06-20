@@ -398,6 +398,27 @@ def _tokenize_text(value: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", value.lower())
 
 
+def build_bm25_query_terms(repo_name: str, extra_terms: list[str] | None = None) -> list[str]:
+    """Install/build-relevant BM25 query terms for a repo. Shared so the classifier and
+    the retrieval playground query identically."""
+    fixed_terms = [
+        "install", "installation", "build", "setup", "dependency", "dependencies",
+        "requirements", "package", "docker", "workflow", "ci", "compile", "test",
+        "make", "cmake", "gradle", "maven", "cargo", "npm", "pip",
+    ]
+    repo_terms = re.findall(r"[a-z0-9]+", repo_name.lower())
+    merged = fixed_terms + repo_terms + (extra_terms or [])
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for term in merged:
+        normalized = str(term).strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
 def select_files_by_bm25(root: Path, query_terms: list[str], top_k: int = 12) -> list[str]:
     """Rank manifest/config files using a lightweight BM25 scorer."""
     candidates = collect_retrieval_candidates(root)
