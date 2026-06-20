@@ -9,7 +9,9 @@ from pathlib import Path
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state, ensure_repo_checkout, build_initial_user_request
+    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state, ensure_repo_checkout, build_initial_user_request, resolve_repo_checkout_dir
+    from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
+    from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
@@ -22,7 +24,9 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from core.common import upsert_shared_repository_state, build_initial_user_request
+    from core.common import upsert_shared_repository_state, build_initial_user_request, resolve_repo_checkout_dir
+    from core.repo_cleanup import delete_files_build_context, get_files_to_delete
+    from metrics.eval_metrics_lib import load_gt_for_repo
     from core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
@@ -1358,6 +1362,28 @@ def resolve_phase_skips() -> dict[str, bool]:
     return skips
 
 
+def strip_docs_before_stages(repo_urls: list[str], workspace_root: Path) -> None:
+    """ID 25: strip each repo's declarative ``files_to_delete`` (docs/CI) BEFORE any stage
+    runs, so the agent never sees install docs regardless of variant. classify and repair
+    also strip, but ``one_shot_direct`` skips both — this central pass is what covers it
+    (and any future skip-heavy variant). Repair still re-strips after its hard reset, which
+    restores the deleted files."""
+    if not args.dataset_dir:
+        return
+    dataset_dir = Path(args.dataset_dir)
+    if not dataset_dir.is_absolute():
+        dataset_dir = workspace_root / dataset_dir
+    repos_dir = Path(args.repos_dir)
+    if not repos_dir.is_absolute():
+        repos_dir = workspace_root / repos_dir
+    for url in repo_urls:
+        repo_name = _repo_name_from_url(url)
+        repo_path = resolve_repo_checkout_dir(repos_dir, repo_name)
+        if not repo_path.exists():
+            continue
+        delete_files_build_context(repo_path, repo_name, get_files_to_delete(load_gt_for_repo(dataset_dir, url)))
+
+
 def _expected_validation_gate_enabled_for_variant(variant: str) -> bool | None:
     contract = {
         "one_shot_direct": False,
@@ -1708,7 +1734,9 @@ def main() -> int:
     # NOTE: Start of actual pipeline
     # TODO: turn the prints below of commands into logs, or if they are already logged elsewhere delete them
     try:
-        
+        # ID 25: strip docs/CI for every variant before any stage sees the repo.
+        strip_docs_before_stages(repo_urls_for_run, workspace_root)
+
         if not phase_skips["classify"]:
             classify_command = build_classify_command(python_executable, classify_script)
             summary["phases"].append(
