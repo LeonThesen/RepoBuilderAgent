@@ -605,7 +605,13 @@ def compute_repo_metrics(
         gt_doc = load_gt_for_repo(dataset_dir, repo_url)
         gold = get_gt_install_relevant_files(gt_doc)
         predicted = read_selected_files(workspace_root, repo_url, summaries_dir)
-        if gold and predicted is not None:
+        strategy = read_retrieval_strategy(workspace_root, repo_url, summaries_dir)
+        # one_shot_fingerprint deliberately selects no files (it feeds the full repo
+        # fingerprint as context), so per-file precision/recall is N/A — scoring its empty
+        # selection as 0 would unfairly sink it against strategies that do select.
+        if strategy == "one_shot_fingerprint":
+            retrieval_quality = None
+        elif gold and predicted is not None:
             retrieval_quality = compute_retrieval_quality(predicted, gold)
         # Package classification: predicted system packages vs GT packages (any manager).
         gold_pkgs = get_gt_packages(gt_doc)
@@ -688,6 +694,16 @@ def read_selected_files(workspace_root: Path, repo_url: str, summaries_dir: str 
         return None
     sf = doc.get("selected_files")
     return sf if isinstance(sf, list) else None
+
+
+def read_retrieval_strategy(workspace_root: Path, repo_url: str, summaries_dir: str = "summaries") -> Optional[str]:
+    """Read which retrieval strategy produced the selected-files artifact."""
+    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+    doc = _load_yaml(workspace_root / summaries_dir / f"{repo_name}.selected-files.yaml")
+    if not doc:
+        return None
+    s = doc.get("retrieval_strategy")
+    return str(s) if s else None
 
 
 def compute_retrieval_quality(predicted: list[str], gold: list[str]) -> Optional[dict]:
