@@ -600,11 +600,18 @@ def compute_repo_metrics(
 
     # Retrieval quality: L1 selected files vs curated gold set (only when both exist).
     retrieval_quality = None
+    package_quality = None
     if dataset_dir is not None:
-        gold = get_gt_install_relevant_files(load_gt_for_repo(dataset_dir, repo_url))
+        gt_doc = load_gt_for_repo(dataset_dir, repo_url)
+        gold = get_gt_install_relevant_files(gt_doc)
         predicted = read_selected_files(workspace_root, repo_url, summaries_dir)
         if gold and predicted is not None:
             retrieval_quality = compute_retrieval_quality(predicted, gold)
+        # Package classification: predicted system packages vs GT packages (any manager).
+        gold_pkgs = get_gt_packages(gt_doc)
+        pred_pkgs = read_predicted_packages(workspace_root, repo_url, results_dir)
+        if gold_pkgs and pred_pkgs is not None:
+            package_quality = compute_package_quality(pred_pkgs, gold_pkgs)
 
     return {
         "tokens": {
@@ -615,6 +622,7 @@ def compute_repo_metrics(
         "dockerfile": dockerfile_metrics,
         "ground_truth_comparison": gt_comparison,
         "retrieval_quality": retrieval_quality,
+        "package_quality": package_quality,
     }
 
 
@@ -712,6 +720,84 @@ def compute_retrieval_quality(predicted: list[str], gold: list[str]) -> Optional
         "gold_count": len(gold_set),
         "matched_gold": len(covered),
         "missed_gold": sorted(gold_set - covered),
+    }
+
+
+def get_gt_packages(gt_doc: Optional[dict]) -> list[str]:
+    """Ground-truth package names from `categories.packages.value`.
+
+    GT entries are ``name:manager`` (e.g. ``libssl-dev:apt``, ``pnpm:npm``, ``rustup:sh``)
+    spanning every package manager. We score on the package NAME (manager stripped),
+    lower-cased, since that is the classification target."""
+    if not isinstance(gt_doc, dict):
+        return []
+    val = gt_doc.get("categories", {}).get("packages", {}).get("value")
+    names: list[str] = []
+    if isinstance(val, list):
+        for entry in val:
+            if isinstance(entry, str) and entry.strip():
+                name = entry.split(":", 1)[0].strip().lower()
+                if name:
+                    names.append(name)
+    return names
+
+
+def read_predicted_packages(workspace_root: Path, repo_url: str, results_dir: str) -> Optional[list[str]]:
+    """Agent-predicted install packages = names under classification `system_dependencies`.
+
+    These are the system packages the agent says to install (apt/pip/etc.), the analogue of
+    GT `packages`. Project library dependencies (`dependencies_packages`, e.g. cargo crates)
+    are deliberately excluded — they are resolved by the build tool, not installed, and are
+    not part of GT packages. Returns None when no classification result exists for the repo."""
+    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+    path = workspace_root / results_dir / f"{repo_name}.yaml"
+    if not path.exists():
+        results_root = workspace_root / results_dir
+        target = f"{repo_name.lower()}.yaml"
+        match = next((c for c in results_root.iterdir() if c.name.lower() == target), None) if results_root.exists() else None
+        if match is None:
+            return None
+        path = match
+    try:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    sysdeps = doc.get("categories", {}).get("system_dependencies", {}).get("value")
+    names: list[str] = []
+    if isinstance(sysdeps, list):
+        for item in sysdeps:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip().lower()
+            elif isinstance(item, str):
+                name = item.strip().lower()
+            else:
+                name = ""
+            if name:
+                names.append(name)
+    return names
+
+
+def compute_package_quality(predicted: list[str], gold: list[str]) -> Optional[dict]:
+    """Precision/recall/F1 of predicted vs ground-truth package names (set comparison).
+    Returns None when no gold package set exists for the repo."""
+    gold_set = {g for g in gold if isinstance(g, str) and g.strip()}
+    if not gold_set:
+        return None
+    pred_set = {p for p in predicted if isinstance(p, str) and p.strip()}
+    matched = pred_set & gold_set
+    precision = round(len(matched) / len(pred_set), 4) if pred_set else 0.0
+    recall = round(len(matched) / len(gold_set), 4)
+    f1 = round(2 * precision * recall / (precision + recall), 4) if (precision + recall) else 0.0
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "predicted_count": len(pred_set),
+        "gold_count": len(gold_set),
+        "matched_gold": len(matched),
+        "missed_gold": sorted(gold_set - pred_set),
     }
 
 
@@ -883,6 +969,7 @@ def compute_aggregate_metrics(
         "image_size": image_size,
         "ground_truth_scores": _aggregate_gt_scores(results),
         "retrieval_quality": _aggregate_retrieval_quality(results),
+        "package_quality": _aggregate_package_quality(results),
     }
 
 
@@ -901,6 +988,24 @@ def _aggregate_retrieval_quality(results: list[dict]) -> dict:
         "mean_precision": round(sum(q["precision"] for q in rqs) / n, 4),
         "mean_recall": round(sum(q["recall"] for q in rqs) / n, 4),
         "mean_f1": round(sum(q["f1"] for q in rqs) / n, 4),
+    }
+
+
+def _aggregate_package_quality(results: list[dict]) -> dict:
+    """Mean precision/recall/F1 of package classification over repos with a GT package set."""
+    pqs = [
+        r["metrics"]["package_quality"]
+        for r in results
+        if r.get("metrics", {}).get("package_quality")
+    ]
+    if not pqs:
+        return {"available": 0}
+    n = len(pqs)
+    return {
+        "available": n,
+        "mean_precision": round(sum(q["precision"] for q in pqs) / n, 4),
+        "mean_recall": round(sum(q["recall"] for q in pqs) / n, 4),
+        "mean_f1": round(sum(q["f1"] for q in pqs) / n, 4),
     }
 
 
