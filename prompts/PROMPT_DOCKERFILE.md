@@ -16,14 +16,19 @@ Your task is to:
      move, or remove a `USER` directive, and never modify the CA bootstrap, user setup, or
      `COPY . .` (it already copies the repo — do NOT git clone or wget it).
   2. Between the `# AGENT_BUILD_STEPS_BEGIN` and `# AGENT_BUILD_STEPS_END` marker lines: put ALL
-     dependency/toolchain installs AND build commands. Keep the two marker lines verbatim — they
-     are parsed for evaluation; never rename, move, or duplicate them. These run as the non-root
-     user with sudo available:
-       - System packages / privileged steps: prefix with `sudo` (e.g. `sudo apt-get update && sudo apt-get install -y <pkgs>`, `sudo make install`).
-       - Build commands: run WITHOUT sudo (e.g. `cargo build --release`, `make`, `npm run build`).
-       - Language toolchains: prefer `sudo apt-get install -y` (e.g. `cargo`/`rustc`). If you use a
-         home-dir installer like rustup, run it WITHOUT sudo so it installs into your home and stays
-         on PATH — never `sudo` rustup (that puts it in root's home and the non-root build can't reach it).
+     dependency/toolchain installs AND build commands. **Every step MUST be a Docker `RUN`
+     instruction — each line starts with `RUN` (use `&&` and `\` for multi-command/multi-line
+     steps). Do NOT write bare shell lines.** Keep the two marker lines verbatim — they are parsed
+     for evaluation; never rename, move, or duplicate them. These run as the non-root user with
+     sudo available:
+       - System packages / privileged steps: prefix the command with `sudo`, e.g.
+         `RUN sudo apt-get update && sudo apt-get install -y <pkgs>` or `RUN sudo make install`.
+       - Build commands: no sudo, e.g. `RUN cargo build --release`, `RUN make`, `RUN npm run build`.
+       - Language toolchains: prefer `RUN sudo apt-get install -y <toolchain>` (e.g. `cargo`/`rustc`).
+         If you use a home-dir installer like rustup, run it WITHOUT sudo so it installs into your
+         home and stays on PATH — never `sudo` rustup. Set PATH in the same `RUN` (e.g.
+         `RUN curl ... | sh -s -- -y && . "$HOME/.cargo/env" && cargo build --release`), since each
+         `RUN` is a fresh shell that does not re-source your profile.
   3. Fill the runtime CMD/ENTRYPOINT placeholder (after the END marker) if the repo is an
      application (omit for a library).
   4. Follow these additional guidelines:

@@ -133,6 +133,9 @@ args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
+# Cap hadolint regeneration so a Dockerfile the model can't lint-fix never loops forever.
+MAX_LINT_ATTEMPTS = 8
+
 
 # httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
 # Use ssl.create_default_context() to pull in the OS trust store instead.
@@ -435,6 +438,12 @@ async def generate_dockerfile(
                         f"[hadolint {repo_name}] Dockerfile syntax error on attempt {lint_attempt}: "
                         f"{validation_error[:200]}"
                     )
+                    if lint_attempt >= MAX_LINT_ATTEMPTS:
+                        log_warn(
+                            f"[hadolint {repo_name}] Still invalid after {MAX_LINT_ATTEMPTS} attempts; "
+                            f"proceeding with the last generation — the docker build will surface any real error."
+                        )
+                        break
                     lint_attempt += 1
                     continue
                 else:

@@ -48,10 +48,13 @@ WORKDIR /home/manualrepos/repo
 # Copy repository from build context (already checked out on host)
 COPY --chown=manualrepos:manualrepos . .
 
-# Dependency installs + build commands go here. They run as the non-root user, which
-# has passwordless sudo. Edit only between the markers.
+# Dependency installs + build commands go here. EACH step is a Docker RUN instruction
+# (every line starts with RUN), running as the non-root user which has passwordless sudo.
+# Edit only between the markers. Example:
+#   RUN sudo apt-get update && sudo apt-get install -y cargo rustc
+#   RUN cargo build --release
 # AGENT_BUILD_STEPS_BEGIN
-# [PLACEHOLDER: e.g. sudo apt-get update && sudo apt-get install -y <pkgs>; cargo build --release]
+# [PLACEHOLDER: RUN <dependency installs>, then RUN <build commands>]
 # AGENT_BUILD_STEPS_END
 
 # Final CMD or ENTRYPOINT (runs as manualrepos)
