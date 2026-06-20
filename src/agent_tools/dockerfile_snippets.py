@@ -1,26 +1,42 @@
 """Validated Dockerfile RUN-block snippets for common build toolchains.
 
 Each function returns one or more Dockerfile lines as a string ready to paste.
-Snippets target Debian/Ubuntu-based images (apt). Where network is required
-(Go, Rust, .NET, Gradle) the download URL follows official release conventions.
+Snippets target the project's Debian/Ubuntu base image, where the build runs as a
+NON-ROOT user (manualrepos) with passwordless sudo — so every privileged step (apt,
+writes under /usr/local, /opt) is prefixed with `sudo`. Where network is required
+(Go, Gradle, .NET) the download URL follows official release conventions.
 """
 
 from __future__ import annotations
 
+# The non-root build user's home, where user-scoped toolchains (rustup) install.
+_USER_HOME = "/home/manualrepos"
+
 
 def _apt(packages: str, extras: str = "") -> str:
-    """Return a minimal apt-get RUN block with cache cleanup."""
-    body = f"apt-get update && apt-get install -y --no-install-recommends {packages} && rm -rf /var/lib/apt/lists/*"
+    """Return an apt-get RUN block (sudo, non-root base) with cache cleanup."""
+    body = f"sudo apt-get update && sudo apt-get install -y --no-install-recommends {packages}"
     if extras:
-        body = f"apt-get update && apt-get install -y --no-install-recommends {packages} && {extras} && rm -rf /var/lib/apt/lists/*"
+        body += f" && {extras}"
+    body += " && sudo rm -rf /var/lib/apt/lists/*"
     return f"RUN {body}"
 
 
-def install_jdk(version: str = "21") -> str:
-    """Install OpenJDK Development Kit from apt.
+def install_apt(packages: str = "") -> str:
+    """Install an arbitrary set of apt packages (space-separated) the right way.
 
-    Common versions: 11, 17, 21, 25. Use install_jre for a smaller runtime-only image.
+    Example: get_dockerfile_snippet("install_apt", "libssl-dev zlib1g-dev pkg-config").
+    Use this for system dev libraries (libssl-dev, zlib1g-dev, libffi-dev, libopenblas-dev,
+    gfortran, ninja-build, autoconf, automake, libtool, protobuf-compiler, ...).
     """
+    pkgs = (packages or "").strip()
+    if not pkgs:
+        return "ERROR: install_apt requires a space-separated package list (the `version` arg)."
+    return _apt(pkgs)
+
+
+def install_jdk(version: str = "21") -> str:
+    """Install OpenJDK Development Kit from apt. Common versions: 11, 17, 21, 25."""
     v = (version or "21").strip()
     return _apt(f"openjdk-{v}-jdk")
 
@@ -32,37 +48,49 @@ def install_jre(version: str = "21") -> str:
 
 
 def install_node(version: str = "20") -> str:
-    """Install Node.js via NodeSource setup script.
-
-    Common versions: 18, 20, 22. Installs the full nodejs package including npm.
-    """
+    """Install Node.js via NodeSource setup script. Common versions: 18, 20, 22."""
     v = (version or "20").strip()
     return (
-        "RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \\\n"
-        f"    curl -fsSL https://deb.nodesource.com/setup_{v}.x | bash - && \\\n"
-        "    apt-get install -y --no-install-recommends nodejs && \\\n"
-        "    rm -rf /var/lib/apt/lists/*"
+        "RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends curl ca-certificates && \\\n"
+        f"    curl -fsSL https://deb.nodesource.com/setup_{v}.x | sudo -E bash - && \\\n"
+        "    sudo apt-get install -y --no-install-recommends nodejs && \\\n"
+        "    sudo rm -rf /var/lib/apt/lists/*"
     )
+
+
+def install_pnpm(version: str = "") -> str:
+    """Install the pnpm package manager globally (requires Node.js; install_node first)."""
+    return "RUN sudo corepack enable && corepack prepare pnpm@latest --activate"
 
 
 def install_cargo(version: str = "") -> str:
-    """Install Rust toolchain and Cargo via rustup (official method).
+    """Install Rust + Cargo via apt (lands in /usr/bin, on PATH for the non-root build).
 
-    Uses the minimal profile for smaller image size. Sets CARGO_HOME and RUSTUP_HOME
-    to /usr/local so all users share the installation.
+    Simplest reliable option on this base. For a newer toolchain, install rustup WITHOUT
+    sudo so it lands in the build user's home and stays on PATH:
+      RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+      ENV PATH=/home/manualrepos/.cargo/bin:$PATH
+    Never `sudo` the rustup installer (it would land in root's home, unreachable here).
     """
+    return _apt("cargo rustc")
+
+
+def install_go(version: str = "1.22") -> str:
+    """Install Go from the official tarball into /usr/local/go. Common versions: 1.21, 1.22, 1.23."""
+    v = (version or "1.22").strip()
     return (
-        "ENV RUSTUP_HOME=/usr/local/rustup \\\n"
-        "    CARGO_HOME=/usr/local/cargo \\\n"
-        "    PATH=/usr/local/cargo/bin:$PATH\n"
-        "RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \\\n"
-        "    curl https://sh.rustup.rs -sSf | sh -s -- -y --no-modify-path --profile minimal && \\\n"
-        "    chmod -R a+w $RUSTUP_HOME $CARGO_HOME && \\\n"
-        "    rm -rf /var/lib/apt/lists/*"
+        "RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends curl ca-certificates && \\\n"
+        f"    curl -fsSL https://go.dev/dl/go{v}.linux-amd64.tar.gz -o /tmp/go.tgz && \\\n"
+        "    sudo tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz && \\\n"
+        "    sudo rm -rf /var/lib/apt/lists/*\n"
+        "ENV PATH=/usr/local/go/bin:$PATH"
     )
 
 
-# TODO: install helper for arbitrary apt packets
+def install_ruby(version: str = "") -> str:
+    """Install Ruby and bundler from apt."""
+    return _apt("ruby-full", "sudo gem install bundler --no-document")
+
 
 def install_cmake(version: str = "") -> str:
     """Install CMake and the C/C++ build toolchain from apt."""
@@ -75,19 +103,17 @@ def install_maven(version: str = "") -> str:
 
 
 def install_gradle(version: str = "8.5") -> str:
-    """Download and install Gradle from the official distribution.
+    """Download and install Gradle from the official distribution into /opt.
 
-    Installs to /opt/gradle-<version> and symlinks the binary to /usr/local/bin.
-    Common versions: 7.6, 8.0, 8.5, 8.7.
+    Common versions: 7.6, 8.0, 8.5, 8.7. Requires Java; combine with install_jdk.
     """
     v = (version or "8.5").strip()
     return (
-        "RUN apt-get update && apt-get install -y --no-install-recommends wget unzip && \\\n"
-        f"    wget -q https://services.gradle.org/distributions/gradle-{v}-bin.zip && \\\n"
-        f"    unzip -q gradle-{v}-bin.zip -d /opt && \\\n"
-        f"    ln -s /opt/gradle-{v}/bin/gradle /usr/local/bin/gradle && \\\n"
-        f"    rm gradle-{v}-bin.zip && \\\n"
-        "    rm -rf /var/lib/apt/lists/*"
+        "RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends wget unzip && \\\n"
+        f"    wget -q https://services.gradle.org/distributions/gradle-{v}-bin.zip -O /tmp/gradle.zip && \\\n"
+        "    sudo unzip -q /tmp/gradle.zip -d /opt && rm /tmp/gradle.zip && \\\n"
+        f"    sudo ln -s /opt/gradle-{v}/bin/gradle /usr/local/bin/gradle && \\\n"
+        "    sudo rm -rf /var/lib/apt/lists/*"
     )
 
 
@@ -96,24 +122,25 @@ def install_build_essential(version: str = "") -> str:
     return _apt("build-essential pkg-config")
 
 
+def install_autotools(version: str = "") -> str:
+    """Install the GNU Autotools build chain (autoconf, automake, libtool) from apt."""
+    return _apt("autoconf automake libtool pkg-config build-essential")
+
+
 def install_elixir(version: str = "") -> str:
     """Install Elixir and Erlang/OTP from apt."""
     return _apt("elixir erlang-dev erlang-parsetools erlang-tools")
 
 
 def install_dotnet(version: str = "8") -> str:
-    """Install the .NET SDK via the official dotnet-install script.
-
-    Installs to /usr/local/share/dotnet. Common versions: 6, 7, 8, 9.
-    """
+    """Install the .NET SDK via the official dotnet-install script. Common versions: 6, 7, 8, 9."""
     v = (version or "8").strip()
     return (
-        "RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && \\\n"
-        f"    wget -qO dotnet-install.sh https://dot.net/v1/dotnet-install.sh && \\\n"
-        f"    bash dotnet-install.sh --channel {v}.0 --install-dir /usr/local/share/dotnet && \\\n"
-        "    ln -sf /usr/local/share/dotnet/dotnet /usr/local/bin/dotnet && \\\n"
-        "    rm dotnet-install.sh && \\\n"
-        "    rm -rf /var/lib/apt/lists/*"
+        "RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends wget ca-certificates && \\\n"
+        "    wget -qO /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh && \\\n"
+        f"    sudo bash /tmp/dotnet-install.sh --channel {v}.0 --install-dir /usr/local/share/dotnet && \\\n"
+        "    sudo ln -sf /usr/local/share/dotnet/dotnet /usr/local/bin/dotnet && rm /tmp/dotnet-install.sh && \\\n"
+        "    sudo rm -rf /var/lib/apt/lists/*"
     )
 
 
@@ -121,16 +148,12 @@ def install_php(version: str = "") -> str:
     """Install PHP-CLI, common extensions, and Composer from apt."""
     return _apt(
         "php-cli php-xml php-mbstring php-curl php-zip unzip curl",
-        "curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer",
+        "curl -sS https://getcomposer.org/installer | php -- --install-dir=/tmp && sudo mv /tmp/composer.phar /usr/local/bin/composer",
     )
 
 
 def install_pip_requirements(version: str = "") -> str:
-    """Install Python dependencies from requirements.txt.
-
-    Assumes requirements.txt has been COPYed into the working directory first.
-    Use 'COPY requirements*.txt ./' before this snippet.
-    """
+    """Install Python dependencies from requirements.txt (COPY it in first)."""
     return (
         "COPY requirements*.txt ./\n"
         "RUN pip install --no-cache-dir -r requirements.txt"
@@ -138,10 +161,7 @@ def install_pip_requirements(version: str = "") -> str:
 
 
 def install_npm_ci(version: str = "") -> str:
-    """Install Node.js dependencies via npm ci (reproducible, ignores package-lock changes).
-
-    Assumes package.json and package-lock.json are COPYed first.
-    """
+    """Install Node.js dependencies via npm ci (COPY package*.json first)."""
     return (
         "COPY package*.json ./\n"
         "RUN npm ci --omit=dev"
@@ -149,22 +169,23 @@ def install_npm_ci(version: str = "") -> str:
 
 
 def install_yarn_frozen(version: str = "") -> str:
-    """Install Node.js dependencies via yarn with frozen lockfile.
-
-    Assumes package.json and yarn.lock are COPYed first.
-    """
+    """Install Node.js dependencies via yarn with a frozen lockfile (COPY package.json yarn.lock first)."""
     return (
         "COPY package.json yarn.lock ./\n"
         "RUN yarn install --frozen-lockfile --non-interactive"
     )
 
 
-def install_poetry(version: str = "") -> str:
-    """Install Poetry and project dependencies.
+def install_pnpm_frozen(version: str = "") -> str:
+    """Install Node.js dependencies via pnpm with a frozen lockfile (requires install_pnpm; COPY lockfile first)."""
+    return (
+        "COPY package.json pnpm-lock.yaml ./\n"
+        "RUN pnpm install --frozen-lockfile"
+    )
 
-    Assumes pyproject.toml and poetry.lock are COPYed first.
-    Installs without dev dependencies in a virtualenv-free mode.
-    """
+
+def install_poetry(version: str = "") -> str:
+    """Install Poetry and project dependencies (COPY pyproject.toml poetry.lock first)."""
     return (
         "RUN pip install --no-cache-dir poetry\n"
         "COPY pyproject.toml poetry.lock ./\n"
@@ -173,28 +194,31 @@ def install_poetry(version: str = "") -> str:
 
 
 def install_sbt(version: str = "") -> str:
-    """Install sbt (Scala Build Tool) from apt. Requires JDK; combine with install_jdk."""
+    """Install sbt (Scala Build Tool) from its apt repo. Requires JDK; combine with install_jdk."""
     return (
-        "RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg && \\\n"
-        "    curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823' | apt-key add - && \\\n"
-        "    echo 'deb https://repo.scala-sbt.org/scalasbt/debian all main' > /etc/apt/sources.list.d/sbt.list && \\\n"
-        "    apt-get update && apt-get install -y --no-install-recommends sbt && \\\n"
-        "    rm -rf /var/lib/apt/lists/*"
+        "RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends curl gnupg && \\\n"
+        "    curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823' | sudo apt-key add - && \\\n"
+        "    echo 'deb https://repo.scala-sbt.org/scalasbt/debian all main' | sudo tee /etc/apt/sources.list.d/sbt.list && \\\n"
+        "    sudo apt-get update && sudo apt-get install -y --no-install-recommends sbt && \\\n"
+        "    sudo rm -rf /var/lib/apt/lists/*"
     )
 
 
 def list_actions(version: str = "") -> str:
     """Return all available snippet action names and their descriptions."""
     lines = [
-        "install_jdk(version)       — OpenJDK JDK from apt (default: 17; options: 11, 17, 21)",
-        "install_jre(version)       — OpenJDK JRE from apt (default: 17; smaller than full JDK)",
+        "install_apt(packages)      — Install arbitrary apt packages (pass space-separated list as the arg)",
+        "install_jdk(version)       — OpenJDK JDK from apt (default: 21; options: 11, 17, 21, 25)",
+        "install_jre(version)       — OpenJDK JRE from apt (default: 21; smaller than full JDK)",
         "install_node(version)      — Node.js via NodeSource (default: 20; options: 18, 20, 22)",
-        "install_cargo              — Rust + Cargo via rustup",
-        "install_go(version)        — Go tarball from go.dev (default: 1.22)",
-        "install_ruby               — Ruby from apt",
-        "install_cmake              — CMake + build-essential",
+        "install_pnpm               — pnpm package manager via corepack (requires Node)",
+        "install_cargo              — Rust + Cargo via apt (rustup alternative in docstring)",
+        "install_go(version)        — Go tarball from go.dev into /usr/local (default: 1.22)",
+        "install_ruby               — Ruby + bundler from apt",
+        "install_cmake              — CMake + build-essential + pkg-config",
+        "install_autotools          — autoconf + automake + libtool + build-essential",
         "install_maven              — Apache Maven from apt (requires JDK)",
-        "install_gradle(version)    — Gradle from official distribution (default: 8.5)",
+        "install_gradle(version)    — Gradle from official distribution (default: 8.5; requires JDK)",
         "install_build_essential    — GCC, G++, Make, pkg-config",
         "install_elixir             — Elixir + Erlang/OTP from apt",
         "install_dotnet(version)    — .NET SDK via install script (default: 8)",
@@ -202,6 +226,7 @@ def list_actions(version: str = "") -> str:
         "install_pip_requirements   — pip install -r requirements.txt (adds COPY first)",
         "install_npm_ci             — npm ci (adds COPY package*.json first)",
         "install_yarn_frozen        — yarn install --frozen-lockfile (adds COPY first)",
+        "install_pnpm_frozen        — pnpm install --frozen-lockfile (adds COPY first; needs install_pnpm)",
         "install_poetry             — Poetry install (adds COPY pyproject.toml first)",
         "install_sbt                — sbt Scala build tool (requires JDK)",
         "list_actions               — Return this list of available actions",
@@ -210,13 +235,16 @@ def list_actions(version: str = "") -> str:
 
 
 _ACTIONS: dict[str, object] = {
+    "install_apt": install_apt,
     "install_jdk": install_jdk,
     "install_jre": install_jre,
     "install_node": install_node,
+    "install_pnpm": install_pnpm,
     "install_cargo": install_cargo,
     "install_go": install_go,
     "install_ruby": install_ruby,
     "install_cmake": install_cmake,
+    "install_autotools": install_autotools,
     "install_maven": install_maven,
     "install_gradle": install_gradle,
     "install_build_essential": install_build_essential,
@@ -226,6 +254,7 @@ _ACTIONS: dict[str, object] = {
     "install_pip_requirements": install_pip_requirements,
     "install_npm_ci": install_npm_ci,
     "install_yarn_frozen": install_yarn_frozen,
+    "install_pnpm_frozen": install_pnpm_frozen,
     "install_poetry": install_poetry,
     "install_sbt": install_sbt,
     "list_actions": list_actions,
