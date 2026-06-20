@@ -1357,8 +1357,12 @@ def resolve_phase_skips() -> dict[str, bool]:
     if args.variant == "one_shot_direct":
         skips["classify"] = True
         skips["validation_gate"] = True
-        skips["repair"] = True
         skips["install_guide"] = True
+        # ID 6: keep repair ENABLED so the one-shot Dockerfile is actually built and
+        # verified (otherwise one_shot_direct produces no build_success / verify result),
+        # but force a single attempt — build + verify once, no repair iterations — so the
+        # variant stays "one-shot". Reuses the full tiered soft/mid/hard verify machinery.
+        args.max_attempts = 1
     return skips
 
 

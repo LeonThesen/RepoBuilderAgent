@@ -1186,12 +1186,15 @@ async def repair_repository(
 
         try:
             classification_path = results_dir / f"{repo_name}.yaml"
-            classification = read_yaml_file(classification_path)
+            # Classification is optional: building + verifying needs only the Dockerfile.
+            # one_shot_direct skips Stage 1, so there is no classification — proceed with an
+            # empty one (it only feeds the repair PROMPT, and one_shot runs a single attempt
+            # with no repair). Other variants do produce it.
+            classification = read_yaml_file(classification_path) or {}
             if not classification:
                 log_warn(
-                    f"Skipping {repo_url}: classification result missing at {classification_path}. Run agent_classify.py first."
+                    f"No classification for {repo_url} at {classification_path}; proceeding with build+verify only (expected for one_shot_direct)."
                 )
-                return
 
             if not dockerfile_path.exists():
                 log_warn(
