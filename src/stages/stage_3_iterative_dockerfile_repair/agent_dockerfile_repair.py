@@ -874,6 +874,37 @@ async def measure_binary_in_image(
     return result
 
 
+async def gather_artifact_listing(image_tag: str, workdir: str) -> Optional[dict]:
+    """Collect the raw inputs HARD verification needs from the built image: the
+    git-tracked source list and an xxh64sum of every file under the workdir. The
+    evaluator (eval.py) turns these into the produced-artifact combined hash and
+    compares it to ground truth, so the agent submodule stays free of dataset logic."""
+    wd = workdir or "/home/manualrepos/repo"
+
+    async def _run(shell: str, timeout: int) -> Optional[str]:
+        cmd = [args.container_cli, "run", "--rm", "--entrypoint", "/bin/sh", image_tag, "-c", shell]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode == 0:
+                return stdout.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+        return None
+
+    wd_q = shlex.quote(wd)
+    git_files = await _run(f"cd {wd_q} && git ls-files", 60)
+    # %P drops the leading "./"; xargs -0 keeps it fast on repos with thousands of files.
+    all_hashes = await _run(
+        f"cd {wd_q} && find . -type f -printf '%P\\0' | xargs -0 xxh64sum", 180
+    )
+    if git_files is None and all_hashes is None:
+        return None
+    return {"git_files": git_files or "", "all_hashes": all_hashes or ""}
+
+
 async def request_repair(
     repo_url: str,
     attempt_number: int,
@@ -1347,9 +1378,9 @@ async def repair_repository(
                         report["success"] = True
                         report["successful_attempt"] = attempt
                         if gt_doc:
+                            _, workdir = await get_image_runtime_context(image_tag)
                             gt_artifact = get_gt_key_artifact(gt_doc, gt_verify_commands)
                             if gt_artifact:
-                                _, workdir = await get_image_runtime_context(image_tag)
                                 binary_metrics = await measure_binary_in_image(
                                     image_tag,
                                     gt_artifact["path"],
@@ -1363,6 +1394,9 @@ async def repair_repository(
                                     f"plausible={binary_metrics.get('binary_size_plausible')}, "
                                     f"hash_match={binary_metrics.get('binary_hash_match')}"
                                 )
+                            # HARD verify inputs (TODO 1/28): source list + per-file hashes of
+                            # the produced artifacts, for the evaluator's combined-hash check.
+                            report["artifact_listing"] = await gather_artifact_listing(image_tag, workdir)
                         log_info(
                             f"Build and verification succeeded for {repo_url} on attempt {attempt}; image tag: {image_tag}; build log: {build_log_path}; verify log: {verify_log_path}"
                         )

@@ -22,13 +22,15 @@ RUN if [ -n "$MANUALREPOS_CA_CERT_B64" ]; then \
       update-ca-certificates; \
     fi
 
-# Install default packages (incl. sudo, so the build user can install system packages).
+# Install default packages (incl. sudo, so the build user can install system packages;
+# xxhash provides xxh64sum, used post-build to hash artifacts for HARD verification).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     curl \
     pkg-config \
     sudo \
+    xxhash \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root build user with passwordless sudo, so the build feels like a normal dev
