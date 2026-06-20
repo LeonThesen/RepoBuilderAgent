@@ -43,7 +43,7 @@ try:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms
+    from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms, clear_walk_cache
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo
@@ -76,7 +76,7 @@ except ImportError:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms
+    from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms, clear_walk_cache
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
     from core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from metrics.eval_metrics_lib import load_gt_for_repo
@@ -1232,6 +1232,8 @@ async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, 
             if args.dataset_dir:
                 gt_doc = load_gt_for_repo(Path(args.dataset_dir), repo_url)
                 delete_files_build_context(repo_path, repo_name, get_files_to_delete(gt_doc))
+            # Drop any cached repo walk so the fingerprints below reflect the post-deletion tree (TODO 53).
+            clear_walk_cache(repo_path)
             # TODO: stripping docs is mandatory we need to abort the FULL pipeline if we cant load gt_doc
             # TODO: this code needs to be in agent_pipeline.py because one_shot_direct currently skips 
             # TODO: things like git checkout/clone and docs delete need to be done before any stage or agent config is run

@@ -123,6 +123,29 @@ def read_file_safe(path: Path, max_bytes: Optional[int] = None) -> str:
         return f"[error reading file: {e}]"
 
 
+# Per-root walk cache (TODO 53): classify fingerprints a repo three times in one process
+# (structure / selected / baseline). The directory tree, metadata, and manifest scan are
+# identical across those passes, so memoize them per repo root and walk the filesystem once.
+# Safe because the repo is mutated (file deletion) once before fingerprinting within a
+# process; call clear_walk_cache() after any mutation to be sure.
+_WALK_CACHE: dict[str, dict] = {}
+
+
+def clear_walk_cache(root: "str | Path | None" = None) -> None:
+    """Drop cached walks — for one root, or all. Call after mutating a checkout."""
+    if root is None:
+        _WALK_CACHE.clear()
+    else:
+        _WALK_CACHE.pop(str(Path(root).resolve()), None)
+
+
+def _cached_walk(root: Path, key: str, compute):
+    bucket = _WALK_CACHE.setdefault(str(root), {})
+    if key not in bucket:
+        bucket[key] = compute()
+    return bucket[key]
+
+
 def build_tree(root: Path, depth: int = 0) -> list[str]:
     if depth > MAX_TREE_DEPTH:
         return []
@@ -718,7 +741,9 @@ def fingerprint(
     ctx = f" [{context}]" if context else ""
     log_info(f"Scanning {root} ...{ctx}")
     log_trace(f"fingerprint{ctx}(format={format}, structure_only={structure_only}, include_tree={include_tree})")
-    tree = build_tree(root) if include_tree else []
+    # Tree / metadata / manifest scan are identical across this repo's fingerprint passes,
+    # so cache them per root and walk the filesystem once (TODO 53).
+    tree = _cached_walk(root, "tree", lambda: build_tree(root)) if include_tree else []
     manifests: list[tuple[str, str]]
 
     if structure_only:
@@ -729,10 +754,10 @@ def fingerprint(
         manifests = collect_selected_files(root, selected_files)
     else:
         log_info(f"Collecting manifest files ...{ctx}")
-        manifests = collect_manifest_files(root)
+        manifests = _cached_walk(root, "manifests", lambda: collect_manifest_files(root))
 
     log_info(f"Collecting metadata ...{ctx}")
-    meta = collect_metadata(root)
+    meta = _cached_walk(root, "meta", lambda: collect_metadata(root))
 
     log_info(
         f"Found {len(manifests)} manifest files, "
