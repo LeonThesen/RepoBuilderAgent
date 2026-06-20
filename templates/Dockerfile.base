@@ -36,7 +36,9 @@ COPY . .
 RUN chown -R manualrepos:manualrepos /home/manualrepos/repo
 
 # Build instructions
+# AGENT_BUILD_STEPS_BEGIN
 # [PLACEHOLDER: Repo-specific build commands (make, cmake, autoreconf, etc.)]
+# AGENT_BUILD_STEPS_END
 
 # Final CMD or ENTRYPOINT
 # [PLACEHOLDER: Binary path or entry point]

@@ -16,6 +16,7 @@ Your task is to:
      - Language/ecosystem-specific dependency installation (pip install, npm ci, cargo fetch, mvn install, etc.)
      - Repo-specific build commands (make, cmake, npm run build, cargo build, maven goals, etc.)
      - Final CMD or ENTRYPOINT if the repo is an application
+     - **Keep the `# AGENT_BUILD_STEPS_BEGIN` and `# AGENT_BUILD_STEPS_END` marker lines verbatim, and place ALL repo-specific build RUN commands (the project compile/build, not dependency installation) strictly between them.** These markers are parsed for evaluation; never rename, remove, duplicate, or move them. Dependency/toolchain installation stays above the BEGIN marker.
   3. Add any additional system packages needed for THIS specific repo (if not already in base template).
   4. Follow these additional guidelines:
      - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `apt-get install -y` up front (run `apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim — prefer UNVERSIONED toolchain packages (build-essential, gcc, g++, clang) over version-pinned names like `gcc-11` that may not exist in forky; install `gnupg`+`ca-certificates` before any `gpg`/key step.

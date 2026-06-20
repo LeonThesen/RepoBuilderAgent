@@ -2,11 +2,12 @@
 Dockerfile (TODO 4).
 
 The agent emits a free-form Dockerfile, but the base template brackets the
-repo-specific build commands with stable section-comment markers:
+repo-specific build commands with explicit sentinel markers the generation and
+repair prompts are instructed to keep verbatim:
 
-    # Build instructions
+    # AGENT_BUILD_STEPS_BEGIN
     RUN <build command>
-    # Final CMD or ENTRYPOINT
+    # AGENT_BUILD_STEPS_END
 
 This module slices out the marked build section and strips the ``RUN`` prefix so
 the agent's build_steps and verification command land in the same flat, parsable
@@ -21,9 +22,14 @@ them) ``build_steps`` is empty and ``markers_found`` is False so callers can fla
 
 from __future__ import annotations
 
-BUILD_START_MARKER = "# Build instructions"
-# Any of these (exact stripped comment, or an instruction keyword) ends the section.
-BUILD_END_MARKERS = ("# Final CMD or ENTRYPOINT",)
+# Explicit sentinels emitted by the base template + enforced by the prompts.
+BUILD_START_MARKER = "# AGENT_BUILD_STEPS_BEGIN"
+BUILD_END_MARKER = "# AGENT_BUILD_STEPS_END"
+
+# Legacy fallback for Dockerfiles generated before the sentinels existed, or when a
+# repair rewrite dropped them: the human section comments still bracket the build.
+LEGACY_START_MARKER = "# Build instructions"
+LEGACY_END_MARKERS = ("# Final CMD or ENTRYPOINT",)
 _INSTRUCTION_TERMINATORS = ("CMD ", "ENTRYPOINT ", "CMD[", "ENTRYPOINT[")
 
 
@@ -48,22 +54,31 @@ def _join_run_command(first_line: str, lines: list[str], index: int) -> tuple[st
     return " ".join(command.split()), i
 
 
+def _section_bounds(lines: list[str]) -> tuple[int, tuple[str, ...]] | None:
+    """Locate the build section. Prefer the explicit sentinels; fall back to the
+    legacy section comments. Returns (start_index, end_markers) or None."""
+    for idx, line in enumerate(lines):
+        if line.strip() == BUILD_START_MARKER:
+            return idx + 1, (BUILD_END_MARKER,)
+    for idx, line in enumerate(lines):
+        if line.strip() == LEGACY_START_MARKER:
+            return idx + 1, LEGACY_END_MARKERS
+    return None
+
+
 def extract_build_steps(dockerfile_text: str) -> tuple[list[str], bool]:
     """Return (build_steps, markers_found) parsed from the marked build section."""
     lines = dockerfile_text.splitlines()
-    start = None
-    for idx, line in enumerate(lines):
-        if line.strip() == BUILD_START_MARKER:
-            start = idx + 1
-            break
-    if start is None:
+    bounds = _section_bounds(lines)
+    if bounds is None:
         return [], False
+    start, end_markers = bounds
 
     steps: list[str] = []
     i = start
     while i < len(lines):
         stripped = lines[i].strip()
-        if stripped in BUILD_END_MARKERS:
+        if stripped in end_markers:
             break
         if stripped.startswith(_INSTRUCTION_TERMINATORS):
             break
