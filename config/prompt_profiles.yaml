@@ -24,7 +24,7 @@ profiles:
     temperature: 0.0
     role_framing: neutral
 
-  # AB-01: role framing only (neutral → expert)
+  # AB-04: role framing only (neutral → expert)
   phase1_role_only:
     few_shot_count: 0
     prompt_length_mode: concise
@@ -33,7 +33,9 @@ profiles:
     temperature: 0.0
     role_framing: expert
 
-  # AB-02: reasoning instruction only
+  # Reasoning instruction only (no longer scheduled; kept for reference).
+  # Dropped from Phase 1 when the study moved to completions-only and temperature
+  # took the AB-01/AB-02 slots.
   phase1_reasoning_only:
     few_shot_count: 0
     prompt_length_mode: concise
@@ -51,7 +53,7 @@ profiles:
     temperature: 0.0
     role_framing: neutral
 
-  # AB-04: output format only (strict → structured)
+  # AB-05: output format only (strict → structured)
   phase1_format_only:
     few_shot_count: 0
     prompt_length_mode: concise

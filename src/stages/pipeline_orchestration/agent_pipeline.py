@@ -286,8 +286,6 @@ RUN_DIR_DEFAULTS = {
     "analysis_dir": (DEFAULT_ANALYSIS_DIR, "analysis"),
 }
 
-CANONICAL_EXECUTION_BRANCH = "ablation/full-system/runtime-agent-config"
-
 _stage_temperature_overrides: dict[str, float | None] = {}
 
 
@@ -1552,7 +1550,6 @@ def main() -> int:
         "ended_at": None,
         "duration_seconds": None,
         "status": "failed",
-        "canonical_execution_branch": CANONICAL_EXECUTION_BRANCH,
         "trace": {
             "enabled": args.trace,
             "forwarded_to_child_agents": args.trace,
@@ -1641,7 +1638,6 @@ def main() -> int:
 
     runtime_config_lock = {
         "generated_at": utc_now(),
-        "canonical_execution_branch": CANONICAL_EXECUTION_BRANCH,
         "variant": args.variant,
         "variant_policy": variant_policy,
         "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),

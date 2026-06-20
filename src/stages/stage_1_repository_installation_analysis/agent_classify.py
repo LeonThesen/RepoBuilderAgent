@@ -1021,12 +1021,54 @@ async def _select_relevant_files(
     react_trace: list[dict[str, Any]] = []
     react_stop_reason = "not_applicable"
     if args.retrieval_strategy == "bm25":
+        # TODO: Separate path tokens from content tokens so filenames, directories, and
+        #       extensions can be weighted explicitly instead of being mixed into one BM25 field.
+
+        # TODO: Improve tokenization for code/repository text, including "-", "_", ".",
+        #       "/", camelCase, package names, config keys, and exact identifiers.
+
+        # TODO: Review the fixed filename boosts because constants like 2.5 can dominate
+        #       BM25 scores, especially for short queries.
+
+        # TODO: Add a better fallback ranking when no BM25 score is positive, prioritizing
+        #       high-signal filenames instead of returning the raw candidate order.
         selected_files = select_files_by_bm25(repo_path, build_bm25_query_terms(repo_name, prior_failure_terms))
         if not selected_files:
             log_warn(f"BM25 selection returned no files for {repo_url}; using defaults.")
             selected_files = default_selected_files.copy()
         log_info(f"Selected {len(selected_files)} files for {repo_name} via BM25 retrieval.")
     elif args.retrieval_strategy == "neural_embedding":
+        # TODO: Split large files into smaller semantic chunks before embedding them,
+        #       instead of embedding the entire file as one vector.
+
+        # TODO: Limit or truncate file content before sending it to the embedding model
+        #       to avoid token-limit errors or unintended provider-side truncation.
+
+        # TODO: Score files by their best matching chunk rather than by a single
+        #       whole-file embedding.
+
+        # TODO: Improve the embedding query text so it describes the retrieval goal
+        #       explicitly, e.g. architecture, entry points, configuration, APIs,
+        #       build setup, and domain-specific implementation details.
+
+        # TODO: Consider weighting path information separately from content so that
+        #       filenames help retrieval without dominating the embedding.
+
+        # TODO: Cache embeddings per file or chunk to avoid recomputing unchanged
+        #       candidates on every run.
+
+        # TODO: Preserve asyncio cancellation by re-raising asyncio.CancelledError
+        #       before the generic Exception fallback handler.
+
+        # TODO: Optionally parallelize embedding batch requests with a bounded
+        #       concurrency limit to improve performance without exceeding rate limits.
+
+        # TODO: Add telemetry or debug logging for the selected files and similarity
+        #       scores to make retrieval quality easier to inspect.
+
+        # TODO: Consider combining dense embedding retrieval with a lexical/BM25-style
+        #       signal so exact matches for identifiers, filenames, and symbols are
+        #       not missed.
         selected_files = await select_files_by_neural_embedding(
             repo_name,
             repo_path,
@@ -1052,6 +1094,17 @@ async def _select_relevant_files(
         selected_files = []
         log_info(f"Using static repo fingerprint for {repo_name} via one-shot retrieval.")
     elif args.retrieval_strategy == "one_shot_fingerprint_budgeted":
+        # TODO: Separate path tokens from content tokens so filenames, directories, and
+        #       extensions can be weighted explicitly instead of being mixed into one BM25 field.
+
+        # TODO: Improve tokenization for code/repository text, including "-", "_", ".",
+        #       "/", camelCase, package names, config keys, and exact identifiers.
+
+        # TODO: Review the fixed filename boosts because constants like 2.5 can dominate
+        #       BM25 scores, especially for short queries.
+
+        # TODO: Add a better fallback ranking when no BM25 score is positive, prioritizing
+        #       high-signal filenames instead of returning the raw candidate order.
         _budgeted_files = select_files_by_bm25_budgeted(
             repo_path, build_bm25_query_terms(repo_name, prior_failure_terms)
         )

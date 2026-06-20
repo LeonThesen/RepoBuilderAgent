@@ -124,8 +124,10 @@ def _profile_directives(profile: dict) -> str:
     )
 
     output_mode = str(factors.get("output_format_mode", "structured"))
-    if output_mode in {"strict", "structured"}:
-        output_line = "Strictly follow the requested output format."
+    if output_mode == "strict":
+        output_line = "Strictly follow the requested output format with no deviation."
+    elif output_mode == "structured":
+        output_line = "Return well-structured output that follows the requested schema and field order."
     else:
         output_line = "Use readable free-form output while preserving required fields."
 
