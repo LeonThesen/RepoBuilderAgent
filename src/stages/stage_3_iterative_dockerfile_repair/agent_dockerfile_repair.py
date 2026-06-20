@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import xxhash
 import yaml
 from openai import APIError, APITimeoutError, AsyncOpenAI
 from tqdm import tqdm
@@ -849,25 +850,24 @@ async def measure_binary_in_image(
         ratio = result["measured_size_bytes"] / gt_size_bytes
         result["binary_size_plausible"] = 0.5 <= ratio <= 2.0
 
-    # Measure xxh64 hash if GT stores one (informational only)
+    # Measure the xxh64 hash on the HOST: the slim image has no xxhsum, so stream the file
+    # out with `cat` and hash it locally. GT digests are stored as `xxh64:<hex>`.
     if gt_digest and gt_digest.startswith("xxh64:"):
-        hash_cmd = [
+        cat_cmd = [
             args.container_cli, "run", "--rm",
             "--entrypoint", "/bin/sh",
-            image_tag, "-c",
-            f"xxhsum -H64 {shlex.quote(abs_path)} 2>/dev/null | cut -d' ' -f1",
+            image_tag, "-c", f"cat {shlex.quote(abs_path)}",
         ]
         try:
             proc = await asyncio.create_subprocess_exec(
-                *hash_cmd,
+                *cat_cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if proc.returncode == 0:
-                measured_hex = stdout.decode("utf-8", errors="replace").strip().lower()
-                if measured_hex:
-                    result["binary_hash_match"] = (f"xxh64:{measured_hex}" == gt_digest.lower())
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode == 0 and stdout:
+                measured_hex = xxhash.xxh64(stdout).hexdigest().lower()
+                result["binary_hash_match"] = (f"xxh64:{measured_hex}" == gt_digest.lower())
         except Exception:
             pass
 

@@ -540,8 +540,36 @@ def compute_repo_metrics(
             succ = next((a for a in attempts if a.get("attempt") == successful_attempt), None)
             if succ:
                 image_size_bytes = succ.get("image_size_bytes")
+
+        # Tiered verification (TODO 1): split the formerly-conflated build_success into
+        # distinct, separately-reportable tiers.
+        #   build_ok    — the image built (docker build exit 0), regardless of verify.
+        #   soft_verify — the verify command (GT-preferred, else generated) exited 0.
+        #   hard_verify — soft_verify AND the produced artifact's hash matched the GT digest.
+        #                 None = inconclusive (no GT artifact/hash available — see TODO 28).
+        build_ok = any(a.get("exit_code") == 0 for a in attempts)
+        soft_verify = verify_passed
+        hash_match = binary_metrics_raw.get("binary_hash_match")  # True / False / None
+        if not soft_verify:
+            hard_verify: Optional[bool] = False
+        elif hash_match is True:
+            hard_verify = True
+        elif hash_match is False:
+            hard_verify = False
+        else:
+            hard_verify = None  # no usable GT artifact hash yet
+        # Per-artifact match rate. Single key artifact today; becomes matched/total once
+        # multi-artifact hashing lands. None when no artifact was hashable.
+        artifact_match_rate = (
+            None if hash_match is None else (1.0 if hash_match else 0.0)
+        )
+
         repair_metrics = {
             "build_success": build_success,
+            "build_ok": build_ok,
+            "soft_verify": soft_verify,
+            "hard_verify": hard_verify,
+            "artifact_match_rate": artifact_match_rate,
             "first_attempt_success": bool(build_success and successful_attempt == 1),
             "repair_salvaged": bool(build_success and successful_attempt is not None and successful_attempt > 1),
             "verification_passed": verify_passed,
@@ -714,6 +742,12 @@ def compute_aggregate_metrics(
     first_attempt = [r for r in results if r.get("metrics", {}).get("repair", {}).get("first_attempt_success")]
     repair_salvaged = [r for r in results if r.get("metrics", {}).get("repair", {}).get("repair_salvaged")]
     verify_passed = [r for r in results if r.get("metrics", {}).get("repair", {}).get("verification_passed")]
+    # Tiered verification (TODO 1): build_ok and soft_verify span all repos; hard_verify is
+    # rated only over repos where it was conclusive (a GT artifact hash was available).
+    build_ok = [r for r in results if r.get("metrics", {}).get("repair", {}).get("build_ok")]
+    soft_verify = [r for r in results if r.get("metrics", {}).get("repair", {}).get("soft_verify")]
+    hard_applicable = [r for r in results if r.get("metrics", {}).get("repair", {}).get("hard_verify") is not None]
+    hard_pass = [r for r in hard_applicable if r["metrics"]["repair"]["hard_verify"] is True]
     # binary_size_plausible: only count repos where GT binary info was available (not None)
     binary_plausible_applicable = [r for r in results if r.get("metrics", {}).get("repair", {}).get("binary_size_plausible") is not None]
     binary_plausible_pass = [r for r in binary_plausible_applicable if r["metrics"]["repair"]["binary_size_plausible"] is True]
@@ -819,6 +853,10 @@ def compute_aggregate_metrics(
         "total_repos": total,
         "pipeline_completed_rate": round(len(completed_pipelines) / total, 4),
         "build_success_rate": round(len(build_success) / total, 4),
+        "build_ok_rate": round(len(build_ok) / total, 4),
+        "soft_verify_rate": round(len(soft_verify) / total, 4),
+        "hard_verify_rate": round(len(hard_pass) / len(hard_applicable), 4) if hard_applicable else None,
+        "hard_verify_applicable": len(hard_applicable),
         "first_attempt_success_rate": round(len(first_attempt) / total, 4),
         "repair_salvage_rate": round(len(repair_salvaged) / total, 4),
         "verification_pass_rate": round(len(verify_passed) / total, 4),
