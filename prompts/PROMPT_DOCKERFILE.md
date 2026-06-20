@@ -21,8 +21,12 @@ Your task is to:
      steps). Do NOT write bare shell lines.** Keep the two marker lines verbatim — they are parsed
      for evaluation; never rename, move, or duplicate them. These run as the non-root user with
      sudo available:
-       - System packages / privileged steps: prefix the command with `sudo`, e.g.
+       - System packages / privileged steps: prefix EVERY privileged command with `sudo`, e.g.
          `RUN sudo apt-get update && sudo apt-get install -y <pkgs>` or `RUN sudo make install`.
+         This includes cleanup/file ops on system paths — `rm`, `mv`, writes under `/var`, `/usr`,
+         `/etc` all need `sudo` too (e.g. `&& sudo rm -rf /var/lib/apt/lists/*`). A non-sudo command
+         touching a root-owned path fails with `Permission denied`. Apt-list cleanup is optional; if
+         you do it, `sudo` it.
        - Build commands: no sudo, e.g. `RUN cargo build --release`, `RUN make`, `RUN npm run build`.
        - Language toolchains: prefer `RUN sudo apt-get install -y <toolchain>` (e.g. `cargo`/`rustc`).
          If you use a home-dir installer like rustup, run it WITHOUT sudo so it installs into your
