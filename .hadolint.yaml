@@ -1,0 +1,6 @@
+failure-threshold: error
+ignored:
+  - DL3008  # apt: pin versions — too strict for cross-repo generation
+  - DL3009  # apt: delete lists — base already cleans /var/lib/apt/lists
+  - DL4006  # SHELL -o pipefail — not relevant to generated single-RUN builds
+  - DL3004  # sudo — intentional: the build runs as a non-root user with passwordless sudo

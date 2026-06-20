@@ -6,25 +6,33 @@ DO NOT start from scratch. Use the provided base template as the starting point.
 The base template already includes:
   - Debian forky-slim base image
   - CA certificate bootstrap (including MANUALREPOS_CA_CERT_B64 decoding)
-  - Standard build toolchain for the ecosystem (e.g., build-essential for C/C++, Python for Python projects)
-  - Non-root user (manualrepos) with working directory set to /home/manualrepos/repo
+  - A base toolchain (build-essential, git, curl, pkg-config) and a `COPY . .` of the repo
+  - A non-root build user (manualrepos) with passwordless sudo, like a normal dev box: everything
+    you write runs as this user. Use `sudo` for system installs and privileged steps; run build
+    commands without sudo. You do not manage users.
 
 Your task is to:
-  1. Keep the base template structure intact (DO NOT remove or modify CA bootstrap, user setup, or COPY statement).
-  2. The base template already has a `COPY . .` statement that copies the repository from the build context. Do NOT add git clone or wget commands to download the repo.
-  3. Replace only the [PLACEHOLDER: ...] comments with repo-specific steps:
-     - Language/ecosystem-specific dependency installation (pip install, npm ci, cargo fetch, mvn install, etc.)
-     - Repo-specific build commands (make, cmake, npm run build, cargo build, maven goals, etc.)
-     - Final CMD or ENTRYPOINT if the repo is an application
-     - **Keep the `# AGENT_BUILD_STEPS_BEGIN` and `# AGENT_BUILD_STEPS_END` marker lines verbatim, and place ALL repo-specific build RUN commands (the project compile/build, not dependency installation) strictly between them.** These markers are parsed for evaluation; never rename, remove, duplicate, or move them. Dependency/toolchain installation stays above the BEGIN marker.
-  3. Add any additional system packages needed for THIS specific repo (if not already in base template).
+  1. Edit ONLY the two placeholder regions below; leave every other line unchanged. Never add,
+     move, or remove a `USER` directive, and never modify the CA bootstrap, user setup, or
+     `COPY . .` (it already copies the repo — do NOT git clone or wget it).
+  2. Between the `# AGENT_BUILD_STEPS_BEGIN` and `# AGENT_BUILD_STEPS_END` marker lines: put ALL
+     dependency/toolchain installs AND build commands. Keep the two marker lines verbatim — they
+     are parsed for evaluation; never rename, move, or duplicate them. These run as the non-root
+     user with sudo available:
+       - System packages / privileged steps: prefix with `sudo` (e.g. `sudo apt-get update && sudo apt-get install -y <pkgs>`, `sudo make install`).
+       - Build commands: run WITHOUT sudo (e.g. `cargo build --release`, `make`, `npm run build`).
+       - Language toolchains: prefer `sudo apt-get install -y` (e.g. `cargo`/`rustc`). If you use a
+         home-dir installer like rustup, run it WITHOUT sudo so it installs into your home and stays
+         on PATH — never `sudo` rustup (that puts it in root's home and the non-root build can't reach it).
+  3. Fill the runtime CMD/ENTRYPOINT placeholder (after the END marker) if the repo is an
+     application (omit for a library).
   4. Follow these additional guidelines:
-     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `apt-get install -y` up front (run `apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim — prefer UNVERSIONED toolchain packages (build-essential, gcc, g++, clang) over version-pinned names like `gcc-11` that may not exist in forky; install `gnupg`+`ca-certificates` before any `gpg`/key step.
+     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `sudo apt-get install -y` up front (run `sudo apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim — prefer UNVERSIONED toolchain packages (build-essential, gcc, g++, clang) over version-pinned names like `gcc-11` that may not exist in forky; install `gnupg`+`ca-certificates` before any `gpg`/key step.
      - Be conservative. Only include commands and dependencies supported by provided evidence.
      - Do not use insecure TLS bypasses (curl -k, strict-ssl=false) unless explicitly required.
      - Never bake secrets into the image; use comments for unclear values.
-     - Prefer multi-stage builds for large artifact reduction (C++, Rust, Node, Java).
-     - Keep layers cache-friendly by copying dependency manifests before source trees.
+     - Keep a single build stage; do not introduce multi-stage builds (they break the fixed
+       user/marker structure).
       - Prefer multicore/parallel build execution when supported (e.g., `make -j$(nproc)`, `cmake --build . --parallel $(nproc)`, `cargo build -j $(nproc)`, `mvn -T 1C`, `gradle --parallel`) while keeping builds deterministic.
       - Prefer build commands that skip documentation generation/build (e.g., avoid `javadoc`, `dokka`, `antora`, site/docs aggregate tasks) unless docs are explicitly required for the main artifact.
      - If the startup command is unclear, leave a comment and omit/comment out the CMD.

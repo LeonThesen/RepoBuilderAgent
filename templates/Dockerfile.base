@@ -3,6 +3,9 @@
 
 FROM debian:forky-slim
 
+# Non-interactive apt so `sudo apt-get install` never blocks on a prompt.
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Make builds (as) reproducible (as possible)
 ENV SOURCE_DATE_EPOCH=0
 ENV CARGO_INCREMENTAL=0
@@ -19,26 +22,35 @@ RUN if [ -n "$MANUALREPOS_CA_CERT_B64" ]; then \
       update-ca-certificates; \
     fi
 
-# Install default packages
+# Install default packages (incl. sudo, so the build user can install system packages).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     curl \
     pkg-config \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -s /bin/bash manualrepos
+# Non-root build user with passwordless sudo, so the build feels like a normal dev
+# environment: build commands run as this user; use `sudo` for system package installs
+# (`sudo apt-get install ...`) or privileged steps (`sudo make install`). The repo
+# directory is owned by the user so the build can write artifacts into it.
+RUN useradd -m -s /bin/bash manualrepos \
+    && mkdir -p /home/manualrepos/repo \
+    && chown manualrepos:manualrepos /home/manualrepos/repo \
+    && echo 'manualrepos ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/manualrepos \
+    && chmod 0440 /etc/sudoers.d/manualrepos
+USER manualrepos
 WORKDIR /home/manualrepos/repo
 
 # Copy repository from build context (already checked out on host)
-COPY . .
-RUN chown -R manualrepos:manualrepos /home/manualrepos/repo
+COPY --chown=manualrepos:manualrepos . .
 
-# Build instructions
+# Dependency installs + build commands go here. They run as the non-root user, which
+# has passwordless sudo. Edit only between the markers.
 # AGENT_BUILD_STEPS_BEGIN
-# [PLACEHOLDER: Repo-specific build commands (make, cmake, autoreconf, etc.)]
+# [PLACEHOLDER: e.g. sudo apt-get update && sudo apt-get install -y <pkgs>; cargo build --release]
 # AGENT_BUILD_STEPS_END
 
-# Final CMD or ENTRYPOINT
+# Final CMD or ENTRYPOINT (runs as manualrepos)
 # [PLACEHOLDER: Binary path or entry point]
