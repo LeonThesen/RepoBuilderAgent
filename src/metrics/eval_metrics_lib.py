@@ -34,6 +34,7 @@ _COMPARABLE_FIELDS: list[tuple[str, str]] = [
     ("programming_language", "set"),
     ("build_tool",           "set"),
     ("system_dependencies",  "set"),
+    ("packages",             "apt_packages"),
     ("build_steps",          "set"),
     ("verification",         "set"),
     ("installation_strategy","exact"),
@@ -91,6 +92,77 @@ def _normalise_list(value) -> set[str]:
         # e.g. language_version: {C: unknown} → {"c"}
         return {k.lower() for k in value}
     return set()
+
+
+def _normalise_apt_packages(value) -> set[str]:
+    """Extract apt package names from a ground-truth ``packages`` list.
+
+    Dataset entries are ``name:manager`` strings (e.g. ``cmake:apt``,
+    ``python3-pip:apt``). Keep only apt-managed packages (and bare names with no
+    manager suffix, treated as system packages) so the set lines up with what the
+    Dockerfile actually installs via apt-get/apk. Returns lowercase names.
+    """
+    if value is None:
+        return set()
+    items = value if isinstance(value, list) else [value]
+    names: set[str] = set()
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("name") or (next(iter(item.values()), "") if item else "")
+        text = str(item).strip().lower()
+        if not text:
+            continue
+        if ":" in text:
+            name, manager = text.rsplit(":", 1)
+            if manager not in ("apt", ""):
+                continue
+            text = name.strip()
+        if text:
+            names.add(text)
+    return names
+
+
+# Generic Docker base-image → provided-toolchain map. Keyed on language/toolchain
+# images only (NOT repo names) — a `rust:` image ships rustc+cargo, a `node:` image
+# ships nodejs+npm, etc. Used to subtract base-provided packages so the apt metric
+# scores only the EXTRA system packages a build must install on top of its base.
+# Each entry: (base-image-name regex, [provided package-name regexes]).
+_BASE_IMAGE_PROVIDES: list[tuple[str, list[str]]] = [
+    (r"(^|/)rust(:|$)",                       [r"^rustc$", r"^cargo$"]),
+    (r"(^|/)node(:|$)",                       [r"^nodejs$", r"^node$", r"^npm$", r"^yarn$"]),
+    (r"(^|/)python(:|$)",                     [r"^python3?$", r"^python3-pip$", r"^pip3?$",
+                                              r"^python3-venv$", r"^python3-dev$"]),
+    (r"(^|/)golang(:|$)|(^|/)go(:|$)",        [r"^golang.*$", r"^go$"]),
+    (r"(^|/)gcc(:|$)|buildpack-deps",         [r"^gcc$", r"^g\+\+$", r"^build-essential$"]),
+    # JDK/JRE-bearing bases (incl. maven/gradle images, which are JDK-based)
+    (r"eclipse-temurin|openjdk|amazoncorretto|(^|/)maven(:|$)|(^|/)gradle(:|$)",
+     [r"^openjdk-\d+-(jdk|jre)(-headless)?$", r"^default-(jdk|jre)(-headless)?$", r"^java$"]),
+    (r"(^|/)maven(:|$)",                      [r"^maven$"]),
+    (r"(^|/)gradle(:|$)",                     [r"^gradle$"]),
+]
+
+
+def base_provided_matchers(base_images: list[str]) -> list:
+    """Compiled package-name regexes for toolchains the given base images provide.
+
+    A GT/installed apt package is "base-provided" (and so excluded from the extras
+    comparison) if its name matches any returned matcher. Unions across every FROM
+    stage so a toolchain provided by any stage is credited.
+    """
+    matchers = []
+    for image in base_images:
+        img = (image or "").lower()
+        for image_re, pkg_res in _BASE_IMAGE_PROVIDES:
+            if re.search(image_re, img):
+                matchers.extend(re.compile(p) for p in pkg_res)
+    return matchers
+
+
+def _drop_base_provided(packages: set[str], matchers: list) -> set[str]:
+    """Remove packages a base image already provides, leaving only extras."""
+    if not matchers:
+        return set(packages)
+    return {p for p in packages if not any(m.match(p) for m in matchers)}
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -211,19 +283,23 @@ def observe_dockerfile(workspace_root: Path, repo_url: str, dockerfiles_dir: str
 
     lines = content.splitlines()
 
-    # FROM line
-    from_line = next((l.strip() for l in lines if l.strip().upper().startswith("FROM ")), "")
-    parts = from_line.split()
-    base_image = parts[1] if len(parts) >= 2 else ""
+    # FROM lines (multi-stage: keep every base image; first is the primary)
+    from_lines = [l.strip() for l in lines if l.strip().upper().startswith("FROM ")]
+    base_images = [p.split()[1] for p in from_lines if len(p.split()) >= 2]
+    base_image = base_images[0] if base_images else ""
 
-    # System packages from apt-get install lines
+    # System packages from apt-get install / apk add lines. Collapse shell
+    # line-continuations (``\`` + newline) into one logical line first, then capture
+    # each install's argument run up to the next command boundary (``&&``/``;``/
+    # newline). This catches single-line, ``;``-terminated, and multi-line installs
+    # alike; arguments beginning with ``-`` (flags) are dropped below.
     apt_packages: list[str] = []
-    _apt_re = re.compile(r"apt(?:-get)?\s+install\s+(?:-[^\s]+\s+)*(.+?)(?:\\|$)", re.I)
-    _apk_re = re.compile(r"apk\s+add\s+(?:--[^\s]+\s+)*(.+?)(?:\\|$)", re.I)
-    full_text = content
-    for m in _apt_re.finditer(full_text):
+    joined = re.sub(r"\\\s*\n", " ", content)
+    _apt_re = re.compile(r"apt(?:-get)?\s+install\s+([^\n;]*?)(?:&&|;|\n|$)", re.I)
+    _apk_re = re.compile(r"apk\s+add\s+([^\n;]*?)(?:&&|;|\n|$)", re.I)
+    for m in _apt_re.finditer(joined):
         apt_packages.extend(t for t in m.group(1).split() if not t.startswith("-"))
-    for m in _apk_re.finditer(full_text):
+    for m in _apk_re.finditer(joined):
         apt_packages.extend(t for t in m.group(1).split() if not t.startswith("-"))
     apt_packages = sorted({p.lower().rstrip("\\") for p in apt_packages if p.strip()})
 
@@ -252,6 +328,7 @@ def observe_dockerfile(workspace_root: Path, repo_url: str, dockerfiles_dir: str
 
     return {
         "base_image": base_image,
+        "base_images": base_images,
         "system_packages_installed": apt_packages,
         "build_run_commands": build_run_commands,
     }
@@ -315,6 +392,35 @@ def compare_with_ground_truth(
                 "only_in_gt": sorted(gt_set - pred_set),
                 "only_in_pred": sorted(pred_set - gt_set),
                 "jaccard": score,
+            }
+        elif mode == "apt_packages":
+            # EXTRAS-ONLY apt comparison. The GT package list mixes base-provided
+            # toolchains (rustc, nodejs, python3 — shipped by the chosen base image)
+            # with extra system packages a build must apt-install on top. Subtract
+            # base-provided from BOTH sides and score only the extras: did the agent
+            # apt-install the extra system packages the build actually needs?
+            matchers = base_provided_matchers(observed.get("base_images", []))
+            gt_all = _normalise_apt_packages(gt_val)
+            installed_all = {p.lower() for p in observed.get("system_packages_installed", [])}
+            gt_extra = _drop_base_provided(gt_all, matchers)
+            installed_extra = _drop_base_provided(installed_all, matchers)
+            inter = gt_extra & installed_extra
+            # recall/precision/jaccard only defined when there ARE extras to score;
+            # a build fully covered by its base image yields recall=None (n/a).
+            recall = round(len(inter) / len(gt_extra), 4) if gt_extra else None
+            precision = round(len(inter) / len(installed_extra), 4) if (gt_extra and installed_extra) else None
+            score = _jaccard(gt_extra, installed_extra) if gt_extra else None
+            field_scores[field] = {
+                "mode": "apt_packages",
+                "ground_truth": sorted(gt_extra),       # GT extras (base-provided removed)
+                "installed": sorted(installed_extra),   # installed extras
+                "base_provided_excluded": sorted((gt_all - gt_extra) | (installed_all - installed_extra)),
+                "intersection": sorted(inter),
+                "missing": sorted(gt_extra - installed_extra),    # needed extras NOT installed
+                "extra": sorted(installed_extra - gt_extra),      # installed but not in GT extras
+                "jaccard": score,
+                "recall": recall,
+                "precision": precision,
             }
         else:  # exact
             gt_str = _normalise_str(gt_val)
@@ -1053,7 +1159,12 @@ def _aggregate_gt_scores(results: list[dict]) -> dict:
         and r["metrics"]["ground_truth_comparison"].get("overall_score") is not None
     ]
     if not overall_scores:
-        return {"available": 0, "mean_overall_score": None, "per_field": {}}
+        return {
+            "available": 0,
+            "mean_overall_score": None,
+            "per_field": {},
+            "apt_packages": {"available": 0, "mean_recall": None, "mean_precision": None},
+        }
 
     # Per-field means
     field_accum: dict[str, list[float]] = defaultdict(list)
@@ -1062,7 +1173,8 @@ def _aggregate_gt_scores(results: list[dict]) -> dict:
         if not gt:
             continue
         for field, info in gt.get("field_scores", {}).items():
-            score = info.get("jaccard") if info.get("mode") == "set" else info.get("score")
+            # set + apt_packages modes carry "jaccard"; exact carries "score".
+            score = info.get("jaccard", info.get("score"))
             if score is not None:
                 field_accum[field].append(score)
 
@@ -1071,10 +1183,33 @@ def _aggregate_gt_scores(results: list[dict]) -> dict:
         for field, scores in sorted(field_accum.items())
     }
 
+    # Headline apt-package install fidelity: did the agent install the apt packages
+    # the ground truth requires (recall) without spraying extras (precision)?
+    apt_recall = [
+        info["recall"]
+        for r in results
+        if (gt := r.get("metrics", {}).get("ground_truth_comparison"))
+        for info in [gt.get("field_scores", {}).get("packages", {})]
+        if info.get("recall") is not None
+    ]
+    apt_precision = [
+        info["precision"]
+        for r in results
+        if (gt := r.get("metrics", {}).get("ground_truth_comparison"))
+        for info in [gt.get("field_scores", {}).get("packages", {})]
+        if info.get("precision") is not None
+    ]
+    apt_packages = {
+        "available": len(apt_recall),
+        "mean_recall": round(sum(apt_recall) / len(apt_recall), 4) if apt_recall else None,
+        "mean_precision": round(sum(apt_precision) / len(apt_precision), 4) if apt_precision else None,
+    }
+
     return {
         "available": len(overall_scores),
         "mean_overall_score": round(sum(overall_scores) / len(overall_scores), 4),
         "per_field_mean": per_field,
+        "apt_packages": apt_packages,
     }
 
 
