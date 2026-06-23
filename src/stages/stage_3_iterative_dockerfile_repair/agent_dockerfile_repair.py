@@ -42,6 +42,8 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        clamp_summary_in_prompt,
+        DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
         load_shared_repository_state,
         load_repo_urls,
@@ -87,6 +89,8 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        clamp_summary_in_prompt,
+        DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
         load_shared_repository_state,
         load_repo_urls,
@@ -227,6 +231,12 @@ parser.add_argument(
     "so it can inspect the source it is fixing. Building/verifying stays deterministic in the outer loop.",
 )
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
+parser.add_argument(
+    "--max-input-tokens",
+    type=int,
+    default=DEFAULT_MAX_INPUT_TOKENS,
+    help="Hard input-token cap for the repair prompt; the repository summary is trimmed to fit (endpoint-specific, e.g. 64000 for gpt-4o).",
+)
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
@@ -962,6 +972,10 @@ async def request_repair(
             )
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
+
+    prompt = clamp_summary_in_prompt(
+        prompt, summary, args.max_input_tokens, model=args.model, phase=f"repair attempt {attempt_number}"
+    )
 
     repo_tools = None
     if args.repair_repo_tools and repo_path is not None:

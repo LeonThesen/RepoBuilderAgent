@@ -92,6 +92,8 @@ INCLUDE_HIDDEN_DIRS = {".github", ".circleci", ".devcontainer"}
 
 MAX_TREE_DEPTH = 4
 MAX_TREE_FILES_PER_DIR = 30    # truncate busy dirs
+MAX_TREE_DIRS_PER_DIR = 40     # collapse very wide directories
+MAX_TREE_TOTAL_ENTRIES = 1000  # global node cap; stops pathological repos (e.g. airflow ~1700) overflowing the input-token budget
 MAX_FILE_SIZE = 64 * 1024      # skip files > 64 KB
 
 
@@ -146,8 +148,13 @@ def _cached_walk(root: Path, key: str, compute):
     return bucket[key]
 
 
-def build_tree(root: Path, depth: int = 0) -> list[str]:
-    if depth > MAX_TREE_DEPTH:
+def build_tree(root: Path, depth: int = 0, _state: dict | None = None) -> list[str]:
+    # _state carries a shared global-entry budget across the recursion so the
+    # whole tree is bounded, not just each directory in isolation.
+    top_level = _state is None
+    if top_level:
+        _state = {"remaining": MAX_TREE_TOTAL_ENTRIES}
+    if depth > MAX_TREE_DEPTH or _state["remaining"] <= 0:
         return []
     lines = []
     try:
@@ -158,15 +165,26 @@ def build_tree(root: Path, depth: int = 0) -> list[str]:
     dirs = [e for e in entries if e.is_dir() and not should_skip_dir(e.name)]
     files = [e for e in entries if e.is_file()]
 
-    for d in dirs:
+    for d in dirs[:MAX_TREE_DIRS_PER_DIR]:
+        if _state["remaining"] <= 0:
+            break
         lines.append("  " * depth + f"📁 {d.name}/")
-        lines.extend(build_tree(d, depth + 1))
+        _state["remaining"] -= 1
+        lines.extend(build_tree(d, depth + 1, _state))
+    if len(dirs) > MAX_TREE_DIRS_PER_DIR:
+        lines.append("  " * depth + f"📁 ... ({len(dirs) - MAX_TREE_DIRS_PER_DIR} more directories)")
 
     shown = files[:MAX_TREE_FILES_PER_DIR]
     for f in shown:
+        if _state["remaining"] <= 0:
+            break
         lines.append("  " * depth + f"  {f.name}")
+        _state["remaining"] -= 1
     if len(files) > MAX_TREE_FILES_PER_DIR:
         lines.append("  " * depth + f"  ... ({len(files) - MAX_TREE_FILES_PER_DIR} more files)")
+
+    if top_level and _state["remaining"] <= 0:
+        lines.append(f"... [directory tree capped at {MAX_TREE_TOTAL_ENTRIES} entries]")
 
     return lines
 

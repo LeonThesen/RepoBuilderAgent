@@ -25,6 +25,7 @@ try:
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload, LoopOutcome, TokenCounts, SummaryPaths
     from RepoBuilderAgent.src.core.common import (
         chat_completion_with_retries,
+        count_tokens,
         finalize_llm_metrics,
         init_llm_metrics,
         load_shared_repository_state,
@@ -59,6 +60,7 @@ except ImportError:
     from stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload, LoopOutcome, TokenCounts, SummaryPaths
     from core.common import (
         chat_completion_with_retries,
+        count_tokens,
         finalize_llm_metrics,
         init_llm_metrics,
         load_shared_repository_state,
@@ -277,14 +279,8 @@ _new_prebuilt_chat_model = make_prebuilt_chat_model_factory(
 )
 
 def estimate_tokens(string: str, model_name: str) -> int:
-    """Returns the number of tokens in a text string."""
-
-    try:
-        encoding = tiktoken.encoding_for_model(model_name)
-    except Exception:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    num_tokens = len(encoding.encode(string))
-    return num_tokens
+    """Returns the number of tokens in a text string (shared exact counter)."""
+    return count_tokens(string, model_name)
 
 
 def _truncate_to_token_budget(text: str, model_name: str, max_tokens: int, *, label: str = "content") -> str:

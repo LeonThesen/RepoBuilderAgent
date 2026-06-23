@@ -29,7 +29,6 @@ try:
         load_architecture_scratchpad,
         load_shared_repository_state,
         load_repo_urls,
-        load_summary,
         prompt_path,
         set_prompt_length_mode,
         read_yaml_file,
@@ -62,7 +61,6 @@ except ImportError:
         load_architecture_scratchpad,
         load_shared_repository_state,
         load_repo_urls,
-        load_summary,
         prompt_path,
         set_prompt_length_mode,
         read_yaml_file,
@@ -211,7 +209,6 @@ async def generate_install_guide(
             if not await ensure_repo_checkout(repo_url, repo_path, "skipping install guide generation"):
                 return
 
-            summary = load_summary(repo_name, repo_path, summaries_dir)
             architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
             shared_repository_state = load_shared_repository_state(repo_name, summaries_dir)
             validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
@@ -222,7 +219,6 @@ async def generate_install_guide(
             prompt = (
                 PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
                 .replace("{{CLASSIFICATION_RESULT}}", render_yaml(classification))
-                .replace("{{SUMMARY_CONTENT}}", summary)
                 .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
                 .replace("{{VERIFY_COMMAND}}", verify_command)
             )

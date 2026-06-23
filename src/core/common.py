@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
 import os
 import subprocess
@@ -401,6 +402,128 @@ def load_summary(repo_name: str, repo_path: Path, summaries_dir: Path) -> str:
         include_tree=True,
         context="summary-baseline",
     )
+
+
+# ---------------------------------------------------------------------------
+# Input-token bounding
+#
+# The model endpoint enforces a hard input-token cap (e.g. 64000 for gpt-4o).
+# The repository summary — dominated by the directory tree for large repos —
+# is the one unbounded part of every stage prompt, so a giant repo (airflow:
+# ~1700 tree entries) overflows the cap and the call 400s. These helpers bound
+# the summary so no prompt can exceed the cap, trimming the lowest-value part
+# (the tree) first and logging every cut (no silent truncation).
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_INPUT_TOKENS = 60000
+
+_TREE_HEADER = "## Directory structure"
+
+
+@functools.lru_cache(maxsize=8)
+def _token_encoder(model: str):
+    import tiktoken
+
+    try:
+        return tiktoken.encoding_for_model(model)
+    except KeyError:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    """Exact input-token count for ``text`` under ``model``'s encoding."""
+    if not text:
+        return 0
+    return len(_token_encoder(model).encode(text))
+
+
+def _shrink_tree_block(summary: str, budget_tokens: int, model: str) -> str:
+    """Keep the largest prefix of the directory-tree block that lets the whole
+    summary fit ``budget_tokens``; drop the rest behind an explicit marker."""
+    header_idx = summary.find(_TREE_HEADER)
+    if header_idx == -1:
+        return summary
+    fence_open = summary.find("```", header_idx)
+    if fence_open == -1:
+        return summary
+    body_start = summary.find("\n", fence_open) + 1
+    fence_close = summary.find("```", body_start)
+    if fence_close == -1:
+        return summary
+
+    tree_lines = summary[body_start:fence_close].splitlines()
+    prefix, suffix = summary[:body_start], summary[fence_close:]
+    # Reserve headroom for the fixed parts plus the "omitted" marker line so the
+    # reconstructed summary lands at or under budget (the marker is added after).
+    marker_reserve = 64
+    fixed_tokens = count_tokens(prefix + suffix, model) + marker_reserve
+
+    kept: list[str] = []
+    running = fixed_tokens
+    for line in tree_lines:
+        line_tokens = count_tokens(line + "\n", model)
+        if running + line_tokens > budget_tokens:
+            break
+        kept.append(line)
+        running += line_tokens
+
+    if len(kept) == len(tree_lines):
+        return summary
+    omitted = len(tree_lines) - len(kept)
+    marker = f"… [{omitted} of {len(tree_lines)} directory-tree entries omitted to fit the input-token budget]"
+    return prefix + "\n".join(kept + [marker]) + "\n" + suffix
+
+
+def _hard_truncate(text: str, budget_tokens: int, model: str) -> str:
+    """Last-resort token clamp: slice ``text`` to ``budget_tokens`` and mark it."""
+    enc = _token_encoder(model)
+    marker = "\n… [content truncated to fit the input-token budget]"
+    marker_tokens = count_tokens(marker, model)
+    keep = max(0, budget_tokens - marker_tokens)
+    return enc.decode(enc.encode(text)[:keep]) + marker
+
+
+def bound_summary(summary: str, budget_tokens: int, model: str = "gpt-4o") -> str:
+    """Return ``summary`` trimmed to at most ``budget_tokens``.
+
+    Trims the directory-tree block first (lowest value per token); if that is
+    not enough, hard-truncates the remainder. Warns whenever it cuts.
+    """
+    if budget_tokens <= 0:
+        log_warn(f"[token-bound] summary budget is {budget_tokens}; dropping summary content")
+        return _hard_truncate(summary, max(0, budget_tokens), model)
+    if count_tokens(summary, model) <= budget_tokens:
+        return summary
+    shrunk = _shrink_tree_block(summary, budget_tokens, model)
+    if count_tokens(shrunk, model) <= budget_tokens:
+        log_warn(f"[token-bound] directory tree trimmed to fit {budget_tokens}-token summary budget")
+        return shrunk
+    log_warn(f"[token-bound] summary still over {budget_tokens} tokens after tree trim; hard-truncating")
+    return _hard_truncate(shrunk, budget_tokens, model)
+
+
+def clamp_summary_in_prompt(
+    prompt: str,
+    summary: str,
+    max_input_tokens: int,
+    model: str = "gpt-4o",
+    *,
+    phase: str = "",
+) -> str:
+    """Final guard: if ``prompt`` exceeds ``max_input_tokens``, trim the embedded
+    ``summary`` (the one unbounded region) just enough to fit. No-op when under."""
+    total = count_tokens(prompt, model)
+    if total <= max_input_tokens:
+        return prompt
+    summary_tokens = count_tokens(summary, model)
+    budget = max_input_tokens - (total - summary_tokens)
+    bounded = bound_summary(summary, budget, model)
+    label = f"[token-bound]{(' ' + phase) if phase else ''}"
+    log_warn(
+        f"{label}: prompt {total} > cap {max_input_tokens}; "
+        f"summary {summary_tokens} -> {count_tokens(bounded, model)} tokens"
+    )
+    return prompt.replace(summary, bounded, 1)
 
 
 def load_architecture_scratchpad(repo_name: str, summaries_dir: Path) -> dict | None:

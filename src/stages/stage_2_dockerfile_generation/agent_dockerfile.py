@@ -28,6 +28,8 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        clamp_summary_in_prompt,
+        DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
         load_shared_repository_state,
         load_repo_urls,
@@ -66,6 +68,8 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        clamp_summary_in_prompt,
+        DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
         load_shared_repository_state,
         load_repo_urls,
@@ -131,6 +135,12 @@ parser.add_argument("--results-dir", default="classification_results", help="Dir
 parser.add_argument("--summaries-dir", default="summaries", help="Directory containing repository summary files")
 parser.add_argument("--repos-dir", default="repos", help="Directory containing cloned repositories")
 parser.add_argument("--output-dir", default="dockerfiles", help="Directory where generated Dockerfiles will be written")
+parser.add_argument(
+    "--max-input-tokens",
+    type=int,
+    default=DEFAULT_MAX_INPUT_TOKENS,
+    help="Hard input-token cap for the generation prompt; the repository summary is trimmed to fit (endpoint-specific, e.g. 64000 for gpt-4o).",
+)
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
@@ -385,6 +395,10 @@ async def generate_dockerfile(
                 if failed_lint_attempts:
                     prompt += render_failed_lint_attempts(failed_lint_attempts)
                     prompt += render_repeated_lint_guardrail(failed_lint_attempts)
+
+                prompt = clamp_summary_in_prompt(
+                    prompt, summary, args.max_input_tokens, model=args.model, phase=f"dockerfile lint attempt {lint_attempt}"
+                )
 
                 log_info(f"Generating Dockerfile for {repo_url} (lint attempt {lint_attempt})...")
                 response = await chat_completion_with_retries(

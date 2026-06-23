@@ -9,7 +9,7 @@ from pathlib import Path
 
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state, ensure_repo_checkout, build_initial_user_request, resolve_repo_checkout_dir
+    from RepoBuilderAgent.src.core.common import upsert_shared_repository_state, ensure_repo_checkout, build_initial_user_request, resolve_repo_checkout_dir, DEFAULT_MAX_INPUT_TOKENS
     from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
@@ -24,7 +24,7 @@ try:
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
-    from core.common import upsert_shared_repository_state, build_initial_user_request, resolve_repo_checkout_dir
+    from core.common import upsert_shared_repository_state, build_initial_user_request, resolve_repo_checkout_dir, DEFAULT_MAX_INPUT_TOKENS
     from core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from metrics.eval_metrics_lib import load_gt_for_repo
     from core.log_utils import log_error, log_info, set_dump_prompts_dir, set_trace_enabled
@@ -103,6 +103,7 @@ parser.add_argument("--analysis-dir", default="analysis", help="Directory where 
 parser.add_argument("--container-cli", default="docker", help="Container CLI to use for repair builds")
 parser.add_argument("--max-attempts", type=int, default=5, help="Maximum number of repair attempts per repository")
 parser.add_argument("--max-log-chars", type=int, default=24000, help="Maximum number of build log characters to send to the repair model")
+parser.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS, help="Hard input-token cap for generation/repair prompts; the repository summary is trimmed to fit (endpoint-specific, e.g. 64000 for gpt-4o)")
 parser.add_argument("--skip-hadolint", action="store_true", help="Skip Dockerfile syntax validation via hadolint before docker build")
 parser.add_argument("--verify-command", default="echo build-ok", help="Shell command executed inside built images to verify the build produced working software")
 parser.add_argument("--verify-timeout", type=int, default=int(TIMEOUTS["verify_timeout"]), help="Timeout in seconds for build verification container execution")
@@ -890,6 +891,7 @@ def build_dockerfile_command(python_executable: str, script_path: Path) -> list[
         "--summaries-dir", args.summaries_dir,
         "--repos-dir", args.repos_dir,
         "--output-dir", args.dockerfiles_dir,
+        "--max-input-tokens", str(args.max_input_tokens),
     ])
     return command
 
@@ -907,6 +909,7 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
         "--container-cli", args.container_cli,
         "--max-attempts", str(args.max_attempts),
         "--max-log-chars", str(args.max_log_chars),
+        "--max-input-tokens", str(args.max_input_tokens),
     ])
     if args.skip_hadolint:
         command.append("--skip-hadolint")

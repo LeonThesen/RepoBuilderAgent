@@ -13,10 +13,6 @@ Expert build/install engineer. Write a concise INSTALL.md for a human developer:
 {{CLASSIFICATION_RESULT}}
 </classification_result>
 
-<repository_summary>
-{{SUMMARY_CONTENT}}
-</repository_summary>
-
 <dockerfile>
 {{DOCKERFILE_CONTENT}}
 </dockerfile>
