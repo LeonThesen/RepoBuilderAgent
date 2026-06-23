@@ -1471,12 +1471,20 @@ async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, 
             with open(selected_files_path, "w") as f:
                 yaml.dump({"retrieval_strategy": args.retrieval_strategy, "selected_files": selected_files}, f, sort_keys=False, allow_unicode=True)
 
-            exploration_artifact = _build_exploration_artifact(
-                repo_url=repo_url,
-                retrieval_strategy=args.retrieval_strategy,
-                selected_files=selected_files,
-                react_trace=react_trace,
-                react_stop_reason=react_stop_reason,
+            # Architecture components run only when the active variant enables them;
+            # a disabled component must neither execute nor be wired in (not merely
+            # have its output suppressed).
+            arch_loop_active = args.synthesis_enabled or args.validation_enabled
+            exploration_artifact = (
+                _build_exploration_artifact(
+                    repo_url=repo_url,
+                    retrieval_strategy=args.retrieval_strategy,
+                    selected_files=selected_files,
+                    react_trace=react_trace,
+                    react_stop_reason=react_stop_reason,
+                )
+                if args.exploration_enabled
+                else {}
             )
             exploration_path = None
             if args.exploration_enabled:
@@ -1501,62 +1509,72 @@ async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, 
             log_info(f"Selected files list saved at {selected_files_path}")
             log_info(f"Generated selected-files summary at {summary_path}")
 
-            file_context_by_path = _build_file_context_by_path(repo_path)
-            _l1_escalation_count = 0
             _graph_selected_files = selected_files
             _graph_summary = summary
-            while True:
-                (
-                    synthesis_artifact,
-                    synthesis_loop_trace,
-                    synthesis_stop_reason,
-                    validation_artifact,
-                    validation_loop_trace,
-                    validation_stop_reason,
-                ) = await _run_architecture_state_graph(
-                    repo_url=repo_url,
-                    repo_name=repo_name,
-                    repo_path=repo_path,
-                    summary=_graph_summary,
-                    selected_files=_graph_selected_files,
-                    exploration_artifact=exploration_artifact,
-                    file_context_by_path=file_context_by_path,
-                    llm_metrics=llm_metrics,
-                )
-                # L2→L1 escalation: re-run L1 with doubled steps when L2 found no stack signals.
-                # Only triggers for iterative_react strategy (others have no L1 to re-run).
-                if (
-                    synthesis_artifact.get("stack_unknown")
-                    and _l1_escalation_count < 1
-                    and args.retrieval_strategy == "iterative_react"
-                ):
-                    _l1_escalation_count += 1
-                    log_info(
-                        f"Stack unknown for {repo_name} — escalating to L1 re-run "
-                        f"(attempt {_l1_escalation_count}, react_max_steps={args.react_max_steps * 2})."
+            if arch_loop_active:
+                file_context_by_path = _build_file_context_by_path(repo_path)
+                _l1_escalation_count = 0
+                while True:
+                    (
+                        synthesis_artifact,
+                        synthesis_loop_trace,
+                        synthesis_stop_reason,
+                        validation_artifact,
+                        validation_loop_trace,
+                        validation_stop_reason,
+                    ) = await _run_architecture_state_graph(
+                        repo_url=repo_url,
+                        repo_name=repo_name,
+                        repo_path=repo_path,
+                        summary=_graph_summary,
+                        selected_files=_graph_selected_files,
+                        exploration_artifact=exploration_artifact,
+                        file_context_by_path=file_context_by_path,
+                        llm_metrics=llm_metrics,
                     )
-                    _rerun_files, _, _, _ = await select_files_by_iterative_react(
-                        repo=RepoRef(url=repo_url, name=repo_name, path=repo_path),
-                        structure_summary=structure_summary,
-                        default_selected_files=default_selected_files,
-                        config=dataclasses.replace(
-                            _make_classify_config(),
-                            react_max_steps=args.react_max_steps * 2,
-                        ),
-                        runtime=_make_classify_runtime(),
-                        estimate_tokens=estimate_tokens,
-                    )
-                    if _rerun_files:
-                        _graph_selected_files = _rerun_files
-                        _graph_summary = fingerprint(
-                            format="md",
-                            repo_path=str(repo_path),
-                            selected_files=_graph_selected_files,
-                            include_tree=False,
-                            context="l1-escalation-step2",
+                    # L2→L1 escalation: re-run L1 with doubled steps when L2 found no stack signals.
+                    # Only triggers for iterative_react strategy (others have no L1 to re-run).
+                    if (
+                        synthesis_artifact.get("stack_unknown")
+                        and _l1_escalation_count < 1
+                        and args.retrieval_strategy == "iterative_react"
+                    ):
+                        _l1_escalation_count += 1
+                        log_info(
+                            f"Stack unknown for {repo_name} — escalating to L1 re-run "
+                            f"(attempt {_l1_escalation_count}, react_max_steps={args.react_max_steps * 2})."
                         )
-                    continue
-                break
+                        _rerun_files, _, _, _ = await select_files_by_iterative_react(
+                            repo=RepoRef(url=repo_url, name=repo_name, path=repo_path),
+                            structure_summary=structure_summary,
+                            default_selected_files=default_selected_files,
+                            config=dataclasses.replace(
+                                _make_classify_config(),
+                                react_max_steps=args.react_max_steps * 2,
+                            ),
+                            runtime=_make_classify_runtime(),
+                            estimate_tokens=estimate_tokens,
+                        )
+                        if _rerun_files:
+                            _graph_selected_files = _rerun_files
+                            _graph_summary = fingerprint(
+                                format="md",
+                                repo_path=str(repo_path),
+                                selected_files=_graph_selected_files,
+                                include_tree=False,
+                                context="l1-escalation-step2",
+                            )
+                        continue
+                    break
+            else:
+                # Baseline / retrieval / exploration variants: no L2 synthesis or
+                # L3 validation. Provide inert artifacts for the downstream writers.
+                synthesis_artifact = {}
+                synthesis_loop_trace = []
+                synthesis_stop_reason = "skipped"
+                validation_artifact = {"checks": {}, "warnings": [], "outcome_state": "skipped"}
+                validation_loop_trace = []
+                validation_stop_reason = "skipped"
             selected_files = _graph_selected_files
             summary = _graph_summary
             synthesis_path = None
