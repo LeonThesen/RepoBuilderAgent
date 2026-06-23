@@ -1491,29 +1491,14 @@ def resolve_classify_retrieval_strategy() -> str:
 
 
 def apply_stateful_contract_by_variant() -> None:
-    contract: dict[str, tuple[bool, bool]] = {
-        "flat_baseline": (False, False),
-        "exploration": (False, False),
-        "synthesis": (False, False),
-        "validation": (False, False),
-        "full_system": (False, False),
-        "ab_retrieval_bm25": (False, False),
-        "ab_retrieval_neural_embedding": (False, False),
-        "ab_retrieval_one_shot_fingerprint": (False, False),
-        "ab_retrieval_one_shot_fingerprint_budgeted": (False, False),
-        "ab_retrieval_iterative_react": (False, False),
-        "ab_prev_attempt_ctx_on": (True, False),
-        "ab_prev_attempt_ctx_off": (False, False),
-        "ab_stateful_tree_on": (True, True),
-        "ab_stateful_tree_off": (True, False),
-        "ab_snippet_tools_baseline": (False, False),
-        "ab_snippet_tools_on": (False, False),
-        "ab_snippet_tools_off": (False, False),
-    }
-    expected = contract.get(args.variant)
-    if expected is None:
-        return
-    expected_stateful, expected_tree = expected
+    """Force stateful_repair / stateful_repair_tree to the values the active variant
+    declares in variant_policy — the single source of truth — so --variant alone is
+    authoritative for the repair-feature ablation. ``prev_attempt_context_enabled``
+    is the previous-attempt (history) toggle; ``stateful_tree_enabled`` the decision
+    tree. agent_config may still override these afterwards."""
+    policy = resolve_variant_policy(args.variant)
+    expected_stateful = bool(policy.get("prev_attempt_context_enabled", False))
+    expected_tree = bool(policy.get("stateful_tree_enabled", False))
 
     if args.stateful_repair != expected_stateful or args.stateful_repair_tree != expected_tree:
         log_info(
