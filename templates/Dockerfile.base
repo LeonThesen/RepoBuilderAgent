@@ -16,6 +16,14 @@ ENV SOURCE_DATE_EPOCH=0
 ENV CARGO_INCREMENTAL=0
 ENV RUSTFLAGS="-C codegen-units=1"
 
+# Skip Playwright browser-binary downloads during `npm/pnpm install`. A repo with
+# Playwright in its dev dependency tree (e.g. vite) runs a postinstall that downloads
+# 170 MiB+ of browsers and then a launch-validation that hangs indefinitely in a
+# minimal container missing libnss3/libnspr4 — this stalled vite's build until the
+# build timeout killed it. Browsers are irrelevant to building a package, so skip them.
+# Harmless no-op for repos that do not use Playwright.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 # Install CA certificates and corporate CA if provided
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
