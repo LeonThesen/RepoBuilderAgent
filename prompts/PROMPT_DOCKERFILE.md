@@ -33,6 +33,11 @@ Your task is to:
          home and stays on PATH — never `sudo` rustup. Set PATH in the same `RUN` (e.g.
          `RUN curl ... | sh -s -- -y && . "$HOME/.cargo/env" && cargo build --release`), since each
          `RUN` is a fresh shell that does not re-source your profile.
+       - Build steps ONLY — install dependencies and build/compile the artifact. Do NOT run tests
+         or verification here (`ctest`, `make test`/`make check`, `cargo test`, `npm test`, `pytest`,
+         `go test`, etc.). The image is verified by a separate command generated downstream; a test
+         in the build steps fails the whole build on a flaky/expected test failure and runs the suite
+         twice. Stop at the build artifact.
   3. Fill the runtime CMD/ENTRYPOINT placeholder (after the END marker) if the repo is an
      application (omit for a library).
   4. Follow these additional guidelines:

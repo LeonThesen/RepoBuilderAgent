@@ -6,7 +6,6 @@ Build failed. Log (tail):
 Current AGENT_BUILD_STEPS region:
   RUN sudo apt-get update && sudo apt-get install -y gcc make && sudo rm -rf /var/lib/apt/lists/*
   RUN make all
-  RUN make test
 Root cause: missing OpenSSL development headers. Fix the smallest thing; keep build steps.
 </user>
 <assistant>
@@ -20,8 +19,6 @@ RUN sudo apt-get update && sudo apt-get install -y \
     && sudo rm -rf /var/lib/apt/lists/*
 
 RUN make all
-
-RUN make test
 # AGENT_BUILD_STEPS_END
 </assistant>
 </example>

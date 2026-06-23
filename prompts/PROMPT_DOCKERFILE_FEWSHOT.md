@@ -12,11 +12,9 @@ RUN sudo apt-get update && sudo apt-get install -y \
     make \
     && sudo rm -rf /var/lib/apt/lists/*
 
-# Build the library and its test binary.
+# Build the library. Tests/verification (`make test`) run via the separate verify
+# command downstream — not here.
 RUN make all
-
-# Build-time check that the test target compiles and links.
-RUN make test
 # AGENT_BUILD_STEPS_END
 # Library — no CMD/ENTRYPOINT.
 </assistant>
