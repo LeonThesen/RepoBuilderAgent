@@ -14,11 +14,14 @@ profiles:
     role_framing: expert
 
   # ── Phase 1 — OFAT prompt ablation ──────────────────────────────────────────
-  # Null baseline: absolute minimum prompt. Every Phase 1 run differs from this
-  # by exactly one variable so effects are attributable.
+  # Anchor (AB-00). Every Phase 1 run differs from this by exactly one variable so
+  # effects are attributable. The anchor uses the FULL prompts (prompt_length_mode:
+  # detailed); only AB-03 (phase1_length_only) swaps to the caveman-compressed
+  # PROMPT_*.concise.md variants. AB-01/AB-02 reuse this profile and vary only the
+  # generation+repair temperature via ablation_configs/phase1-temperature-*.json.
   phase1_zero_baseline:
     few_shot_count: 0
-    prompt_length_mode: concise
+    prompt_length_mode: detailed
     reasoning_instruction: false
     output_format_mode: strict
     temperature: 0.0
@@ -27,110 +30,32 @@ profiles:
   # AB-04: role framing only (neutral → expert)
   phase1_role_only:
     few_shot_count: 0
-    prompt_length_mode: concise
+    prompt_length_mode: detailed
     reasoning_instruction: false
     output_format_mode: strict
     temperature: 0.0
     role_framing: expert
 
-  # Reasoning instruction only (no longer scheduled; kept for reference).
-  # Dropped from Phase 1 when the study moved to completions-only and temperature
-  # took the AB-01/AB-02 slots.
-  phase1_reasoning_only:
-    few_shot_count: 0
-    prompt_length_mode: concise
-    reasoning_instruction: true
+  # AB-05: few-shot only (0 → 2). Each phase injects 2 full worked <example> demos
+  # (real output shapes: selected_files lists, classification YAML, RUN-step Dockerfile
+  # bodies, repair patches, INSTALL.md), loaded from prompts/PROMPT_*_FEWSHOT.md — see
+  # _FEWSHOT_FILES in core/prompt_profiles.py.
+  phase1_few_shot_only:
+    few_shot_count: 2
+    prompt_length_mode: detailed
+    reasoning_instruction: false
     output_format_mode: strict
     temperature: 0.0
     role_framing: neutral
 
-  # AB-03: prompt verbosity only (concise → detailed)
+  # AB-03: prompt verbosity only (full → caveman-compressed). concise loads the
+  # PROMPT_*.concise.md variants via prompt_path(); this is the ONLY profile that
+  # does so. The .concise.md files are generated once, offline, via the
+  # /caveman-compress methodology and committed as static files — never at runtime.
   phase1_length_only:
     few_shot_count: 0
-    prompt_length_mode: detailed
-    reasoning_instruction: false
-    output_format_mode: strict
-    temperature: 0.0
-    role_framing: neutral
-
-  # AB-05: output format only (strict → structured)
-  phase1_format_only:
-    few_shot_count: 0
-    prompt_length_mode: concise
-    reasoning_instruction: false
-    output_format_mode: structured
-    temperature: 0.0
-    role_framing: neutral
-
-  # ── Legacy profiles (no longer scheduled; kept for reference) ────────────────
-  concise_neutral:
-    few_shot_count: 0
     prompt_length_mode: concise
     reasoning_instruction: false
     output_format_mode: strict
     temperature: 0.0
     role_framing: neutral
-
-  phase1_fewshot_0:
-    few_shot_count: 0
-    prompt_length_mode: concise
-    reasoning_instruction: false
-    output_format_mode: strict
-    temperature: 0.0
-    role_framing: neutral
-
-  phase1_fewshot_1:
-    few_shot_count: 1
-    prompt_length_mode: concise
-    reasoning_instruction: false
-    output_format_mode: strict
-    temperature: 0.0
-    role_framing: neutral
-
-  phase1_fewshot_3:
-    few_shot_count: 3
-    prompt_length_mode: concise
-    reasoning_instruction: false
-    output_format_mode: strict
-    temperature: 0.0
-    role_framing: neutral
-
-  phase1_prompt_detailed:
-    few_shot_count: 3
-    prompt_length_mode: detailed
-    reasoning_instruction: false
-    output_format_mode: strict
-    temperature: 0.0
-    role_framing: neutral
-
-  phase1_reasoning_on:
-    few_shot_count: 3
-    prompt_length_mode: detailed
-    reasoning_instruction: true
-    output_format_mode: strict
-    temperature: 0.0
-    role_framing: neutral
-
-  phase1_structured_output:
-    few_shot_count: 3
-    prompt_length_mode: detailed
-    reasoning_instruction: true
-    output_format_mode: structured
-    temperature: 0.0
-    role_framing: neutral
-
-  phase1_role_expert:
-    few_shot_count: 3
-    prompt_length_mode: detailed
-    reasoning_instruction: true
-    output_format_mode: structured
-    temperature: 0.0
-    role_framing: expert
-
-  exploratory_expert:
-    few_shot_count: 3
-    prompt_length_mode: detailed
-    reasoning_instruction: true
-    output_format_mode: structured
-    temperature: 0.3
-    role_framing: expert

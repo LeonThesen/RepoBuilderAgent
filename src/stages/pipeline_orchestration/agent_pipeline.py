@@ -1436,18 +1436,14 @@ def enforce_variant_phase_contract(phase_skips: dict[str, bool]) -> bool | None:
 
 
 def resolve_classify_retrieval_strategy() -> str:
-    retrieval_overrides = {
-        "ab_retrieval_bm25": "bm25",
-        "ab_retrieval_neural_embedding": "neural_embedding",
-        "ab_retrieval_one_shot_fingerprint": "one_shot_fingerprint",
-        "ab_retrieval_one_shot_fingerprint_budgeted": "one_shot_fingerprint_budgeted",
-        "ab_retrieval_iterative_react": "iterative_react",
-    }
+    # Single source of truth: an explicit CLI/agent-config override wins, otherwise
+    # the retrieval strategy is whatever the variant policy declares. The policy
+    # table (variant_policy.py) is the only place that maps variant -> strategy;
+    # this used to carry a duplicate override dict that drifted (flat_baseline ran
+    # iterative_react despite its policy declaring one_shot_fingerprint).
     if args.retrieval_strategy:
         return args.retrieval_strategy
-    if args.variant in retrieval_overrides:
-        return retrieval_overrides[args.variant]
-    return "iterative_react"
+    return resolve_variant_policy(args.variant).get("retrieval_strategy", "iterative_react")
 
 
 # VARIANT_POLICY_TABLE and resolve_variant_policy are imported from

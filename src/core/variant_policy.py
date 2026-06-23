@@ -15,15 +15,21 @@ dict literal.
 """
 
 VARIANT_POLICY_TABLE: dict[str, dict] = {
+    # ── Retrieval phase (runs BEFORE the architecture ladder) ────────────────────
+    # Retrieval strategies are compared on the flat_baseline architecture (no L2/L3
+    # layers), so the only varied factor is retrieval. The winner (R*) is then frozen
+    # into the architecture-ladder configs. Hence all ab_retrieval_* variants here
+    # carry the SAME flat architecture (exploration/synthesis/validation/scratchpads
+    # OFF) and differ only in retrieval_strategy.
     "ab_retrieval_iterative_react": {
         "phase2_anchor": False,
         "repo_context_source": "iterative_react_retrieval",
         "classification_required": True,
         "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
         "retrieval_strategy": "iterative_react",
     },
     "ab_retrieval_one_shot_fingerprint": {
@@ -31,10 +37,10 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "repo_context_source": "one_shot_fingerprint_retrieval",
         "classification_required": True,
         "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
         "retrieval_strategy": "one_shot_fingerprint",
     },
     "ab_retrieval_one_shot_fingerprint_budgeted": {
@@ -42,10 +48,10 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "repo_context_source": "one_shot_fingerprint_budgeted_retrieval",
         "classification_required": True,
         "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
         "retrieval_strategy": "one_shot_fingerprint_budgeted",
     },
     "ab_retrieval_neural_embedding": {
@@ -53,10 +59,10 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "repo_context_source": "neural_embedding_retrieval",
         "classification_required": True,
         "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
         "retrieval_strategy": "neural_embedding",
     },
     "ab_retrieval_bm25": {
@@ -64,10 +70,10 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "repo_context_source": "bm25_retrieval",
         "classification_required": True,
         "repair_enabled": True,
-        "exploration_enabled": True,
-        "synthesis_enabled": True,
-        "validation_enabled": True,
-        "scratchpads_enabled": True,
+        "exploration_enabled": False,
+        "synthesis_enabled": False,
+        "validation_enabled": False,
+        "scratchpads_enabled": False,
         "retrieval_strategy": "bm25",
     },
     "ab_stateful_tree_off": {
@@ -79,7 +85,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
         "stateful_repair_enabled": True,
         "stateful_tree_enabled": False,
         "prev_attempt_context_enabled": True,
@@ -93,7 +99,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
         "stateful_repair_enabled": True,
         "stateful_tree_enabled": True,
         "prev_attempt_context_enabled": True,
@@ -107,7 +113,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
         "stateful_repair_enabled": True,
         "stateful_tree_enabled": False,
         "prev_attempt_context_enabled": True,
@@ -121,7 +127,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
         "stateful_repair_enabled": True,
         "stateful_tree_enabled": False,
         "prev_attempt_context_enabled": False,
@@ -135,7 +141,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
     },
     "ab_snippet_tools_baseline": {
         "phase2_anchor": False,
@@ -146,7 +152,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": False,
         "validation_enabled": False,
         "scratchpads_enabled": False,
-        "retrieval_strategy": "baseline_one_shot_fingerprint",
+        "retrieval_strategy": "one_shot_fingerprint",
         "snippet_tools_enabled": True,
     },
     "ab_snippet_tools_on": {
@@ -158,7 +164,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
         "snippet_tools_enabled": True,
     },
     "ab_snippet_tools_off": {
@@ -170,7 +176,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": True,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
         "snippet_tools_enabled": False,
     },
     "validation": {
@@ -182,7 +188,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": True,
         "scratchpads_enabled": False,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
     },
     "synthesis": {
         "phase2_anchor": False,
@@ -193,7 +199,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": True,
         "validation_enabled": False,
         "scratchpads_enabled": False,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
     },
     "exploration": {
         "phase2_anchor": False,
@@ -204,7 +210,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
         "synthesis_enabled": False,
         "validation_enabled": False,
         "scratchpads_enabled": False,
-        "retrieval_strategy": "iterative_exploration",
+        "retrieval_strategy": "iterative_react",
     },
     "one_shot_direct": {
         "phase2_anchor": False,
@@ -231,7 +237,7 @@ FALLBACK_VARIANT_POLICY: dict = {
     "synthesis_enabled": False,
     "validation_enabled": False,
     "scratchpads_enabled": False,
-    "retrieval_strategy": "baseline_one_shot_fingerprint",
+    "retrieval_strategy": "one_shot_fingerprint",
 }
 
 

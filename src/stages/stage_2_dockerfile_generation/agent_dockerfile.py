@@ -33,6 +33,7 @@ try:
         load_repo_urls,
         load_summary,
         prompt_path,
+        set_prompt_length_mode,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
         render_initial_user_request_for_prompt,
@@ -70,6 +71,7 @@ except ImportError:
         load_repo_urls,
         load_summary,
         prompt_path,
+        set_prompt_length_mode,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
         render_initial_user_request_for_prompt,
@@ -131,6 +133,7 @@ parser.add_argument("--repos-dir", default="repos", help="Directory containing c
 parser.add_argument("--output-dir", default="dockerfiles", help="Directory where generated Dockerfiles will be written")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 # Cap hadolint regeneration so a Dockerfile the model can't lint-fix never loops forever.

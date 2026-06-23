@@ -47,6 +47,7 @@ try:
         load_repo_urls,
         load_summary,
         prompt_path,
+        set_prompt_length_mode,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
         render_shared_repository_state_for_prompt,
@@ -91,6 +92,7 @@ except ImportError:
         load_repo_urls,
         load_summary,
         prompt_path,
+        set_prompt_length_mode,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
         render_shared_repository_state_for_prompt,
@@ -227,6 +229,7 @@ parser.add_argument(
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 
@@ -1210,6 +1213,10 @@ async def repair_repository(
                 if gt_doc:
                     gt_verify_commands = get_gt_verify_commands(gt_doc)
                     if gt_verify_commands:
+                        # Record GT commands whenever they exist (not only when executed):
+                        # the evaluator-side similarity judge and HARD hashing consume them,
+                        # but SOFT verify no longer executes them.
+                        report["gt_verify_commands"] = gt_verify_commands
                         log_info(f"[gt {repo_name}] Loaded {len(gt_verify_commands)} GT verify command(s) from dataset")
 
             # Resume: skip repair if a successful report already exists and --force is not set.
@@ -1232,14 +1239,12 @@ async def repair_repository(
                 delete_files_build_context, repo_path, repo_name, get_files_to_delete(gt_doc)
             )
 
-            # Load the build verification command: GT dataset > LLM-generated sidecar > CLI arg.
+            # Load the build verification command: agent-generated sidecar > CLI default.
+            # SOFT verify executes the AGENT's own command. The GT command is recorded
+            # (report["gt_verify_commands"], above) and consumed only by the evaluator-side
+            # similarity judge and HARD artifact hashing — it is never executed here.
             verify_command_path = dockerfiles_dir / f"{repo_name}.verify-command"
-            if gt_verify_commands:
-                gt_joined = " && ".join(gt_verify_commands)
-                verify_command_to_use = normalize_verify_command(gt_joined)
-                report["gt_verify_commands"] = gt_verify_commands
-                log_info(f"[verify {repo_name}] Using GT dataset verification commands: {verify_command_to_use}")
-            elif verify_command_path.exists():
+            if verify_command_path.exists():
                 verify_command_to_use = normalize_verify_command(verify_command_path.read_text(encoding="utf-8"))
                 log_info(f"[verify {repo_name}] Using generated verification command from {verify_command_path}: {verify_command_to_use}")
             else:
@@ -1348,6 +1353,29 @@ async def repair_repository(
                 if exit_code == 0:
                     # Record final image size (quality metric: multi-stage builds aim small).
                     report["attempts"][-1]["image_size_bytes"] = await get_image_size_bytes(image_tag)
+                    # HARD verify inputs (TODO 1/28): hash the produced artifact and gather the
+                    # artifact listing on ANY successful build, independent of whether the agent's
+                    # verify command passes. This decouples HARD (build_ok AND hash-match) from SOFT.
+                    # The evaluator's combined-hash check consumes artifact_listing; binary_metrics
+                    # holds the single key-artifact hash. Latest successful build wins.
+                    if gt_doc:
+                        _, hard_workdir = await get_image_runtime_context(image_tag)
+                        gt_artifact = get_gt_key_artifact(gt_doc, gt_verify_commands)
+                        if gt_artifact:
+                            binary_metrics = await measure_binary_in_image(
+                                image_tag,
+                                gt_artifact["path"],
+                                hard_workdir,
+                                gt_artifact.get("size_bytes"),
+                                gt_artifact.get("digest"),
+                            )
+                            report["binary_metrics"] = binary_metrics
+                            log_info(
+                                f"[binary {repo_name}] size={binary_metrics.get('measured_size_bytes')}, "
+                                f"plausible={binary_metrics.get('binary_size_plausible')}, "
+                                f"hash_match={binary_metrics.get('binary_hash_match')}"
+                            )
+                        report["artifact_listing"] = await gather_artifact_listing(image_tag, hard_workdir)
                     verify_log_path = report_dir / f"attempt-{attempt}.verify.log"
                     log_info(
                         f"Running build verification for {repo_url} using command: {verify_command_to_use}"
@@ -1380,26 +1408,6 @@ async def repair_repository(
                     if verify_exit_code == 0:
                         report["success"] = True
                         report["successful_attempt"] = attempt
-                        if gt_doc:
-                            _, workdir = await get_image_runtime_context(image_tag)
-                            gt_artifact = get_gt_key_artifact(gt_doc, gt_verify_commands)
-                            if gt_artifact:
-                                binary_metrics = await measure_binary_in_image(
-                                    image_tag,
-                                    gt_artifact["path"],
-                                    workdir,
-                                    gt_artifact.get("size_bytes"),
-                                    gt_artifact.get("digest"),
-                                )
-                                report["binary_metrics"] = binary_metrics
-                                log_info(
-                                    f"[binary {repo_name}] size={binary_metrics.get('measured_size_bytes')}, "
-                                    f"plausible={binary_metrics.get('binary_size_plausible')}, "
-                                    f"hash_match={binary_metrics.get('binary_hash_match')}"
-                                )
-                            # HARD verify inputs (TODO 1/28): source list + per-file hashes of
-                            # the produced artifacts, for the evaluator's combined-hash check.
-                            report["artifact_listing"] = await gather_artifact_listing(image_tag, workdir)
                         log_info(
                             f"Build and verification succeeded for {repo_url} on attempt {attempt}; image tag: {image_tag}; build log: {build_log_path}; verify log: {verify_log_path}"
                         )
@@ -1493,18 +1501,6 @@ async def repair_repository(
                     if retry_exit_code == 0:
                         report["success"] = True
                         report["successful_attempt"] = attempt
-                        if gt_doc and "binary_metrics" not in report:
-                            gt_artifact = get_gt_key_artifact(gt_doc, gt_verify_commands)
-                            if gt_artifact:
-                                _, workdir = await get_image_runtime_context(image_tag)
-                                binary_metrics = await measure_binary_in_image(
-                                    image_tag,
-                                    gt_artifact["path"],
-                                    workdir,
-                                    gt_artifact.get("size_bytes"),
-                                    gt_artifact.get("digest"),
-                                )
-                                report["binary_metrics"] = binary_metrics
                         log_info(
                             f"Build and verification succeeded for {repo_url} on attempt {attempt} after updating the verification command; image tag: {image_tag}; build log: {build_log_path}; verify log: {retry_verify_log_path}"
                         )

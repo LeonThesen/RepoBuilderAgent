@@ -110,12 +110,10 @@ def _profile_directives(profile: dict) -> str:
     role_framing = str(factors.get("role_framing", "expert"))
     role_line = "Adopt an expert implementer tone." if role_framing == "expert" else "Use a neutral, evidence-only tone."
 
-    length_mode = str(factors.get("prompt_length_mode", "detailed"))
-    length_line = (
-        "Favor concise responses and avoid unnecessary elaboration."
-        if length_mode == "concise"
-        else "Provide complete reasoning-relevant detail while staying factual."
-    )
+    # NOTE: prompt verbosity (prompt_length_mode) is NOT a directive line. The
+    # concise/detailed contrast is realized by loading a different prompt file
+    # (PROMPT_X.concise.md vs PROMPT_X.md) via prompt_path() — see set_prompt_length_mode
+    # in core.common. Injecting a "be concise" sentence here would be a near-null run.
 
     reasoning_line = (
         "Before final output, reason step by step internally and verify evidence alignment."
@@ -135,40 +133,43 @@ def _profile_directives(profile: dict) -> str:
         "<prompt_profile_directives>\n"
         f"- Profile: {profile.get('resolved_profile', 'unknown')}\n"
         f"- {role_line}\n"
-        f"- {length_line}\n"
         f"- {reasoning_line}\n"
         f"- {output_line}\n"
         "</prompt_profile_directives>"
     )
 
 
-_FEW_SHOT_EXAMPLES = {
-    "classify-step1-selection": [
-        "Input structure with pyproject.toml and README => select README.md, pyproject.toml, poetry.lock, .github/workflows/*.yml.",
-        "Input structure with package.json and docker-compose.yml => select package.json, package-lock.json, docker-compose.yml, .env.example.",
-        "Input structure with Cargo.toml and Makefile => select Cargo.toml, Cargo.lock, Makefile, README.md.",
-    ],
-    "classify-step2": [
-        "If evidence shows Python >=3.10 in CI and pyproject, set language_version.Python accordingly and cite ci_config/lockfile confidence.",
-        "If docker-compose includes postgres and redis, include both external services and matching env vars.",
-        "If build command is explicit in README, mirror it in build_steps and verify command in verification.",
-    ],
-    "dockerfile": [
-        "If pyproject.toml exists, copy lock/manifest first, install deps, then copy source for cache-friendly layers.",
-        "If Java repo uses Gradle wrapper, run ./gradlew with parallel flags and keep JAVA_HOME explicit when required.",
-        "If repo is library-only, omit CMD and prioritize deterministic build artifact generation.",
-    ],
-    "repair": [
-        "If build log shows missing package, add minimal apt package and retry same build step.",
-        "If verification fails after build success, keep build steps and patch only runtime command/binary path.",
-        "If python missing but python3 exists, install python-is-python3 instead of editing project scripts.",
-    ],
-    "install-guide": [
-        "Translate Dockerfile package installs into host prerequisites only when confidently inferable.",
-        "Keep verification command aligned with final image verification contract.",
-        "For libraries, document produced artifacts (libs/headers/wheels) instead of app startup.",
-    ],
+# Few-shot content is full worked <user>/<assistant> demonstrations, one file per phase.
+# Each file holds <example>...</example> blocks grounded in the real artifact shapes the
+# pipeline emits (classification YAML, selected_files lists, RUN-step Dockerfile bodies,
+# repair patches, INSTALL.md). They teach the target OUTPUT FORMAT, not repo-specific
+# answers — examples span build systems so the model generalizes (no-dataset-overfit).
+#
+# The demos flow ONLY through this channel (injected at {{PROMPT_PROFILE_FEWSHOT}} when
+# few_shot_count > 0); none are baked into the base prompts, so a 0-shot profile is a
+# true 0-shot run and the few-shot ablation (AB-05) is a clean 0 → N contrast.
+_FEWSHOT_FILES = {
+    "classify-step1-selection": "PROMPT_SELECT_FILES_FEWSHOT.md",
+    "classify-step2":           "PROMPT_CLASSIFY_FEWSHOT.md",
+    "dockerfile":               "PROMPT_DOCKERFILE_FEWSHOT.md",
+    "repair":                   "PROMPT_DOCKERFILE_REPAIR_FEWSHOT.md",
+    "install-guide":            "PROMPT_INSTALL_GUIDE_FEWSHOT.md",
 }
+
+
+def _prompts_dir() -> Path:
+    # core/prompt_profiles.py -> core -> src -> RepoBuilderAgent/prompts
+    return Path(__file__).resolve().parents[2] / "prompts"
+
+
+def _load_file_examples(filename: str) -> list[str]:
+    import re
+
+    path = _prompts_dir() / filename
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    return re.findall(r"<example\b.*?</example>", text, flags=re.DOTALL)
 
 
 def _few_shot_block(profile: dict, phase: str) -> str:
@@ -177,16 +178,16 @@ def _few_shot_block(profile: dict, phase: str) -> str:
     if count <= 0:
         return ""
 
-    examples = _FEW_SHOT_EXAMPLES.get(phase, [])
-    if not examples:
+    filename = _FEWSHOT_FILES.get(phase)
+    if not filename:
         return ""
 
-    selected = examples[:count]
-    lines = ["<few_shot_hints>"]
-    for index, text in enumerate(selected, start=1):
-        lines.append(f"- Example {index}: {text}")
-    lines.append("</few_shot_hints>")
-    return "\n".join(lines)
+    # Take the first `count` <example> blocks and inject them verbatim. The available
+    # pool may be smaller than count (then all of it is used).
+    selected = _load_file_examples(filename)[:count]
+    if not selected:
+        return ""
+    return "<few_shot_examples>\n" + "\n\n".join(selected) + "\n</few_shot_examples>"
 
 
 def apply_prompt_profile(template: str, profile: dict, phase: str) -> str:

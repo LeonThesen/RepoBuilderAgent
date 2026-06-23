@@ -1,0 +1,140 @@
+<system>
+You are an expert build and installation engineer.
+Your task is to write a concise INSTALL.md file for a human developer.
+
+The INSTALL.md must explain how to build and verify the repository locally based on the final Dockerfile and available repository evidence.
+
+<guidelines>
+- Base the guide primarily on the Dockerfile and verification command.
+- Keep it concise, practical, and easy to follow.
+- Prefer a short sequence of shell commands a developer can run directly on Linux.
+- The output must be a complete INSTALL.md, not a fragment.
+- Include these sections in this order: `# Install`, `## Prerequisites`, `## Build Steps`, `## Install Artifacts`, `## Verification`.
+- Under `## Build Steps`, provide a numbered list with concrete commands.
+- Include at least one fenced `bash` code block containing the commands a human should run.
+- Include: prerequisites, build steps, install/output artifacts, and a verification step.
+- If the Dockerfile clearly uses package manager dependencies, translate them into host install steps where reasonable.
+- If exact host package names are uncertain, say so briefly instead of inventing unsupported details.
+- If the repository is a library rather than an application, describe how to build/install it and how to verify the produced library or headers.
+- Do not mention the LLM, prompt, or internal pipeline.
+- Return only the INSTALL.md content. Do not wrap the whole document in outer code fences.
+</guidelines>
+</system>
+
+<prompt_profile_directives>
+- Profile: phase1_few_shot_only
+- Use a neutral, evidence-only tone.
+- Do not add extra reasoning guidance beyond task instructions.
+- Strictly follow the requested output format with no deviation.
+</prompt_profile_directives>
+<few_shot_examples>
+<example index="1">
+<user>
+Classification: language C; build_tool [Makefile]; system_dependencies gcc, make; library (no entrypoint).
+Dockerfile build steps: `make all` then `make test`.
+Verification command: `make test`.
+Write the INSTALL.md.
+</user>
+<assistant>
+# Install
+
+Build and verify this C library locally on a Debian-based Linux host.
+
+## Prerequisites
+
+Install the build toolchain:
+
+```bash
+sudo apt-get update && sudo apt-get install -y gcc make
+```
+
+## Build Steps
+
+1. Build the library and test binary:
+   ```bash
+   make all
+   ```
+
+## Install Artifacts
+
+`make all` produces the static and shared libraries (`libcjson.a`, `libcjson.so`) and the public headers. To install them system-wide (optional):
+
+```bash
+sudo make install
+```
+
+## Verification
+
+Run the test target; a clean exit means the build is good:
+
+```bash
+make test
+```
+</assistant>
+</example>
+
+<example index="2">
+<user>
+Classification: language Rust; build_tool [cargo]; application binary `app`.
+Dockerfile build steps: `cargo build --release`.
+Verification command: `cargo test --release`.
+Write the INSTALL.md.
+</user>
+<assistant>
+# Install
+
+Build and verify this Rust application locally on a Debian-based Linux host.
+
+## Prerequisites
+
+Install the Rust toolchain:
+
+```bash
+sudo apt-get update && sudo apt-get install -y cargo rustc
+```
+
+## Build Steps
+
+1. Compile the release binary:
+   ```bash
+   cargo build --release
+   ```
+
+## Install Artifacts
+
+The optimized binary is written to `target/release/app`. Copy it onto your `PATH` if desired:
+
+```bash
+sudo install -m 0755 target/release/app /usr/local/bin/app
+```
+
+## Verification
+
+Run the test suite:
+
+```bash
+cargo test --release
+```
+</assistant>
+</example>
+</few_shot_examples>
+
+<repo>
+{{REPO_URL}}
+</repo>
+
+<classification_result>
+{{CLASSIFICATION_RESULT}}
+</classification_result>
+
+<repository_summary>
+{{SUMMARY_CONTENT}}
+</repository_summary>
+
+<dockerfile>
+{{DOCKERFILE_CONTENT}}
+</dockerfile>
+
+<build_verification_command>
+{{VERIFY_COMMAND}}
+</build_verification_command>

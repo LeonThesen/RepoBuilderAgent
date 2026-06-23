@@ -31,6 +31,7 @@ try:
         render_initial_user_request_for_prompt,
         upsert_shared_repository_state,
         prompt_path,
+        set_prompt_length_mode,
         should_use_progress,
         ensure_repo_checkout,
         resolve_repo_checkout_dir,
@@ -64,6 +65,7 @@ except ImportError:
         render_initial_user_request_for_prompt,
         upsert_shared_repository_state,
         prompt_path,
+        set_prompt_length_mode,
         should_use_progress,
         ensure_repo_checkout,
         resolve_repo_checkout_dir,
@@ -98,6 +100,40 @@ TIMEOUTS = load_timeout_defaults(
         "classification_timeout": 240,
     },
 )
+
+# Fallback file selection used when a retrieval strategy returns nothing (or is unknown).
+# Canonical BUILD-SYSTEM entrypoints across all six dataset languages — manifests,
+# lockfiles, and build configs. These are standard ecosystem filenames (NOT dataset-specific
+# repo names), so the net generalizes to any repo using these tools.
+#
+# Deliberately excludes everything the declarative strip removes (see get_files_to_delete /
+# repo_cleanup): docs (`**/*.md`, `**/*.rst`, `**/README`, `**/INSTALL`), CI (`.github`,
+# `**/*.yml`, .travis/appveyor/.circleci/.gitlab-ci), and any existing Dockerfile — selecting
+# those would re-introduce exactly what the no-docs policy strips. NOTE: `**/*.yml` also strips
+# `docker-compose.yml` as collateral in some repos; the `.yaml` spelling survives, so both are
+# listed best-effort. Only files that actually exist after stripping get selected (globbed).
+_DEFAULT_SELECTED_FILES = [
+    # Python
+    "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "requirements-dev.txt",
+    "Pipfile", "Pipfile.lock", "poetry.lock", "tox.ini", "meson.build", "meson.options",
+    # JavaScript / TypeScript
+    "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "pnpm-workspace.yaml", "tsconfig.json", ".nvmrc",
+    # Rust
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain",
+    # Go
+    "go.mod", "go.sum",
+    # Java (Maven + Gradle)
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+    "gradle.properties", "gradlew", "gradle/wrapper/gradle-wrapper.properties",
+    # C / C++ (Make, Autotools, CMake)
+    "Makefile", "GNUmakefile", "Makefile.am", "Makefile.in", "configure", "configure.ac",
+    "autogen.sh", "CMakeLists.txt",
+    # Bazel
+    "BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel",
+    # Container / environment (best-effort; docker-compose.yml may be stripped by **/*.yml)
+    "docker-compose.yml", "docker-compose.yaml", ".env.example",
+]
 
 parser = argparse.ArgumentParser(description="Analyze and classify GitHub repositories based on a given schema file.")
 parser.add_argument("--input-file", default="repos.json", help="Path to input file containing repository URLs")
@@ -202,6 +238,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 # httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
@@ -1238,25 +1275,9 @@ async def analyze_repository(repo_url: str, repos_dir: Path, summary_dir: Path, 
             # TODO: this code needs to be in agent_pipeline.py because one_shot_direct currently skips 
             # TODO: things like git checkout/clone and docs delete need to be done before any stage or agent config is run
 
-            # Conservative default file selection used when a retrieval strategy returns
-            # nothing (or is unknown). High-signal manifests/docs/CI across the dataset's languages.
-            
-            # TODO: this is way too small, prompt LLM (not dynamically but for code change) for more complete list for all 6 languages
-            default_selected_files = list([
-                "README.md",
-                "README.rst",
-                "pyproject.toml",
-                "requirements.txt",
-                "package.json",
-                "go.mod",
-                "Cargo.toml",
-                "Dockerfile",
-                "docker-compose.yml",
-                "docker-compose.yaml",
-                ".env.example",
-                ".github/workflows/*.yml",
-                ".github/workflows/*.yaml",
-            ])
+            # Fallback selection for the empty/unknown-retrieval path. See the
+            # _DEFAULT_SELECTED_FILES module constant (build-inputs only; no docs/CI/Dockerfile).
+            default_selected_files = list(_DEFAULT_SELECTED_FILES)
 
             log_trace(f"Begin analysis for {repo_name}")
             # Step 1: structure-only context -> select relevant files.

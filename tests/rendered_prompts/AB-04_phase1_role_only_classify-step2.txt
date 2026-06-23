@@ -17,10 +17,15 @@
   - Prefer explicit evidence (e.g., .nvmrc) over implicit inference (e.g., guessing from import syntax)
   - Always populate build_steps and verification — these are critical for downstream Dockerfile generation
   </guidelines>
-  {{PROMPT_PROFILE_DIRECTIVES}}
+  <prompt_profile_directives>
+- Profile: phase1_role_only
+- Adopt an expert implementer tone.
+- Do not add extra reasoning guidance beyond task instructions.
+- Strictly follow the requested output format with no deviation.
+</prompt_profile_directives>
   </system>
 
-  {{PROMPT_PROFILE_FEWSHOT}}
+  
 
 
   Now analyze the following repository:

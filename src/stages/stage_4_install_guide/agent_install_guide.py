@@ -31,6 +31,7 @@ try:
         load_repo_urls,
         load_summary,
         prompt_path,
+        set_prompt_length_mode,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
         render_shared_repository_state_for_prompt,
@@ -63,6 +64,7 @@ except ImportError:
         load_repo_urls,
         load_summary,
         prompt_path,
+        set_prompt_length_mode,
         read_yaml_file,
         render_architecture_scratchpad_for_prompt,
         render_shared_repository_state_for_prompt,
@@ -118,6 +120,7 @@ parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory 
 parser.add_argument("--output-dir", default="install-guides", help="Directory where generated INSTALL.md files will be written")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
+set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 

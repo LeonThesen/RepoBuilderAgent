@@ -544,20 +544,17 @@ def compute_repo_metrics(
         # Tiered verification (TODO 1): split the formerly-conflated build_success into
         # distinct, separately-reportable tiers.
         #   build_ok    — the image built (docker build exit 0), regardless of verify.
-        #   soft_verify — the verify command (GT-preferred, else generated) exited 0.
-        #   hard_verify — soft_verify AND the produced artifact's hash matched the GT digest.
-        #                 None = inconclusive (no GT artifact/hash available — see TODO 28).
+        #   soft_verify — the agent's own verify command exited 0.
+        #   hard_verify — build_ok AND the produced artifact's hash matched the GT digest,
+        #                 independent of soft_verify. None = inconclusive (no GT artifact/hash).
+        #                 NOTE: this is the scaffold fallback; eval.py's combined-verify
+        #                 post-processing overrides hard_verify when artifact_listing + GT exist.
         build_ok = any(a.get("exit_code") == 0 for a in attempts)
         soft_verify = verify_passed
         hash_match = binary_metrics_raw.get("binary_hash_match")  # True / False / None
-        if not soft_verify:
-            hard_verify: Optional[bool] = False
-        elif hash_match is True:
-            hard_verify = True
-        elif hash_match is False:
-            hard_verify = False
-        else:
-            hard_verify = None  # no usable GT artifact hash yet
+        hard_verify: Optional[bool] = (
+            None if hash_match is None else (build_ok and hash_match is True)
+        )
         # Per-artifact match rate. Single key artifact today; becomes matched/total once
         # multi-artifact hashing lands. None when no artifact was hashable.
         artifact_match_rate = (
@@ -853,6 +850,18 @@ def compute_aggregate_metrics(
     # MID verify (LLM judge): rated only over repos with a conclusive verdict (legit not None).
     mid_applicable = [r for r in results if isinstance(r.get("metrics", {}).get("repair", {}).get("mid_verify"), dict) and r["metrics"]["repair"]["mid_verify"].get("legit") is not None]
     mid_legit = [r for r in mid_applicable if r["metrics"]["repair"]["mid_verify"]["legit"] is True]
+    # Verify-command similarity (TODO 1): rated over repos with a conclusive score (not None).
+    sim_applicable = [
+        r for r in results
+        if isinstance(r.get("metrics", {}).get("repair", {}).get("verify_cmd_similarity"), dict)
+        and r["metrics"]["repair"]["verify_cmd_similarity"].get("score") is not None
+    ]
+    sim_scores = [r["metrics"]["repair"]["verify_cmd_similarity"]["score"] for r in sim_applicable]
+    sim_categories: dict[str, int] = defaultdict(int)
+    for r in sim_applicable:
+        cat = r["metrics"]["repair"]["verify_cmd_similarity"].get("category")
+        if cat:
+            sim_categories[cat] += 1
     # binary_size_plausible: only count repos where GT binary info was available (not None)
     binary_plausible_applicable = [r for r in results if r.get("metrics", {}).get("repair", {}).get("binary_size_plausible") is not None]
     binary_plausible_pass = [r for r in binary_plausible_applicable if r["metrics"]["repair"]["binary_size_plausible"] is True]
@@ -964,6 +973,9 @@ def compute_aggregate_metrics(
         "hard_verify_applicable": len(hard_applicable),
         "mid_verify_legit_rate": round(len(mid_legit) / len(mid_applicable), 4) if mid_applicable else None,
         "mid_verify_applicable": len(mid_applicable),
+        "verify_cmd_similarity_applicable": len(sim_applicable),
+        "verify_cmd_similarity_mean_score": round(sum(sim_scores) / len(sim_scores), 4) if sim_scores else None,
+        "verify_cmd_similarity_categories": dict(sim_categories),
         "first_attempt_success_rate": round(len(first_attempt) / total, 4),
         "repair_salvage_rate": round(len(repair_salvaged) / total, 4),
         "verification_pass_rate": round(len(verify_passed) / total, 4),

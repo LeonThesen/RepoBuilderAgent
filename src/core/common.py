@@ -642,8 +642,27 @@ def prompts_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "prompts"
 
 
+# Active prompt verbosity. "detailed" loads the full PROMPT_X.md; "concise" loads a
+# pre-generated, caveman-compressed PROMPT_X.concise.md sibling when it exists. This is
+# how the AB-03 verbosity arm differs from the rest of Phase 1 — by real prompt content,
+# not a directive sentence. Stages set this once at startup (after resolving their
+# prompt profile, before reading any prompt) via set_prompt_length_mode(). Mirrors the
+# existing set_dump_prompts_dir() module-global pattern.
+_PROMPT_LENGTH_MODE = "detailed"
+
+
+def set_prompt_length_mode(mode: str | None) -> None:
+    global _PROMPT_LENGTH_MODE
+    _PROMPT_LENGTH_MODE = "concise" if str(mode or "").strip().lower() == "concise" else "detailed"
+
+
 def prompt_path(name: str) -> Path:
-    return prompts_dir() / name
+    base = prompts_dir()
+    if _PROMPT_LENGTH_MODE == "concise" and name.endswith(".md"):
+        concise = base / f"{name[:-len('.md')]}.concise.md"
+        if concise.exists():
+            return concise
+    return base / name
 
 
 def should_use_progress(total_repos: int, trace: bool) -> bool:
