@@ -7,6 +7,7 @@ import base64
 import functools
 import json
 import os
+import random
 import re
 import ssl
 import subprocess
@@ -74,6 +75,21 @@ def finalize_llm_metrics(metrics: dict) -> dict:
                 "max": round(max(latencies), 3),
             }
     return metrics
+
+
+_RETRY_DELAY_CAP_SECONDS = 30.0
+
+
+def _retry_delay(attempt: int, retry_backoff_seconds: float, *, cap: float = _RETRY_DELAY_CAP_SECONDS) -> float:
+    """Exponential backoff with a hard cap and full jitter.
+
+    The cap keeps a single sleep bounded even at high retry counts; the jitter
+    (multiply by a random factor in [0.5, 1.0]) decorrelates retries across
+    concurrent callers so N parallel pipelines don't re-spike the endpoint in
+    lockstep after a shared 429. Randomness is intentional — must vary per call.
+    """
+    base = min(retry_backoff_seconds * (2 ** (attempt - 1)), cap)
+    return round(base * random.uniform(0.5, 1.0), 3)
 
 
 def is_retryable_api_error(error: APIError) -> bool:
@@ -184,7 +200,7 @@ async def chat_completion_with_retries(
             last_error = error
             if attempt > max_retries:
                 break
-            delay_seconds = round(retry_backoff_seconds * (2 ** (attempt - 1)), 3)
+            delay_seconds = _retry_delay(attempt, retry_backoff_seconds)
             bucket["retries"] += 1
             log_warn(
                 f"OpenAI timeout for {repo_url} [{phase}] attempt {attempt}/{max_retries + 1}; retrying in {delay_seconds}s"
@@ -204,7 +220,7 @@ async def chat_completion_with_retries(
             last_error = error
             if attempt > max_retries:
                 break
-            delay_seconds = round(retry_backoff_seconds * (2 ** (attempt - 1)), 3)
+            delay_seconds = _retry_delay(attempt, retry_backoff_seconds)
             bucket["retries"] += 1
             log_warn(
                 f"OpenAI connection error for {repo_url} [{phase}] attempt {attempt}/{max_retries + 1}; retrying in {delay_seconds}s"
@@ -225,7 +241,7 @@ async def chat_completion_with_retries(
             last_error = error
             if attempt > max_retries or not is_retryable_api_error(error):
                 break
-            delay_seconds = round(retry_backoff_seconds * (2 ** (attempt - 1)), 3)
+            delay_seconds = _retry_delay(attempt, retry_backoff_seconds)
             bucket["retries"] += 1
             log_warn(
                 f"Retryable API error for {repo_url} [{phase}] attempt {attempt}/{max_retries + 1}; retrying in {delay_seconds}s"

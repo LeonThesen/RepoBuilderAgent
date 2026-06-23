@@ -3,7 +3,7 @@
 
 common:
   timeout: 120
-  llm_max_retries: 2
+  llm_max_retries: 4
   llm_retry_backoff_seconds: 2.0
 
 agent_classify:
