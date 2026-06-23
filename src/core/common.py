@@ -413,9 +413,18 @@ def load_summary(repo_name: str, repo_path: Path, summaries_dir: Path) -> str:
 # ~1700 tree entries) overflows the cap and the call 400s. These helpers bound
 # the summary so no prompt can exceed the cap, trimming the lowest-value part
 # (the tree) first and logging every cut (no silent truncation).
+#
+# We can only measure the user prompt we assemble, but the actual payload the
+# endpoint counts also includes the ReAct agent's system prompt + tool schemas
+# (~6k tokens in stage 3 repair) plus tokenizer drift vs the endpoint. So the
+# clamp targets (cap - PROMPT_OVERHEAD_RESERVE_TOKENS), not the raw cap.
 # ---------------------------------------------------------------------------
 
-DEFAULT_MAX_INPUT_TOKENS = 60000
+# --max-input-tokens is the endpoint's real input cap (gpt-4o = 64000).
+DEFAULT_MAX_INPUT_TOKENS = 64000
+# Headroom left below the cap for the parts of the payload we cannot measure
+# from the assembled user prompt (ReAct system prompt + tool schemas + drift).
+PROMPT_OVERHEAD_RESERVE_TOKENS = 10000
 
 _TREE_HEADER = "## Directory structure"
 
@@ -510,17 +519,23 @@ def clamp_summary_in_prompt(
     *,
     phase: str = "",
 ) -> str:
-    """Final guard: if ``prompt`` exceeds ``max_input_tokens``, trim the embedded
-    ``summary`` (the one unbounded region) just enough to fit. No-op when under."""
+    """Final guard: if ``prompt`` exceeds the effective cap, trim the embedded
+    ``summary`` (the one unbounded region) just enough to fit. No-op when under.
+
+    The effective cap is ``max_input_tokens - PROMPT_OVERHEAD_RESERVE_TOKENS`` so
+    there is room for payload parts we cannot see here (ReAct system prompt + tool
+    schemas + tokenizer drift); without that reserve the call still 400s."""
+    effective_cap = max(0, max_input_tokens - PROMPT_OVERHEAD_RESERVE_TOKENS)
     total = count_tokens(prompt, model)
-    if total <= max_input_tokens:
+    if total <= effective_cap:
         return prompt
     summary_tokens = count_tokens(summary, model)
-    budget = max_input_tokens - (total - summary_tokens)
+    budget = effective_cap - (total - summary_tokens)
     bounded = bound_summary(summary, budget, model)
     label = f"[token-bound]{(' ' + phase) if phase else ''}"
     log_warn(
-        f"{label}: prompt {total} > cap {max_input_tokens}; "
+        f"{label}: prompt {total} > effective cap {effective_cap} "
+        f"(endpoint cap {max_input_tokens} - reserve {PROMPT_OVERHEAD_RESERVE_TOKENS}); "
         f"summary {summary_tokens} -> {count_tokens(bounded, model)} tokens"
     )
     return prompt.replace(summary, bounded, 1)
