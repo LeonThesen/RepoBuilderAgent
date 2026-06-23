@@ -621,7 +621,54 @@ def _seed_user_constraints(repo_urls: list[str], summaries_dir: Path, user_const
     return seeded
 
 
+# Authoritative agent_config schema. Any key absent here is rejected at load so a
+# typo'd flag fails loudly instead of being silently ignored (and running at default).
+# Sections mapped to None are scalars or free-form objects whose sub-keys are not checked.
+_AGENT_CONFIG_SCHEMA: dict[str, "set[str] | None"] = {
+    "architecture": {
+        "exploration_enabled", "synthesis_enabled", "validation_enabled", "scratchpads_enabled",
+        "synthesis_subagents_enabled", "synthesis_react_max_steps", "synthesis_review_rounds",
+        "validation_react_max_steps",
+    },
+    "phases": {"classify", "dockerfile", "validation_gate", "repair", "install_guide"},
+    "classification": {"retrieval_strategy", "embedding_model", "step2_token_budget", "react"},
+    "dockerfile": {"one_shot_direct"},
+    "repair": {
+        "react", "stateful_repair", "stateful_repair_tree", "history_window",
+        "history_max_chars", "tree_max_chars", "tree_max_children", "repo_tools",
+    },
+    "temperature_overrides": {"classify", "dockerfile", "repair", "install_guide"},
+    "snippet_tools": None,
+    "user_constraints": None,
+    "_comment": None,
+}
+_CLASSIFICATION_REACT_KEYS = {"max_steps", "max_total_files", "final_cap"}
+
+
+def _reject_unknown_agent_config_keys(agent_config: dict) -> None:
+    unknown_top = set(agent_config) - set(_AGENT_CONFIG_SCHEMA)
+    if unknown_top:
+        raise ValueError(f"agent_config: unknown key(s): {', '.join(sorted(unknown_top))}")
+    for section, allowed in _AGENT_CONFIG_SCHEMA.items():
+        if allowed is None or section not in agent_config:
+            continue
+        cfg = agent_config[section]
+        if not isinstance(cfg, dict):
+            continue
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(f"agent_config.{section}: unknown key(s): {', '.join(sorted(unknown))}")
+    react_cfg = (agent_config.get("classification") or {}).get("react")
+    if isinstance(react_cfg, dict):
+        unknown_react = set(react_cfg) - _CLASSIFICATION_REACT_KEYS
+        if unknown_react:
+            raise ValueError(
+                f"agent_config.classification.react: unknown key(s): {', '.join(sorted(unknown_react))}"
+            )
+
+
 def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, bool]) -> dict:
+    _reject_unknown_agent_config_keys(agent_config)
     applied: dict = {}
 
     architecture_cfg = agent_config.get("architecture")
@@ -1387,22 +1434,27 @@ def print_planned_summary() -> None:
 
 
 def resolve_phase_skips() -> dict[str, bool]:
+    # Phase enablement is driven by variant_policy (single source): classification_required
+    # gates the classify phase; repair_enabled gates iterative repair. Both are True for every
+    # variant except the simplest arch (one_shot_direct).
+    policy = resolve_variant_policy(args.variant)
     skips = {
-        "classify": args.skip_classify,
+        "classify": args.skip_classify or not policy.get("classification_required", True),
         "dockerfile": args.skip_dockerfile,
         "validation_gate": args.skip_validation_gate,
         "repair": args.skip_repair,
         "install_guide": args.skip_install_guide,
     }
+    if not policy.get("repair_enabled", True):
+        # Simplest arch: the Dockerfile is still built and verified once (the build happens
+        # inside the repair stage, so we keep the stage), but with no repair iterations —
+        # max_attempts=1. This reuses the full tiered soft/mid/hard verify machinery while
+        # keeping the variant "one-shot".
+        args.max_attempts = 1
     if args.variant == "one_shot_direct":
-        skips["classify"] = True
+        # No policy keys represent these; they are intrinsic to the static one-shot variant.
         skips["validation_gate"] = True
         skips["install_guide"] = True
-        # ID 6: keep repair ENABLED so the one-shot Dockerfile is actually built and
-        # verified (otherwise one_shot_direct produces no build_success / verify result),
-        # but force a single attempt — build + verify once, no repair iterations — so the
-        # variant stays "one-shot". Reuses the full tiered soft/mid/hard verify machinery.
-        args.max_attempts = 1
     return skips
 
 
