@@ -1,7 +1,12 @@
 # Base Dockerfile projects
 # Includes: Debian, CA bootstrap, git, curl, pkg-config
 
-FROM debian:forky-slim
+# Pinned by digest so the base layer is frozen: debian:forky-slim is a rolling
+# testing tag that gets re-published, which would silently change the base
+# between eval runs and break reproducibility. Re-pin with:
+#   docker pull debian:forky-slim && docker inspect debian:forky-slim --format '{{index .RepoDigests 0}}'
+# (NOTE: the forky apt repos still roll; the digest only freezes the base image.)
+FROM debian:forky-slim@sha256:484c506e686dd6a8e2977a16d2fbab99763486c1c05f93e1dd29e6a26efe6e03
 
 # Non-interactive apt so `sudo apt-get install` never blocks on a prompt.
 ENV DEBIAN_FRONTEND=noninteractive

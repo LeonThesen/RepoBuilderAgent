@@ -1,3 +1,5 @@
+import hashlib
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -656,3 +658,90 @@ def build_hadolint_snippet_tool() -> Callable[[str], str]:
         )
 
     return run_hadolint_on_snippet
+
+
+# Warmed apt-cache images, keyed by base image ref. The base ships with empty apt
+# lists, so a bare `apt-cache search` finds nothing; running `apt-get update` per tool
+# call would add seconds of network (through the corporate proxy) to every query and
+# can blow the repair timeout. Instead build ONE image off the base with the lists
+# populated, then query it offline. Value is the warm tag, or None if the build failed
+# (callers fall back to update-in-place). Process-global so it is built once across all
+# repos in a run. None means "tried and failed", so we never retry a broken build.
+_APT_WARM_IMAGES: "dict[str, str | None]" = {}
+
+
+def _ensure_apt_warm_image(container_cli: str, base_image: str) -> "str | None":
+    if base_image in _APT_WARM_IMAGES:
+        return _APT_WARM_IMAGES[base_image]
+    warm_tag = "repobuilder-apt-cache:" + hashlib.sha1(base_image.encode()).hexdigest()[:12]
+    dockerfile = f"FROM {base_image}\nRUN apt-get update\n"
+    warm: "str | None" = None
+    try:
+        with tempfile.TemporaryDirectory() as ctx:
+            result = subprocess.run(
+                [container_cli, "build", "-q", "-t", warm_tag, "-f", "-", ctx],
+                input=dockerfile,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+        if result.returncode == 0:
+            warm = warm_tag
+    except Exception:
+        warm = None
+    _APT_WARM_IMAGES[base_image] = warm
+    return warm
+
+
+def build_apt_search_tool(container_cli: str, base_image: str) -> Callable[[str], str]:
+    """ReAct tool: query the build base image's apt repositories. Lets the repair agent
+    resolve `Unable to locate package` errors by discovering which package actually
+    exists on this Debian base (e.g. `default-jdk`/`openjdk-21-jdk` instead of a dropped
+    `openjdk-17-jdk`) instead of guessing version-pinned names from project docs."""
+    cache: "dict[str, str]" = {}
+
+    @tool
+    def apt_search(query: str) -> str:
+        """Search the build base image's apt repositories for packages matching `query`
+        and show install candidates. Use this to fix `Unable to locate package <pkg>`:
+        pass a keyword (e.g. `openjdk`, `clang`, `python3`) to see the package names and
+        versions that actually exist on this base, then install one of those."""
+        term = (query or "").strip()
+        if not term:
+            return "Provide a package name or keyword to search (e.g. 'openjdk')."
+        if term in cache:
+            return cache[term]
+        quoted = shlex.quote(term)
+        warm = _ensure_apt_warm_image(container_cli, base_image)
+        if warm is not None:
+            run_image = warm
+            shell = (
+                f"apt-cache search --names-only {quoted} | head -n 40; "
+                f"echo '--- policy ---'; apt-cache policy {quoted} 2>/dev/null | head -n 20"
+            )
+        else:
+            # Fallback: warm build failed (e.g. offline) — update in place this call.
+            run_image = base_image
+            shell = (
+                f"apt-get update -qq >/dev/null 2>&1; "
+                f"apt-cache search --names-only {quoted} | head -n 40"
+            )
+        try:
+            result = subprocess.run(
+                [container_cli, "run", "--rm", "--entrypoint", "/bin/sh", run_image, "-c", shell],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            output = (result.stdout or "").strip() or (result.stderr or "").strip() or "(no matching packages)"
+        except subprocess.TimeoutExpired:
+            output = "apt search timed out."
+        except Exception as exc:
+            output = f"apt search unavailable: {type(exc).__name__}: {exc}"
+        output = output[:2000]
+        cache[term] = output
+        return output
+
+    return apt_search

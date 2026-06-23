@@ -37,10 +37,6 @@ The INSTALL.md must explain how to build and verify the repository locally based
 {{CLASSIFICATION_RESULT}}
 </classification_result>
 
-<repository_summary>
-{{SUMMARY_CONTENT}}
-</repository_summary>
-
 <dockerfile>
 {{DOCKERFILE_CONTENT}}
 </dockerfile>

@@ -25,6 +25,7 @@ try:
         chat_completion_with_retries,
         ensure_repo_checkout,
         resolve_repo_checkout_dir,
+        strip_ca_cert_from_dockerfile,
         finalize_llm_metrics,
         init_llm_metrics,
         load_architecture_scratchpad,
@@ -58,6 +59,7 @@ except ImportError:
         chat_completion_with_retries,
         ensure_repo_checkout,
         resolve_repo_checkout_dir,
+        strip_ca_cert_from_dockerfile,
         finalize_llm_metrics,
         init_llm_metrics,
         load_architecture_scratchpad,
@@ -212,7 +214,12 @@ async def generate_install_guide(
             architecture_scratchpad = load_architecture_scratchpad(repo_name, summaries_dir)
             shared_repository_state = load_shared_repository_state(repo_name, summaries_dir)
             validation_artifact = read_yaml_file(summaries_dir / f"{repo_name}.validation.yaml")
-            dockerfile_content = dockerfile_path.read_text(encoding="utf-8")
+            # Defensive: the on-disk Dockerfile is kept clean (CA bootstrap is injected
+            # only into the in-memory build payload), but strip here too so the base64
+            # blob can never reach this guide-generation prompt regardless of upstream.
+            dockerfile_content = strip_ca_cert_from_dockerfile(
+                dockerfile_path.read_text(encoding="utf-8")
+            )
             verify_command_path = dockerfiles_dir / f"{repo_name}.verify-command"
             verify_command = verify_command_path.read_text(encoding="utf-8").strip() if verify_command_path.exists() else ""
 

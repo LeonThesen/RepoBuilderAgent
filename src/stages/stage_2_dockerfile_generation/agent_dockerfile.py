@@ -28,7 +28,6 @@ try:
         resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
-        inject_ca_cert_into_dockerfile,
         clamp_summary_in_prompt,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
@@ -69,7 +68,6 @@ except ImportError:
         resolve_repo_checkout_dir,
         finalize_llm_metrics,
         init_llm_metrics,
-        inject_ca_cert_into_dockerfile,
         clamp_summary_in_prompt,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
@@ -422,9 +420,13 @@ async def generate_dockerfile(
                     log_warn(f"Empty Dockerfile output for {repo_url}; skipping write.")
                     return
 
-                dockerfile_content = inject_ca_cert_into_dockerfile(dockerfile_content)
-
-                # Validate Dockerfile syntax with hadolint
+                # Validate the model's Dockerfile pre-injection. The corporate-CA
+                # bootstrap is harness-injected only at write time: it is static,
+                # already hadolint-clean, and the model cannot edit it. Linting the
+                # injected form just offsets line numbers and feeds its base64 blob
+                # back into the retry prompt — base64 tokenizes far denser than the
+                # tiktoken estimate, overran the input cap, and 400'd the endpoint
+                # ("Too many input tokens"). See docs/repair-timeout-base64-hang.md.
                 if not args.skip_hadolint:
                     # Write temporary file for hadolint check
                     temp_dockerfile = output_dir / f".{repo_name}.Dockerfile.tmp"
@@ -464,7 +466,11 @@ async def generate_dockerfile(
                     log_info(f"[hadolint {repo_name}] Skipping validation (--skip-hadolint set)")
                     break
 
-            # Write Dockerfile
+            # Write the model's clean Dockerfile to disk. The corporate-CA bootstrap
+            # is NOT persisted: the repair stage injects it into the in-memory build
+            # payload only (and restores the clean file afterwards). Keeping disk clean
+            # means the base64 blob never enters any LLM prompt — here, the verify-cmd
+            # prompt below, or the stage-4 install-guide prompt that reads this file.
             with open(output_path, "w", encoding="utf-8") as output_file:
                 output_file.write(dockerfile_content)
 

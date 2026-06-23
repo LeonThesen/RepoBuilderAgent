@@ -18,11 +18,11 @@ from tqdm import tqdm
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool, build_apt_search_tool
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
-    from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
+    from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template, extract_base_image
     from RepoBuilderAgent.src.core.file_io import write_text
     from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from RepoBuilderAgent.src.stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
@@ -69,11 +69,11 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
-    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool
+    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool, build_apt_search_tool
     from metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.agent_runtime import RepairRuntime
-    from core.dockerfile_utils import extract_dockerfile, get_base_template
+    from core.dockerfile_utils import extract_dockerfile, get_base_template, extract_base_image
     from core.file_io import write_text
     from core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
@@ -1062,12 +1062,20 @@ async def request_repair(
     )
 
     repo_tools = None
+    apt_tool_added = False
     if args.repair_repo_tools and repo_path is not None:
         repo_tools = [
             build_read_file_tool(repo_path),
             build_list_tree_tool(repo_path),
             build_search_pattern_tool(repo_path),
         ]
+        # Let repair query the actual base image's apt repos to resolve
+        # `Unable to locate package` (e.g. forky dropped openjdk-17-jdk). Tied to
+        # the Dockerfile's own FROM so the query matches the base the build uses.
+        base_image = extract_base_image(dockerfile_content)
+        if base_image:
+            repo_tools.append(build_apt_search_tool(args.container_cli, base_image))
+            apt_tool_added = True
 
     repaired, trace_steps, l3_trace = await run_l3_dockerfile_repair_react(
         repo_url=repo_url,
@@ -1088,6 +1096,8 @@ async def request_repair(
             tools_available.append("get_dockerfile_snippet")
         if repo_tools:
             tools_available.extend(["read_file", "list_tree", "search_pattern"])
+        if apt_tool_added:
+            tools_available.append("apt_search")
         tool_calls_made = [
             tc.get("name")
             for event in l3_trace

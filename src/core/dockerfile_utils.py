@@ -44,6 +44,18 @@ def _strip_trailing_noise(content: str) -> str:
     return "\n".join(lines[: last_valid + 1])
 
 
+def extract_base_image(dockerfile_content: str) -> str:
+    """Return the image ref from the first ``FROM`` instruction (dropping any
+    ``AS <stage>`` alias and ``--platform=`` flag), or ``""`` if none is found.
+    Used to point the apt-search repair tool at the exact base the build uses."""
+    for line in dockerfile_content.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("FROM "):
+            tokens = [t for t in stripped.split()[1:] if not t.startswith("--")]
+            return tokens[0] if tokens else ""
+    return ""
+
+
 def extract_dockerfile(raw: str) -> str:
     match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     content = match.group(1) if match else raw

@@ -101,6 +101,7 @@ TOOLS: tuple[Tool, ...] = (
     Tool("tool.read_file", "read_file", "build_read_file_tool", ("l1_react", "repair_repo")),
     Tool("tool.list_tree", "list_tree", "build_list_tree_tool", ("l1_react", "repair_repo")),
     Tool("tool.search_pattern", "search_pattern", "build_search_pattern_tool", ("l1_react", "repair_repo")),
+    Tool("tool.apt_search", "apt_search", "build_apt_search_tool", ("repair_repo",)),
     Tool("tool.read_gitlog", "read_gitlog", "build_read_gitlog_tool", ("l1_react",)),
     Tool("tool.search_commits", "search_commits", "build_search_commits_tool", ("l1_react",)),
     Tool("tool.search_structure_paths", "search_structure_paths", "build_search_structure_paths_tool", ("l1_react",)),

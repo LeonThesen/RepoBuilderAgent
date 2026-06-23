@@ -41,7 +41,7 @@ Your task is to:
   3. Fill the runtime CMD/ENTRYPOINT placeholder (after the END marker) if the repo is an
      application (omit for a library).
   4. Follow these additional guidelines:
-     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `sudo apt-get install -y` up front (run `sudo apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim — prefer UNVERSIONED toolchain packages (build-essential, gcc, g++, clang) over version-pinned names like `gcc-11` that may not exist in forky; install `gnupg`+`ca-certificates` before any `gpg`/key step.
+     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `sudo apt-get install -y` up front (run `sudo apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim (Debian testing): it keeps only the CURRENT version of each toolchain, so prefer UNVERSIONED / `default-*` meta-packages over version-pinned names — `default-jdk`/`default-jre` not `openjdk-17-jdk`, `build-essential`/`gcc`/`g++`/`clang` not `gcc-11`, `python3`/`python3-dev` not `python3.11`. Older pinned versions are routinely dropped and fail with `Unable to locate package`. Install `gnupg`+`ca-certificates` before any `gpg`/key step.
      - Be conservative. Only include commands and dependencies supported by provided evidence.
      - Do not use insecure TLS bypasses (curl -k, strict-ssl=false) unless explicitly required.
      - Never bake secrets into the image; use comments for unclear values.
