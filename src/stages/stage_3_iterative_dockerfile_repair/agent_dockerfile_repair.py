@@ -1097,6 +1097,29 @@ async def request_repair(
     return repaired
 
 
+async def _simple_verify_command_call(
+    repo_url: str, system_prompt: str, prompt: str, llm_metrics: dict, phase: str
+) -> str:
+    """Baseline verify-command derivation: a single LLM call (no ReAct agent).
+    The prompts instruct the model to return exactly one shell command."""
+    response = await chat_completion_with_retries(
+        client=client,
+        model=args.model,
+        temperature=EFFECTIVE_TEMPERATURE,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        repo_url=repo_url,
+        phase=phase,
+        metrics=llm_metrics,
+        timeout_seconds=args.verify_repair_timeout,
+        max_retries=args.llm_max_retries,
+        retry_backoff_seconds=args.llm_retry_backoff_seconds,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
 async def request_verification_command_repair(
     repo_url: str,
     classification: dict,
@@ -1132,6 +1155,11 @@ async def request_verification_command_repair(
         )
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
+
+    if not args.react_repair:
+        return await _simple_verify_command_call(
+            repo_url, VERIFY_REPAIR_SYSTEM_PROMPT, prompt, llm_metrics, "verify-repair"
+        )
 
     command, trace_steps = await run_l3_verification_command_react(
         repo_url=repo_url,
@@ -1184,6 +1212,11 @@ async def request_verification_command_refresh(
     )
     if architecture_scratchpad_context:
         prompt += architecture_scratchpad_context
+
+    if not args.react_repair:
+        return await _simple_verify_command_call(
+            repo_url, VERIFY_REFRESH_SYSTEM_PROMPT, prompt, llm_metrics, "verify-refresh"
+        )
 
     command, trace_steps = await run_l3_verification_command_react(
         repo_url=repo_url,
