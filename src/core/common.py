@@ -7,6 +7,7 @@ import base64
 import functools
 import json
 import os
+import ssl
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ import types
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import yaml
 from openai import APIConnectionError, APIError, APITimeoutError
 
@@ -91,6 +93,22 @@ def _normalize_responses_output(raw) -> types.SimpleNamespace:
     )
 
 
+def build_async_http_client(timeout_seconds: float) -> httpx.AsyncClient:
+    """Shared httpx client for AsyncOpenAI / ChatOpenAI across all stages.
+
+    Uses ssl.create_default_context() to pull in the OS trust store — httpx defaults
+    to certifi's CA bundle, which omits corporate / internal CAs. The explicit
+    httpx.Timeout bounds connect/read/write/pool per operation; the hard wall-clock
+    ceiling is enforced separately in chat_completion_with_retries via asyncio.wait_for,
+    because httpx read timeouts reset on each received chunk and never bound a
+    trickling response.
+    """
+    return httpx.AsyncClient(
+        verify=ssl.create_default_context(),
+        timeout=httpx.Timeout(timeout_seconds),
+    )
+
+
 async def chat_completion_with_retries(
     *,
     client,
@@ -113,15 +131,25 @@ async def chat_completion_with_retries(
         bucket["calls"] += 1
         started = time.perf_counter()
         try:
+            # asyncio.wait_for is the hard wall-clock ceiling. The httpx/openai
+            # `timeout` is a per-socket-read deadline that resets on every chunk
+            # received, so a server that trickles bytes (e.g. a slow generation for
+            # a very large prompt) never trips it and the call hangs indefinitely.
             c = client.with_options(timeout=timeout_seconds)
             if use_responses_api:
-                raw = await c.responses.create(model=model, input=messages)
+                raw = await asyncio.wait_for(
+                    c.responses.create(model=model, input=messages),
+                    timeout=timeout_seconds,
+                )
                 response = _normalize_responses_output(raw)
             else:
-                response = await c.chat.completions.create(
-                    model=model,
-                    temperature=temperature,
-                    messages=messages,
+                response = await asyncio.wait_for(
+                    c.chat.completions.create(
+                        model=model,
+                        temperature=temperature,
+                        messages=messages,
+                    ),
+                    timeout=timeout_seconds,
                 )
             latency = round(time.perf_counter() - started, 3)
             bucket["success"] += 1
@@ -134,7 +162,7 @@ async def chat_completion_with_retries(
                 }
             )
             return response
-        except APITimeoutError as error:
+        except (APITimeoutError, asyncio.TimeoutError) as error:
             latency = round(time.perf_counter() - started, 3)
             bucket["timeout"] += 1
             bucket["attempts"].append(

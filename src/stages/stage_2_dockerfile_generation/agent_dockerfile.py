@@ -22,6 +22,7 @@ try:
         resolve_prompt_temperature,
     )
     from RepoBuilderAgent.src.core.common import (
+        build_async_http_client,
         chat_completion_with_retries,
         ensure_repo_checkout,
         resolve_repo_checkout_dir,
@@ -62,6 +63,7 @@ except ImportError:
         resolve_prompt_temperature,
     )
     from core.common import (
+        build_async_http_client,
         chat_completion_with_retries,
         ensure_repo_checkout,
         resolve_repo_checkout_dir,
@@ -150,10 +152,8 @@ EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROF
 MAX_LINT_ATTEMPTS = 8
 
 
-# httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
-# Use ssl.create_default_context() to pull in the OS trust store instead.
-_ssl_context = ssl.create_default_context()
-_http_client = httpx.AsyncClient(verify=_ssl_context)
+# Shared httpx client: OS trust store for corporate CAs + bounded timeout.
+_http_client = build_async_http_client(args.timeout)
 
 client = AsyncOpenAI(
     base_url=args.endpoint,

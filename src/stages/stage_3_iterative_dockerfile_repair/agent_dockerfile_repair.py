@@ -42,6 +42,7 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        build_async_http_client,
         chat_completion_with_retries,
         clamp_summary_in_prompt,
         DEFAULT_MAX_INPUT_TOKENS,
@@ -90,6 +91,7 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        build_async_http_client,
         chat_completion_with_retries,
         clamp_summary_in_prompt,
         DEFAULT_MAX_INPUT_TOKENS,
@@ -264,10 +266,8 @@ set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 
-# httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
-# Use ssl.create_default_context() to pull in the OS trust store instead.
-_ssl_context = ssl.create_default_context()
-_http_client = httpx.AsyncClient(verify=_ssl_context)
+# Shared httpx client: OS trust store for corporate CAs + bounded timeout.
+_http_client = build_async_http_client(args.timeout)
 
 client = AsyncOpenAI(
     base_url=args.endpoint,

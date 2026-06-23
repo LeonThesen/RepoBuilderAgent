@@ -24,6 +24,7 @@ try:
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
     from RepoBuilderAgent.src.stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload, LoopOutcome, TokenCounts, SummaryPaths
     from RepoBuilderAgent.src.core.common import (
+        build_async_http_client,
         chat_completion_with_retries,
         count_tokens,
         finalize_llm_metrics,
@@ -59,6 +60,7 @@ except ImportError:
     from stages.stage_1_repository_installation_analysis.architecture_state_graph import run_architecture_state_graph as _run_architecture_state_graph_impl
     from stages.stage_1_repository_installation_analysis.scratchpad_payloads import build_architecture_scratchpad_payload, LoopOutcome, TokenCounts, SummaryPaths
     from core.common import (
+        build_async_http_client,
         chat_completion_with_retries,
         count_tokens,
         finalize_llm_metrics,
@@ -243,10 +245,8 @@ PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
 set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
-# httpx defaults to certifi's CA bundle, which does not include corporate / internal CAs.
-# Use ssl.create_default_context() to pull in the OS trust store instead.
-_ssl_context = ssl.create_default_context()
-_http_client = httpx.AsyncClient(verify=_ssl_context)
+# Shared httpx client: OS trust store for corporate CAs + bounded timeout.
+_http_client = build_async_http_client(args.timeout)
 
 client = AsyncOpenAI(
     base_url=args.endpoint,
