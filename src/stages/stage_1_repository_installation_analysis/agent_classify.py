@@ -377,8 +377,10 @@ def extract_selected_files(raw: str) -> list[str]:
 def build_embedding_query_text(repo_name: str, extra_terms: list[str] | None = None) -> str:
     terms = build_bm25_query_terms(repo_name, extra_terms)
     return (
-        "Find repository files that best explain how to install, build, verify, and package this project. "
-        "Prefer manifests, READMEs, Dockerfiles, CI workflows, and dependency configuration. "
+        "Identify the repository files that explain how to install, build, configure, verify, and "
+        "run this project: dependency manifests and lockfiles, build-system config "
+        "(Makefile / CMake / Gradle / Maven / Cargo / Meson), toolchain and language-version files, "
+        "container/compose and environment templates, CI build workflows, and entrypoints. "
         f"Repository: {repo_name}. Keywords: {' '.join(terms)}"
     )
 
@@ -456,6 +458,63 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return numerator / (left_norm * right_norm)
 
 
+# Embedding-retrieval tuning. Files are chunked so a file is scored by its best-matching
+# chunk (not one diluted whole-file vector); path and content similarity are combined with
+# an explicit weight so filenames help without dominating; modest filename boosts mirror the
+# bm25 arm for a fair comparison. _EMBED_MAX_INPUT_CHARS is a per-input guard on top of the
+# 4096-byte content cap so no single embedding input approaches the model token limit.
+_EMBED_CHUNK_CHARS = 1500
+_EMBED_MAX_INPUT_CHARS = 8000
+_NEURAL_PATH_WEIGHT = 0.3
+_EMBED_HIGH_SIGNAL_BOOST = 0.4
+_EMBED_README_BOOST = 0.2
+_EMBED_WORKFLOW_BOOST = 0.05
+_EMBED_HIGH_SIGNAL_NAMES = {
+    "readme.md", "readme.rst", "readme.txt", "install.md", "install.txt",
+    "pyproject.toml", "requirements.txt", "package.json", "package-lock.json",
+    "yarn.lock", "pnpm-lock.yaml", "go.mod", "cargo.toml", "dockerfile",
+    "docker-compose.yml", "docker-compose.yaml", "makefile", "cmakelists.txt",
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "settings.gradle.kts", "gradlew", "gemfile", "composer.json", "setup.py",
+    "setup.cfg", "pipfile", "pipfile.lock", ".env.example", "meson.build",
+}
+
+
+def _chunk_text(text: str, size: int = _EMBED_CHUNK_CHARS) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    return [text[index:index + size] for index in range(0, len(text), size)]
+
+
+def _rank_embedding_scores(
+    candidates: list[tuple[str, str]],
+    path_sim: list[float],
+    best_content_sim: list[float],
+) -> list[tuple[float, str]]:
+    """Combine per-file path and best-chunk content similarity into one score (path
+    weighted separately from content), apply filename boosts, and return (score, rel)
+    sorted descending. Shared by the neural and local-fallback embedding rankers so both
+    weight path/content and boost filenames identically."""
+    ranked: list[tuple[float, str]] = []
+    for index, (rel, _content) in enumerate(candidates):
+        score = (
+            (1.0 - _NEURAL_PATH_WEIGHT) * best_content_sim[index]
+            + _NEURAL_PATH_WEIGHT * path_sim[index]
+        )
+        rel_lower = rel.lower()
+        basename = Path(rel_lower).name
+        if basename in _EMBED_HIGH_SIGNAL_NAMES:
+            score += _EMBED_HIGH_SIGNAL_BOOST
+        elif basename.startswith(("readme", "install")):
+            score += _EMBED_README_BOOST
+        if rel_lower.startswith(".github/workflows/"):
+            score += _EMBED_WORKFLOW_BOOST
+        ranked.append((score, rel))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return ranked
+
+
 def build_local_dense_embedding(text: str, dimensions: int = 256) -> list[float]:
     vector = [0.0] * dimensions
     tokens = re.findall(r"[a-z0-9]+", text.lower())
@@ -476,56 +535,25 @@ def build_local_dense_embedding(text: str, dimensions: int = 256) -> list[float]
 
 
 def select_files_by_local_embedding(query_text: str, candidates: list[tuple[str, str]], top_k: int = 12) -> list[str]:
-    high_signal_names = {
-        "readme.md",
-        "readme.rst",
-        "readme.txt",
-        "install.md",
-        "install.txt",
-        "pyproject.toml",
-        "requirements.txt",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "go.mod",
-        "cargo.toml",
-        "dockerfile",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "makefile",
-        "cmakelists.txt",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "gradlew",
-        "gemfile",
-        "composer.json",
-        "setup.py",
-        "setup.cfg",
-        "pipfile",
-        "pipfile.lock",
-        ".env.example",
-    }
+    """Offline fallback: hash-based dense embedding with the same chunking + path/content
+    weighting + filename boosts as the neural ranker (so the fallback degrades gracefully
+    rather than changing the scoring shape)."""
     query_embedding = build_local_dense_embedding(query_text)
-    ranked: list[tuple[float, str]] = []
-
+    path_sim: list[float] = []
+    best_content_sim: list[float] = []
     for rel, content in candidates:
-        candidate_embedding = build_local_dense_embedding(f"Path: {rel}\n\nContent:\n{content}")
-        score = cosine_similarity(query_embedding, candidate_embedding)
-        rel_lower = rel.lower()
-        basename = Path(rel_lower).name
-        if basename in high_signal_names:
-            score += 0.4
-        elif basename.startswith(("readme", "install")):
-            score += 0.2
-        if rel_lower.startswith(".github/workflows/"):
-            score += 0.05
-        ranked.append((score, rel))
-
-    ranked.sort(key=lambda item: (-item[0], item[1]))
+        path_sim.append(cosine_similarity(query_embedding, build_local_dense_embedding(f"Path: {rel}")))
+        chunks = _chunk_text(content) or [""]
+        best_content_sim.append(max(
+            (cosine_similarity(query_embedding, build_local_dense_embedding(f"Path: {rel}\n\nContent:\n{chunk}"))
+             for chunk in chunks),
+            default=0.0,
+        ))
+    ranked = _rank_embedding_scores(candidates, path_sim, best_content_sim)
+    log_trace(
+        "[local_embedding] top: "
+        + ", ".join(f"{rel}={score:.3f}" for score, rel in ranked[:top_k])
+    )
     return [rel for _, rel in ranked[:top_k]]
 
 
@@ -540,24 +568,49 @@ async def select_files_by_neural_embedding(
         return []
 
     query_text = build_embedding_query_text(repo_name, extra_terms)
-    candidate_payloads = [f"Path: {rel}\n\nContent:\n{content}" for rel, content in candidates]
+
+    # One path-only input plus one input per content chunk, per file. Each input is hard
+    # capped at _EMBED_MAX_INPUT_CHARS so a single request never approaches the token limit.
+    inputs: list[str] = []
+    index_map: list[tuple[int, str]] = []  # (file_index, "path" | "content")
+    for file_index, (rel, content) in enumerate(candidates):
+        inputs.append(f"Path: {rel}"[:_EMBED_MAX_INPUT_CHARS])
+        index_map.append((file_index, "path"))
+        for chunk in (_chunk_text(content) or [""]):
+            inputs.append(f"Path: {rel}\n\nContent:\n{chunk}"[:_EMBED_MAX_INPUT_CHARS])
+            index_map.append((file_index, "content"))
 
     try:
-        query_response = await client.embeddings.create(model=args.embedding_model, input=[query_text])
+        query_response = await client.embeddings.create(
+            model=args.embedding_model, input=[query_text[:_EMBED_MAX_INPUT_CHARS]]
+        )
         query_embedding = query_response.data[0].embedding
 
-        ranked: list[tuple[float, str]] = []
+        sims: list[float] = [0.0] * len(inputs)
         batch_size = 32
-        for start in range(0, len(candidate_payloads), batch_size):
-            batch_payloads = candidate_payloads[start:start + batch_size]
-            batch_candidates = candidates[start:start + batch_size]
-            batch_response = await client.embeddings.create(model=args.embedding_model, input=batch_payloads)
-            for item, (rel, _) in zip(batch_response.data, batch_candidates):
-                score = cosine_similarity(query_embedding, item.embedding)
-                ranked.append((score, rel))
+        for start in range(0, len(inputs), batch_size):
+            batch_response = await client.embeddings.create(
+                model=args.embedding_model, input=inputs[start:start + batch_size]
+            )
+            for offset, item in enumerate(batch_response.data):
+                sims[start + offset] = cosine_similarity(query_embedding, item.embedding)
 
-        ranked.sort(key=lambda item: (-item[0], item[1]))
+        path_sim = [0.0] * len(candidates)
+        best_content_sim = [0.0] * len(candidates)
+        for sim, (file_index, kind) in zip(sims, index_map):
+            if kind == "path":
+                path_sim[file_index] = max(path_sim[file_index], sim)
+            else:
+                best_content_sim[file_index] = max(best_content_sim[file_index], sim)
+
+        ranked = _rank_embedding_scores(candidates, path_sim, best_content_sim)
+        log_trace(
+            f"[neural_embedding] {repo_name} top: "
+            + ", ".join(f"{rel}={score:.3f}" for score, rel in ranked[:top_k])
+        )
         return [rel for _, rel in ranked[:top_k]]
+    except asyncio.CancelledError:
+        raise
     except httpx.HTTPError as e:
         log_warn(f"Embedding retrieval HTTP error for {repo_name}: {e}. Falling back to local dense retrieval.")
     except ssl.SSLError as e:
@@ -1038,6 +1091,7 @@ async def _select_relevant_files(
             log_warn(f"BM25 selection returned no files for {repo_url}; using defaults.")
             selected_files = default_selected_files.copy()
         log_info(f"Selected {len(selected_files)} files for {repo_name} via BM25 retrieval.")
+        log_trace(f"[bm25] {repo_name} selected: " + ", ".join(selected_files))
     elif args.retrieval_strategy == "neural_embedding":
         # TODO: Split large files into smaller semantic chunks before embedding them,
         #       instead of embedding the entire file as one vector.
@@ -1126,6 +1180,7 @@ async def _select_relevant_files(
             f"Using budgeted repo fingerprint for {repo_name} via one-shot-budgeted retrieval "
             f"({len(_budgeted_files)} files selected)."
         )
+        log_trace(f"[bm25_budgeted] {repo_name} selected: " + ", ".join(_budgeted_files))
     elif args.retrieval_strategy == "iterative_react":
         if prior_failure_summary:
             structure_summary = (

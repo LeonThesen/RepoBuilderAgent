@@ -292,9 +292,27 @@ RUN_DIR_DEFAULTS = {
 
 _stage_temperature_overrides: dict[str, float | None] = {}
 
+# Stages whose temperature follows the prompt profile (P*). The generation and repair
+# stages are the "creative" steps the temperature factor targets; classification and the
+# install guide stay deterministic.
+_PROFILE_TEMPERATURE_STAGES = ("dockerfile", "repair")
+
 
 def _get_stage_temperature(stage: str) -> float | None:
-    return _stage_temperature_overrides.get(stage)
+    """Resolve a stage's temperature.
+
+    Precedence: an explicit per-stage ``temperature_overrides`` entry from the agent_config
+    wins (a null entry means "fall back to the stage's own profile resolution"). Otherwise
+    the default policy routes the prompt profile's temperature (P*, via the orchestrator's
+    EFFECTIVE_TEMPERATURE) to the generation/repair stages and pins classify + install_guide
+    to 0.0. This makes a P* temperature flow to every phase automatically — no need to bake
+    temperature_overrides into each downstream config.
+    """
+    if stage in _stage_temperature_overrides:
+        return _stage_temperature_overrides[stage]
+    if stage in _PROFILE_TEMPERATURE_STAGES:
+        return EFFECTIVE_TEMPERATURE
+    return 0.0
 
 
 set_trace_enabled(args.trace)

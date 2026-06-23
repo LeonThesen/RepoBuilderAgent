@@ -417,8 +417,27 @@ def collect_selected_files(root: Path, selected_files: list[str]) -> list[tuple[
     return sorted(results, key=lambda x: x[0])
 
 
+# camelCase / PascalCase / digit-run splitter. Applied per alphanumeric run so that
+# identifiers, package names and config keys tokenize into useful subterms.
+_CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z][a-z]+|[A-Z]+|[a-z]+|[0-9]+")
+
+
 def _tokenize_text(value: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", value.lower())
+    """Tokenize repo text for BM25.
+
+    Splits on every non-alphanumeric boundary (so `_ - . /` separate), and additionally
+    splits camelCase/PascalCase and digit runs while ALSO keeping the whole lowercased run
+    so exact identifiers/filenames still match. Example: ``buildSrc.gradle.kts`` ->
+    ``build src gradle kts`` plus the run ``buildsrc``.
+    """
+    tokens: list[str] = []
+    for run in re.findall(r"[A-Za-z0-9]+", value):
+        low = run.lower()
+        tokens.append(low)
+        parts = _CAMEL_SPLIT_RE.findall(run)
+        if len(parts) > 1:
+            tokens.extend(part.lower() for part in parts)
+    return tokens
 
 
 def build_bm25_query_terms(repo_name: str, extra_terms: list[str] | None = None) -> list[str]:
@@ -442,76 +461,116 @@ def build_bm25_query_terms(repo_name: str, extra_terms: list[str] | None = None)
     return deduped
 
 
+# BM25 scoring constants. Boosts are kept modest so lexical content scores can compete;
+# the path-term bonus rewards query terms appearing in the file PATH, weighted separately
+# from content term frequency (path and content are scored as distinct fields).
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+_BM25_BOOST_HIGH_SIGNAL = 2.0
+_BM25_BOOST_README = 1.0
+_BM25_BOOST_WORKFLOW = 0.25
+_BM25_PATH_TERM_BONUS = 0.5
+
+
+def _normalize_query_terms(query_terms: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for term in query_terms:
+        for token in _tokenize_text(term):
+            if token and token not in seen:
+                seen.add(token)
+                normalized.append(token)
+    return normalized
+
+
+def _high_signal_fallback_order(candidates: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Order candidates by filename signal for the no-positive-score fallback: exact
+    high-signal manifests first, then README/INSTALL, then CI workflows, then by path
+    depth. Beats returning the raw filesystem-walk order."""
+    def rank_key(item: tuple[str, str]):
+        rel, _ = item
+        rel_lower = rel.lower()
+        basename = Path(rel_lower).name
+        if basename in HIGH_SIGNAL_FILENAMES:
+            tier = 0
+        elif basename.startswith(("readme", "install")):
+            tier = 1
+        elif rel_lower.startswith(".github/workflows/"):
+            tier = 2
+        else:
+            tier = 3
+        return (tier, rel.count("/"), rel)
+
+    return sorted(candidates, key=rank_key)
+
+
+def _bm25_rank(candidates: list[tuple[str, str]], query_terms: list[str]) -> list[tuple[float, str]]:
+    """Shared BM25 ranker for the bm25 and bm25_budgeted strategies.
+
+    Scores file CONTENT with BM25, adds a path-term bonus (path tokens weighted
+    separately from content) and modest filename boosts. Returns (score, rel) sorted
+    descending, positive scores only; empty when there are no usable query terms (the
+    caller then applies the high-signal fallback)."""
+    normalized_terms = _normalize_query_terms(query_terms)
+    if not normalized_terms:
+        return []
+
+    documents: list[tuple[str, dict[str, int], int, set[str]]] = []
+    document_frequency: dict[str, int] = {}
+    total_length = 0
+    for rel, content in candidates:
+        content_tokens = _tokenize_text(content)
+        path_tokens = set(_tokenize_text(rel))
+        counts: dict[str, int] = {}
+        for token in content_tokens:
+            counts[token] = counts.get(token, 0) + 1
+        documents.append((rel, counts, len(content_tokens), path_tokens))
+        total_length += len(content_tokens)
+        for token in counts:
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+
+    avg_doc_length = total_length / len(documents) if documents else 0.0
+    ranked: list[tuple[float, str]] = []
+    for rel, counts, doc_length, path_tokens in documents:
+        norm = (
+            _BM25_K1 * (1 - _BM25_B + _BM25_B * (doc_length / avg_doc_length))
+            if avg_doc_length
+            else _BM25_K1
+        )
+        score = 0.0
+        for term in normalized_terms:
+            term_frequency = counts.get(term, 0)
+            if term_frequency > 0:
+                matching_docs = document_frequency.get(term, 0)
+                idf = math.log(1 + ((len(documents) - matching_docs + 0.5) / (matching_docs + 0.5)))
+                score += idf * ((term_frequency * (_BM25_K1 + 1)) / (term_frequency + norm))
+            if term in path_tokens:
+                score += _BM25_PATH_TERM_BONUS
+
+        rel_lower = rel.lower()
+        basename = Path(rel_lower).name
+        if basename in HIGH_SIGNAL_FILENAMES:
+            score += _BM25_BOOST_HIGH_SIGNAL
+        elif basename.startswith(("readme", "install")):
+            score += _BM25_BOOST_README
+        if rel_lower.startswith(".github/workflows/"):
+            score += _BM25_BOOST_WORKFLOW
+
+        if score > 0:
+            ranked.append((score, rel))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return ranked
+
+
 def select_files_by_bm25(root: Path, query_terms: list[str], top_k: int = 12) -> list[str]:
     """Rank manifest/config files using a lightweight BM25 scorer."""
     candidates = collect_retrieval_candidates(root)
     if not candidates:
         return []
-
-    high_signal_names = HIGH_SIGNAL_FILENAMES
-
-    normalized_terms = []
-    seen_terms: set[str] = set()
-    for term in query_terms:
-        for token in _tokenize_text(term):
-            if token and token not in seen_terms:
-                seen_terms.add(token)
-                normalized_terms.append(token)
-
-    if not normalized_terms:
-        return [rel for rel, _ in candidates[:top_k]]
-
-    documents: list[tuple[str, list[str]]] = []
-    document_frequency: dict[str, int] = {}
-    total_length = 0
-
-    for rel, content in candidates:
-        tokens = _tokenize_text(f"{rel}\n{content}") or _tokenize_text(rel)
-        documents.append((rel, tokens))
-        total_length += len(tokens)
-        for token in set(tokens):
-            document_frequency[token] = document_frequency.get(token, 0) + 1
-
-    avg_doc_length = total_length / len(documents) if documents else 0.0
-    k1 = 1.5
-    b = 0.75
-    ranked: list[tuple[float, str]] = []
-
-    for rel, tokens in documents:
-        if not tokens:
-            continue
-        token_counts: dict[str, int] = {}
-        for token in tokens:
-            token_counts[token] = token_counts.get(token, 0) + 1
-
-        doc_length = len(tokens)
-        norm = k1 * (1 - b + b * (doc_length / avg_doc_length)) if avg_doc_length else k1
-        score = 0.0
-
-        for term in normalized_terms:
-            term_frequency = token_counts.get(term, 0)
-            if term_frequency <= 0:
-                continue
-            matching_docs = document_frequency.get(term, 0)
-            inverse_doc_frequency = math.log(1 + ((len(documents) - matching_docs + 0.5) / (matching_docs + 0.5)))
-            score += inverse_doc_frequency * ((term_frequency * (k1 + 1)) / (term_frequency + norm))
-
-        rel_lower = rel.lower()
-        basename = Path(rel_lower).name
-        if basename in high_signal_names:
-            score += 2.5
-        elif basename.startswith(("readme", "install")):
-            score += 1.5
-        if rel_lower.startswith(".github/workflows/"):
-            score += 0.25
-
-        if score > 0:
-            ranked.append((score, rel))
-
+    ranked = _bm25_rank(candidates, query_terms)
     if not ranked:
-        return [rel for rel, _ in candidates[:top_k]]
-
-    ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [rel for rel, _ in _high_signal_fallback_order(candidates)[:top_k]]
     return [rel for _, rel in ranked[:top_k]]
 
 
@@ -527,15 +586,7 @@ def select_files_by_bm25_budgeted(
     if not candidates:
         return []
 
-    high_signal_names = HIGH_SIGNAL_FILENAMES
-
-    normalized_terms: list[str] = []
-    seen_terms: set[str] = set()
-    for term in query_terms:
-        for token in _tokenize_text(term):
-            if token and token not in seen_terms:
-                seen_terms.add(token)
-                normalized_terms.append(token)
+    content_by_rel = {rel: content for rel, content in candidates}
 
     def _fill_budget(ordered: list[tuple[str, str]]) -> list[str]:
         selected: list[str] = []
@@ -548,61 +599,9 @@ def select_files_by_bm25_budgeted(
             tokens_used += cost
         return selected
 
-    if not normalized_terms:
-        return _fill_budget(candidates)
-
-    documents: list[tuple[str, list[str]]] = []
-    content_by_rel: dict[str, str] = {}
-    document_frequency: dict[str, int] = {}
-    total_length = 0
-
-    for rel, content in candidates:
-        tokens = _tokenize_text(f"{rel}\n{content}") or _tokenize_text(rel)
-        documents.append((rel, tokens))
-        content_by_rel[rel] = content
-        total_length += len(tokens)
-        for token in set(tokens):
-            document_frequency[token] = document_frequency.get(token, 0) + 1
-
-    avg_doc_length = total_length / len(documents) if documents else 0.0
-    k1 = 1.5
-    b = 0.75
-    ranked: list[tuple[float, str]] = []
-
-    for rel, tokens in documents:
-        if not tokens:
-            continue
-        token_counts: dict[str, int] = {}
-        for token in tokens:
-            token_counts[token] = token_counts.get(token, 0) + 1
-
-        doc_length = len(tokens)
-        norm = k1 * (1 - b + b * (doc_length / avg_doc_length)) if avg_doc_length else k1
-        score = 0.0
-        for term in normalized_terms:
-            tf = token_counts.get(term, 0)
-            if tf <= 0:
-                continue
-            n_docs = document_frequency.get(term, 0)
-            idf = math.log(1 + ((len(documents) - n_docs + 0.5) / (n_docs + 0.5)))
-            score += idf * ((tf * (k1 + 1)) / (tf + norm))
-
-        rel_lower = rel.lower()
-        basename = Path(rel_lower).name
-        if basename in high_signal_names:
-            score += 2.5
-        elif basename.startswith(("readme", "install")):
-            score += 1.5
-        if rel_lower.startswith(".github/workflows/"):
-            score += 0.25
-
-        if score > 0:
-            ranked.append((score, rel))
-
+    ranked = _bm25_rank(candidates, query_terms)
     if not ranked:
-        return _fill_budget(candidates)
-
-    ranked.sort(key=lambda item: (-item[0], item[1]))
+        return _fill_budget(_high_signal_fallback_order(candidates))
     return _fill_budget([(rel, content_by_rel.get(rel, "")) for _, rel in ranked])
 
 

@@ -13,6 +13,23 @@ profiles:
     temperature: 0.0
     role_framing: expert
 
+  # ── P* confirmation candidate (AB-05V) ───────────────────────────────────────
+  # After Phase 1, set these fields to the COMBINED winners: every factor whose AB-01..05
+  # arm beat the AB-00 anchor (role_framing, prompt_length_mode, few_shot_count). AB-05V
+  # runs this profile on flat_baseline; promote to pstar_profile ONLY if it does not
+  # regress vs AB-00 (and vs the best single-factor run) — OFAT can miss interactions.
+  # Set `temperature` to the winning value here — it flows to the generation + repair
+  # stages automatically in every phase (classify + install stay deterministic at 0.0),
+  # so no per-config freeze is needed. Defaults below = the anchor, so an unedited AB-05V
+  # reproduces AB-00.
+  pstar_candidate:
+    few_shot_count: 0
+    prompt_length_mode: detailed
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
   # ── Phase 1 — OFAT prompt ablation ──────────────────────────────────────────
   # Anchor (AB-00). Every Phase 1 run differs from this by exactly one variable so
   # effects are attributable. The anchor uses the FULL prompts (prompt_length_mode:
