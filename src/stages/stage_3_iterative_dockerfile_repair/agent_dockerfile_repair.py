@@ -131,6 +131,7 @@ TIMEOUTS = load_timeout_defaults(
         "verify_repair_timeout": 180,
         "verify_timeout": 30,
         "repair_max_output_tokens": 4096,
+        "build_timeout": 3600,
     },
 )
 
@@ -155,6 +156,7 @@ parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max
 parser.add_argument("--repair-timeout", type=int, default=int(TIMEOUTS["repair_timeout"]), help="Timeout for Dockerfile repair LLM calls in seconds")
 parser.add_argument("--verify-repair-timeout", type=int, default=int(TIMEOUTS["verify_repair_timeout"]), help="Timeout for verification-command repair LLM calls in seconds")
 parser.add_argument("--repair-max-output-tokens", type=int, default=int(TIMEOUTS["repair_max_output_tokens"]), help="Hard cap on output tokens for repair LLM calls; bounds runaway/non-terminating generations that otherwise hang until the wall-clock timeout")
+parser.add_argument("--build-timeout", type=int, default=int(TIMEOUTS["build_timeout"]), help="Hard wall-clock cap (seconds) on a single docker build attempt; a hung build (e.g. a package manager stalling on a registry) is killed and counted as a failed attempt rather than blocking the run indefinitely")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
@@ -690,16 +692,31 @@ async def run_build(command: list[str], repo_name: str, attempt: int) -> tuple[i
     output_chunks: list[str] = []
     assert process.stdout is not None
 
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
+    async def _stream_until_exit() -> int:
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            decoded_line = line.decode("utf-8", errors="replace")
+            output_chunks.append(decoded_line)
+            log_info(f"[build {repo_name} attempt {attempt}] {decoded_line.rstrip()}")
+        return await process.wait()
 
-        decoded_line = line.decode("utf-8", errors="replace")
-        output_chunks.append(decoded_line)
-        log_info(f"[build {repo_name} attempt {attempt}] {decoded_line.rstrip()}")
-
-    returncode = await process.wait()
+    try:
+        # A hung build (e.g. a package manager stalling on a registry behind a proxy)
+        # produces no output, so the readline loop would block forever. Cap the whole
+        # build on a wall clock; on timeout, kill it and report a failed attempt (124)
+        # so the repair loop and the overall run keep moving.
+        returncode = await asyncio.wait_for(_stream_until_exit(), timeout=args.build_timeout)
+    except asyncio.TimeoutError:
+        log_warn(f"[build {repo_name} attempt {attempt}] timed out after {args.build_timeout}s; killing build")
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        output_chunks.append(f"\n[build timed out after {args.build_timeout}s and was killed]\n")
+        return 124, "".join(output_chunks)
     return returncode, "".join(output_chunks)
 
 
