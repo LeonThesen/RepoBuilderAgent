@@ -54,7 +54,12 @@ def _load_yaml(path: Path) -> Optional[dict]:
 
 def _get_field_value(doc: dict, field: str):
     """Extract a field value from a schema v1.0 or v1.1 classification YAML."""
-    cats = doc.get("categories", {})
+    cats = doc.get("categories", {}) if isinstance(doc, dict) else {}
+    # A schema-drifted classification can emit `categories` as a list (e.g. a bare
+    # list of domain tags) instead of the field->value mapping. Treat any non-dict
+    # shape as "field not predicted" rather than crashing the whole eval run.
+    if not isinstance(cats, dict):
+        return None
     entry = cats.get(field, {})
     if entry is None:
         return None
