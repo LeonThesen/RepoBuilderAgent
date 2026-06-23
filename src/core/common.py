@@ -533,10 +533,19 @@ def load_summary(repo_name: str, repo_path: Path, summaries_dir: Path) -> str:
 # --max-input-tokens is the endpoint's real input cap (gpt-4o = 64000).
 DEFAULT_MAX_INPUT_TOKENS = 64000
 # Headroom left below the cap for the parts of the payload we cannot measure
-# from the assembled user prompt (ReAct system prompt + tool schemas + drift).
+# from the assembled user prompt (ReAct system prompt + tool schemas).
 PROMPT_OVERHEAD_RESERVE_TOKENS = 10000
+# The build endpoint's tokenizer counts more tokens than tiktoken's o200k_base
+# for our prompts (measured: angular gen prompt = 51,054 tiktoken but 64,331 at
+# the endpoint, ~1.26x). The drift scales with prompt size, so a flat overhead
+# reserve cannot cover it — we divide the cap by this factor (plus a margin over
+# the measured ratio) so the tiktoken-space budget we enforce maps to an
+# endpoint-token count safely under the real cap.
+TOKENIZER_DRIFT_FACTOR = 1.30
 
 _TREE_HEADER = "## Directory structure"
+_MANIFEST_HEADER = "## Manifest & config files"
+_MANIFEST_FILE_MARKER = "### `"
 
 
 @functools.lru_cache(maxsize=8)
@@ -593,6 +602,54 @@ def _shrink_tree_block(summary: str, budget_tokens: int, model: str) -> str:
     return prefix + "\n".join(kept + [marker]) + "\n" + suffix
 
 
+def _shrink_manifest_block(summary: str, budget_tokens: int, model: str) -> str:
+    """Keep the largest prefix of WHOLE manifest-file blocks that lets the whole
+    summary fit ``budget_tokens``; drop the trailing files behind a marker.
+
+    Drops whole files rather than cutting mid-file: a half-truncated package.json
+    or BUILD.bazel is worse build signal than one fewer complete manifest. Runs
+    after the directory tree has already been trimmed (lower value per token)."""
+    header_idx = summary.find(_MANIFEST_HEADER)
+    if header_idx == -1:
+        return summary
+    section_start = summary.find("\n", header_idx)
+    if section_start == -1:
+        return summary
+    section_start += 1
+    prefix, body = summary[:section_start], summary[section_start:]
+
+    first = body.find(_MANIFEST_FILE_MARKER)
+    if first == -1:
+        return summary
+    intro, rest = body[:first], body[first:]
+
+    blocks: list[str] = []
+    while rest:
+        nxt = rest.find(_MANIFEST_FILE_MARKER, len(_MANIFEST_FILE_MARKER))
+        if nxt == -1:
+            blocks.append(rest)
+            break
+        blocks.append(rest[:nxt])
+        rest = rest[nxt:]
+
+    marker_reserve = 64
+    fixed_tokens = count_tokens(prefix + intro, model) + marker_reserve
+    kept: list[str] = []
+    running = fixed_tokens
+    for block in blocks:
+        block_tokens = count_tokens(block, model)
+        if running + block_tokens > budget_tokens:
+            break
+        kept.append(block)
+        running += block_tokens
+
+    if len(kept) == len(blocks):
+        return summary
+    omitted = len(blocks) - len(kept)
+    marker = f"… [{omitted} of {len(blocks)} manifest files omitted to fit the input-token budget]\n"
+    return prefix + intro + "".join(kept) + marker
+
+
 def _hard_truncate(text: str, budget_tokens: int, model: str) -> str:
     """Last-resort token clamp: slice ``text`` to ``budget_tokens`` and mark it."""
     enc = _token_encoder(model)
@@ -635,8 +692,9 @@ def truncate_content_keep_ends(
 def bound_summary(summary: str, budget_tokens: int, model: str = "gpt-4o") -> str:
     """Return ``summary`` trimmed to at most ``budget_tokens``.
 
-    Trims the directory-tree block first (lowest value per token); if that is
-    not enough, hard-truncates the remainder. Warns whenever it cuts.
+    Trims the directory-tree block first (lowest value per token), then drops
+    whole manifest files, and only hard-truncates as a last resort. Warns
+    whenever it cuts.
     """
     if budget_tokens <= 0:
         log_warn(f"[token-bound] summary budget is {budget_tokens}; dropping summary content")
@@ -647,7 +705,11 @@ def bound_summary(summary: str, budget_tokens: int, model: str = "gpt-4o") -> st
     if count_tokens(shrunk, model) <= budget_tokens:
         log_warn(f"[token-bound] directory tree trimmed to fit {budget_tokens}-token summary budget")
         return shrunk
-    log_warn(f"[token-bound] summary still over {budget_tokens} tokens after tree trim; hard-truncating")
+    shrunk = _shrink_manifest_block(shrunk, budget_tokens, model)
+    if count_tokens(shrunk, model) <= budget_tokens:
+        log_warn(f"[token-bound] directory tree + manifest files trimmed to fit {budget_tokens}-token summary budget")
+        return shrunk
+    log_warn(f"[token-bound] summary still over {budget_tokens} tokens after tree + manifest trim; hard-truncating")
     return _hard_truncate(shrunk, budget_tokens, model)
 
 
@@ -662,10 +724,14 @@ def clamp_summary_in_prompt(
     """Final guard: if ``prompt`` exceeds the effective cap, trim the embedded
     ``summary`` (the one unbounded region) just enough to fit. No-op when under.
 
-    The effective cap is ``max_input_tokens - PROMPT_OVERHEAD_RESERVE_TOKENS`` so
-    there is room for payload parts we cannot see here (ReAct system prompt + tool
-    schemas + tokenizer drift); without that reserve the call still 400s."""
-    effective_cap = max(0, max_input_tokens - PROMPT_OVERHEAD_RESERVE_TOKENS)
+    The effective cap is computed in tiktoken space as
+    ``(max_input_tokens - PROMPT_OVERHEAD_RESERVE_TOKENS) / TOKENIZER_DRIFT_FACTOR``:
+    the reserve leaves room for payload parts we cannot see here (ReAct system
+    prompt + tool schemas), and the drift divisor maps our tiktoken count to the
+    heavier count the endpoint actually enforces. Without both, the call 400s."""
+    effective_cap = max(
+        0, int((max_input_tokens - PROMPT_OVERHEAD_RESERVE_TOKENS) / TOKENIZER_DRIFT_FACTOR)
+    )
     total = count_tokens(prompt, model)
     if total <= effective_cap:
         return prompt
@@ -675,7 +741,8 @@ def clamp_summary_in_prompt(
     label = f"[token-bound]{(' ' + phase) if phase else ''}"
     log_warn(
         f"{label}: prompt {total} > effective cap {effective_cap} "
-        f"(endpoint cap {max_input_tokens} - reserve {PROMPT_OVERHEAD_RESERVE_TOKENS}); "
+        f"(endpoint cap {max_input_tokens} - reserve {PROMPT_OVERHEAD_RESERVE_TOKENS}, "
+        f"/{TOKENIZER_DRIFT_FACTOR} tokenizer drift); "
         f"summary {summary_tokens} -> {count_tokens(bounded, model)} tokens"
     )
     return prompt.replace(summary, bounded, 1)
