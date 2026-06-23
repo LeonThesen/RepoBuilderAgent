@@ -372,6 +372,11 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+# pnpm/npm do not reliably honour NODE_EXTRA_CA_CERTS for registry TLS under a
+# corporate TLS-intercepting CA, and stall on the handshake (this hung vite's
+# build for hours). Mirror the dataset validation harness (helper.py) and skip
+# Node TLS verification whenever a corporate CA is present.
+ENV NODE_TLS_REJECT_UNAUTHORIZED=0
 ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_DIR=/etc/ssl/certs
 ENV JAVA_TOOL_OPTIONS="-Dcom.sun.jndi.ldap.connect.pool=false -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStorePassword=changeit"
