@@ -7,6 +7,7 @@ import base64
 import functools
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -121,6 +122,7 @@ async def chat_completion_with_retries(
     timeout_seconds: int,
     max_retries: int,
     retry_backoff_seconds: float,
+    max_tokens: int | None = None,
 ):
     bucket = _phase_bucket(metrics, phase)
     last_error: Exception | None = None
@@ -137,18 +139,24 @@ async def chat_completion_with_retries(
             # a very large prompt) never trips it and the call hangs indefinitely.
             c = client.with_options(timeout=timeout_seconds)
             if use_responses_api:
+                responses_kwargs = {"model": model, "input": messages}
+                if max_tokens is not None:
+                    responses_kwargs["max_output_tokens"] = max_tokens
                 raw = await asyncio.wait_for(
-                    c.responses.create(model=model, input=messages),
+                    c.responses.create(**responses_kwargs),
                     timeout=timeout_seconds,
                 )
                 response = _normalize_responses_output(raw)
             else:
+                completion_kwargs = {
+                    "model": model,
+                    "temperature": temperature,
+                    "messages": messages,
+                }
+                if max_tokens is not None:
+                    completion_kwargs["max_tokens"] = max_tokens
                 response = await asyncio.wait_for(
-                    c.chat.completions.create(
-                        model=model,
-                        temperature=temperature,
-                        messages=messages,
-                    ),
+                    c.chat.completions.create(**completion_kwargs),
                     timeout=timeout_seconds,
                 )
             latency = round(time.perf_counter() - started, 3)
@@ -243,6 +251,14 @@ async def chat_completion_with_retries(
     raise RuntimeError(f"Unexpected completion retry flow for {repo_url} [{phase}]")
 
 
+# Sentinel comments that bracket the auto-injected corporate-CA bootstrap block.
+# They make the block trivially strippable before it is shown to a repair LLM (so
+# the model never has to regurgitate the multi-kilobyte base64 cert payload) and
+# serve as the idempotency guard so a re-injection on a repair pass is a no-op.
+CA_BLOCK_BEGIN_MARKER = "# >>> manualrepos-ca-bootstrap (auto-injected at build time) >>>"
+CA_BLOCK_END_MARKER = "# <<< manualrepos-ca-bootstrap <<<"
+
+
 def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | None = None) -> str:
     """
     Inject CA certificate setup into the Dockerfile if MANUALREPOS_CA_CERT_B64 is present.
@@ -293,7 +309,7 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
         return ensure_root_for_sensitive_runs(dockerfile_content)
 
     # Avoid repeatedly injecting very large CA blocks on retries/repair passes.
-    if "manualrepos-refresh-ca-certificates" in dockerfile_content:
+    if CA_BLOCK_BEGIN_MARKER in dockerfile_content or "manualrepos-refresh-ca-certificates" in dockerfile_content:
         return ensure_root_for_sensitive_runs(dockerfile_content)
 
     decoded_bundle = base64.b64decode(ca_cert_b64).decode("utf-8")
@@ -371,13 +387,58 @@ ENV MAVEN_OPTS="-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.n
         # Insert CA setup after first FROM line, before anything else
         if not inserted and line.strip().upper().startswith("FROM"):
             injected_lines.append(line)
+            injected_lines.append(CA_BLOCK_BEGIN_MARKER)
             injected_lines.append("USER root")
             injected_lines.append(ca_setup_commands.strip())
+            injected_lines.append(CA_BLOCK_END_MARKER)
             inserted = True
         else:
             injected_lines.append(line)
 
     return ensure_root_for_sensitive_runs("\n".join(injected_lines))
+
+
+def strip_ca_cert_from_dockerfile(dockerfile_content: str) -> str:
+    """Remove the auto-injected corporate-CA bootstrap block (the sentinel-bracketed
+    region added by ``inject_ca_cert_into_dockerfile``), replacing it with a one-line
+    comment. The block is re-added at build time by injection, so an LLM editing the
+    Dockerfile never needs to see or reproduce the multi-kilobyte base64 cert payload.
+    Idempotent and a no-op when no injected block is present."""
+    if CA_BLOCK_BEGIN_MARKER not in dockerfile_content:
+        return dockerfile_content
+    out: list[str] = []
+    skipping = False
+    for line in dockerfile_content.split("\n"):
+        if not skipping and line.strip().startswith(CA_BLOCK_BEGIN_MARKER):
+            skipping = True
+            out.append("# [corporate CA-cert bootstrap auto-injected at build time; omitted here]")
+            continue
+        if skipping:
+            if CA_BLOCK_END_MARKER in line:
+                skipping = False
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+# A run of base64 long enough to be a cert/script blob rather than an incidental token.
+_LONG_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{120,}={0,2}")
+
+
+def sanitize_build_log_for_prompt(text: str) -> str:
+    """Strip the two kinds of high-volume noise that dominate failing-build logs before
+    they are embedded in a repair prompt: (1) multi-kilobyte base64 blobs echoed by
+    BuildKit (e.g. the injected CA cert), and (2) carriage-return progress-bar spam
+    (apt/dpkg ``\\r``-redrawn lines). Both inflate the prompt and bait the model into
+    degenerate repetition. Returns the de-noised log; signal lines are preserved."""
+    collapsed_lines = []
+    for line in text.split("\n"):
+        # A terminal renders only what follows the last carriage return on a line.
+        if "\r" in line:
+            line = line.split("\r")[-1]
+        collapsed_lines.append(line)
+    collapsed = "\n".join(collapsed_lines)
+    return _LONG_BASE64_RE.sub("<base64 blob omitted>", collapsed)
 
 
 def repo_name_from_url(repo_url: str) -> str:

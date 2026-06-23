@@ -42,6 +42,8 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        strip_ca_cert_from_dockerfile,
+        sanitize_build_log_for_prompt,
         build_async_http_client,
         chat_completion_with_retries,
         clamp_summary_in_prompt,
@@ -91,6 +93,8 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        strip_ca_cert_from_dockerfile,
+        sanitize_build_log_for_prompt,
         build_async_http_client,
         chat_completion_with_retries,
         clamp_summary_in_prompt,
@@ -126,6 +130,7 @@ TIMEOUTS = load_timeout_defaults(
         "repair_timeout": 240,
         "verify_repair_timeout": 180,
         "verify_timeout": 30,
+        "repair_max_output_tokens": 4096,
     },
 )
 
@@ -149,6 +154,7 @@ parser.add_argument("--timeout", type=int, default=int(TIMEOUTS["timeout"]), hel
 parser.add_argument("--llm-max-retries", type=int, default=int(TIMEOUTS["llm_max_retries"]), help="Maximum retries for transient LLM timeouts and retryable API errors")
 parser.add_argument("--repair-timeout", type=int, default=int(TIMEOUTS["repair_timeout"]), help="Timeout for Dockerfile repair LLM calls in seconds")
 parser.add_argument("--verify-repair-timeout", type=int, default=int(TIMEOUTS["verify_repair_timeout"]), help="Timeout for verification-command repair LLM calls in seconds")
+parser.add_argument("--repair-max-output-tokens", type=int, default=int(TIMEOUTS["repair_max_output_tokens"]), help="Hard cap on output tokens for repair LLM calls; bounds runaway/non-terminating generations that otherwise hang until the wall-clock timeout")
 parser.add_argument("--trace", action="store_true", help="Enable verbose trace logs")
 parser.add_argument("--dump-prompts", default=None, metavar="PATH", help="Write each rendered prompt to PATH/<repo>/<phase>.<n>.txt before the LLM call")
 parser.add_argument("--results-dir", default="classification_results", help="Directory containing classification result YAML files")
@@ -958,6 +964,15 @@ async def request_repair(
     repo_path: "Path | None" = None,
     report_dir: "Path | None" = None,
 ) -> str:
+    # De-noise the inputs before they reach the model. The auto-injected corporate-CA
+    # bootstrap (a multi-kilobyte base64 blob) is stripped from the Dockerfile — it is
+    # re-added at build time by inject_ca_cert_into_dockerfile, so the model must never
+    # reproduce it (forcing it to was driving non-terminating generations that hung
+    # until the wall-clock repair timeout). The build log is stripped of echoed base64
+    # blobs and carriage-return progress-bar spam for the same reason.
+    dockerfile_content = strip_ca_cert_from_dockerfile(dockerfile_content)
+    build_log = sanitize_build_log_for_prompt(build_log)
+
     # Baseline repair: a single LLM call over just the current Dockerfile and the
     # build log. This is the flat_baseline mechanism; the ReAct agent below is a
     # gated architecture component.
@@ -979,6 +994,7 @@ async def request_repair(
             timeout_seconds=args.repair_timeout,
             max_retries=args.llm_max_retries,
             retry_backoff_seconds=args.llm_retry_backoff_seconds,
+            max_tokens=args.repair_max_output_tokens,
         )
         raw = response.choices[0].message.content or ""
         return extract_dockerfile(raw.strip())
@@ -1097,6 +1113,32 @@ async def request_repair(
     return repaired
 
 
+# Transient LLM/transport failures that should burn a single repair attempt and let
+# the loop retry on the next one, rather than escaping the whole per-repo attempt loop
+# (a flaky endpoint must not cost a repo all of its remaining repair budget).
+_TRANSIENT_REPAIR_ERRORS = (
+    APITimeoutError,
+    APIError,
+    httpx.HTTPError,
+    ssl.SSLError,
+    asyncio.TimeoutError,
+)
+
+
+async def _safe_request_repair(repo_url: str, attempt: int, repair_coro):
+    """Await a request_repair() coroutine, swallowing transient errors so one failed
+    generation does not abort the remaining attempts. Returns None on transient failure;
+    callers should skip applying a repair and continue to the next attempt."""
+    try:
+        return await repair_coro
+    except _TRANSIENT_REPAIR_ERRORS as error:
+        log_warn(
+            f"Repair generation failed for {repo_url} attempt {attempt} "
+            f"({type(error).__name__}: {error}); retrying on next attempt"
+        )
+        return None
+
+
 async def _simple_verify_command_call(
     repo_url: str, system_prompt: str, prompt: str, llm_metrics: dict, phase: str
 ) -> str:
@@ -1116,6 +1158,7 @@ async def _simple_verify_command_call(
         timeout_seconds=args.verify_repair_timeout,
         max_retries=args.llm_max_retries,
         retry_backoff_seconds=args.llm_retry_backoff_seconds,
+        max_tokens=args.repair_max_output_tokens,
     )
     return (response.choices[0].message.content or "").strip()
 
@@ -1643,24 +1686,30 @@ async def repair_repository(
                         break
 
                     log_info(f"Verification repair was insufficient for {repo_url}; rewriting Dockerfile as a fallback...")
-                    repaired_dockerfile = await request_repair(
-                        repo_url=repo_url,
-                        attempt_number=attempt,
-                        classification=classification,
-                        summary=summary,
-                        dockerfile_content=current_dockerfile,
-                        build_log=build_log,
-                        failure_hints={
-                            "build": build_failure_hints,
-                            "verify": verify_failure_hints,
-                            "verify_retry": retry_failure_hints,
-                        },
-                        llm_metrics=llm_metrics,
-                        repair_history=repair_history,
-                        architecture_scratchpad_context=architecture_scratchpad_context,
-                        repo_path=repo_path,
-                        report_dir=report_dir,
+                    repaired_dockerfile = await _safe_request_repair(
+                        repo_url,
+                        attempt,
+                        request_repair(
+                            repo_url=repo_url,
+                            attempt_number=attempt,
+                            classification=classification,
+                            summary=summary,
+                            dockerfile_content=current_dockerfile,
+                            build_log=build_log,
+                            failure_hints={
+                                "build": build_failure_hints,
+                                "verify": verify_failure_hints,
+                                "verify_retry": retry_failure_hints,
+                            },
+                            llm_metrics=llm_metrics,
+                            repair_history=repair_history,
+                            architecture_scratchpad_context=architecture_scratchpad_context,
+                            repo_path=repo_path,
+                            report_dir=report_dir,
+                        ),
                     )
+                    if repaired_dockerfile is None:
+                        continue
                     prior_dockerfile = current_dockerfile
                     current_dockerfile, stop = _apply_repair(
                         repo_url, repo_name, current_dockerfile, repaired_dockerfile,
@@ -1711,20 +1760,26 @@ async def repair_repository(
                     break
 
                 log_info(f"Diagnosing failed build for {repo_url} and rewriting Dockerfile...")
-                repaired_dockerfile = await request_repair(
-                    repo_url=repo_url,
-                    attempt_number=attempt,
-                    classification=classification,
-                    summary=summary,
-                    dockerfile_content=current_dockerfile,
-                    build_log=build_log,
-                    failure_hints={"build": build_failure_hints},
-                    llm_metrics=llm_metrics,
-                    repair_history=repair_history,
-                    architecture_scratchpad_context=architecture_scratchpad_context,
-                    repo_path=repo_path,
-                    report_dir=report_dir,
+                repaired_dockerfile = await _safe_request_repair(
+                    repo_url,
+                    attempt,
+                    request_repair(
+                        repo_url=repo_url,
+                        attempt_number=attempt,
+                        classification=classification,
+                        summary=summary,
+                        dockerfile_content=current_dockerfile,
+                        build_log=build_log,
+                        failure_hints={"build": build_failure_hints},
+                        llm_metrics=llm_metrics,
+                        repair_history=repair_history,
+                        architecture_scratchpad_context=architecture_scratchpad_context,
+                        repo_path=repo_path,
+                        report_dir=report_dir,
+                    ),
                 )
+                if repaired_dockerfile is None:
+                    continue
                 prior_dockerfile = current_dockerfile
                 current_dockerfile, stop = _apply_repair(
                     repo_url, repo_name, current_dockerfile, repaired_dockerfile,
@@ -1790,7 +1845,10 @@ async def repair_repository(
         except APIError as error:
             log_warn(f"OpenAI API error for {repo_url}: {error}")
         except Exception as error:
-            log_error(f"Unexpected error while repairing Dockerfile for {repo_url}: {error}")
+            log_error(
+                f"Unexpected error while repairing Dockerfile for {repo_url}: "
+                f"{type(error).__name__}: {error}"
+            )
         finally:
             if report["attempts"]:
                 write_text(report_path, render_yaml(report))
