@@ -499,7 +499,9 @@ def compute_repo_metrics(
     ground_truth_index: Optional[dict] = None,
 ) -> dict:
     repo_url = repo_result["url"]
-    log_path = Path(repo_result.get("log", ""))
+    # A repo that failed before the pipeline ran (e.g. a checkout error) has
+    # "log": None, so .get(..., "") returns None, not the default. Guard against it.
+    log_path = Path(repo_result.get("log") or "")
 
     phase_tokens = parse_tokens_from_log(log_path)
     token_summary = aggregate_tokens(phase_tokens)
