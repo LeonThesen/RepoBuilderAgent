@@ -602,6 +602,36 @@ def _hard_truncate(text: str, budget_tokens: int, model: str) -> str:
     return enc.decode(enc.encode(text)[:keep]) + marker
 
 
+def truncate_content_keep_ends(
+    text: str, budget_tokens: int, model: str = "gpt-4o", *, label: str = "file"
+) -> str:
+    """Cap a single file's content to ``budget_tokens``, keeping head AND tail.
+
+    Unlike a head-only clamp, this elides the middle: lockfiles and generated
+    manifests carry build-relevant lines at both ends (the dependency list up
+    top, config/overrides at the bottom), so a middle cut preserves more signal
+    than dropping the tail. Used to stop one fat file from starving the rest of
+    a multi-file fingerprint before the whole-prompt budget guard runs."""
+    if budget_tokens <= 0 or not text:
+        return text
+    enc = _token_encoder(model)
+    tokens = enc.encode(text)
+    if len(tokens) <= budget_tokens:
+        return text
+    marker = (
+        f"\n… [{label}: {len(tokens) - budget_tokens} of {len(tokens)} "
+        f"tokens elided from the middle to fit the per-file cap]\n"
+    )
+    keep = max(0, budget_tokens - count_tokens(marker, model))
+    if keep <= 0:
+        return marker.strip()
+    head = keep * 7 // 10
+    tail = keep - head
+    if tail <= 0:
+        return enc.decode(tokens[:keep]) + marker
+    return enc.decode(tokens[:head]) + marker + enc.decode(tokens[len(tokens) - tail:])
+
+
 def bound_summary(summary: str, budget_tokens: int, model: str = "gpt-4o") -> str:
     """Return ``summary`` trimmed to at most ``budget_tokens``.
 

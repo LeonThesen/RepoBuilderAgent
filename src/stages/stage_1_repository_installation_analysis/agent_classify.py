@@ -1130,6 +1130,9 @@ async def _select_relevant_files(
             selected_files = default_selected_files.copy()
         log_info(f"Selected {len(selected_files)} files for {repo_name} via neural embedding retrieval.")
     elif args.retrieval_strategy == "one_shot_fingerprint":
+        budget = int(args.max_input_tokens * 0.8)
+        # Cap each manifest so one fat lockfile can't fill the budget and starve
+        # the real build files; >=8 files always fit before the whole-blob guard.
         baseline_summary = fingerprint(
             format="md",
             repo_path=str(repo_path),
@@ -1137,9 +1140,11 @@ async def _select_relevant_files(
             selected_files=None,
             include_tree=True,
             context="step2-one-shot-fingerprint",
+            max_tokens_per_file=max(2000, budget // 8),
+            token_model=args.model,
         )
         baseline_summary = _truncate_to_token_budget(
-            baseline_summary, args.model, int(args.max_input_tokens * 0.8),
+            baseline_summary, args.model, budget,
             label="one-shot fingerprint",
         )
         selected_files = []

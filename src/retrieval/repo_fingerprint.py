@@ -750,6 +750,8 @@ def fingerprint(
     selected_files: Optional[list[str]] = None,
     include_tree: bool = True,
     context: Optional[str] = None,
+    max_tokens_per_file: Optional[int] = None,
+    token_model: str = "gpt-4o",
 ) -> str:
     root = Path(repo_path).resolve()
     if not root.is_dir():
@@ -772,6 +774,28 @@ def fingerprint(
     else:
         log_info(f"Collecting manifest files ...{ctx}")
         manifests = _cached_walk(root, "manifests", lambda: collect_manifest_files(root))
+
+    if max_tokens_per_file and max_tokens_per_file > 0 and manifests:
+        # Lazy import: common.py imports this module, so a top-level import cycles.
+        try:
+            from RepoBuilderAgent.src.core.common import truncate_content_keep_ends
+        except ImportError:
+            from core.common import truncate_content_keep_ends
+        capped = 0
+        new_manifests: list[tuple[str, str]] = []
+        for rel, content in manifests:
+            trimmed = truncate_content_keep_ends(
+                content, max_tokens_per_file, token_model, label=rel
+            )
+            if trimmed is not content:
+                capped += 1
+            new_manifests.append((rel, trimmed))
+        manifests = new_manifests
+        if capped:
+            log_info(
+                f"Per-file cap ({max_tokens_per_file} tokens) trimmed {capped} "
+                f"oversized manifest file(s){ctx}"
+            )
 
     log_info(f"Collecting metadata ...{ctx}")
     meta = _cached_walk(root, "meta", lambda: collect_metadata(root))
