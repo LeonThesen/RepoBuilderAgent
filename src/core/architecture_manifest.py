@@ -196,10 +196,13 @@ def active_components(flags: dict) -> list[Component]:
     if not skips.get("repair"):
         out.append(Component("stage3.repair", "repair report", "primary", REPAIR,
                              f"{_S3}.agent_dockerfile_repair:repair_repository", "reports_dir", "{repo}/report.yaml"))
-        # L3 ReAct repair loop is wiring-checked only: its per-attempt trace is
-        # written *only* when a build actually fails, so absence is not NO_OUTPUT.
-        out.append(Component("stage3.l3_react_loop", "L3 repair ReAct loop", "subpart", REPAIR,
-                             f"{_S3}.l3_react_loop:run_l3_dockerfile_repair_react"))
+        # The L3 ReAct repair loop is a gated component: the baseline repair is a
+        # single-shot LLM call, so the ReAct loop only runs when react_repair is on.
+        # Wiring-checked only — its per-attempt trace is written *only* when a build
+        # actually fails, so absence is not NO_OUTPUT.
+        if flags.get("react_repair"):
+            out.append(Component("stage3.l3_react_loop", "L3 repair ReAct loop", "subpart", REPAIR,
+                                 f"{_S3}.l3_react_loop:run_l3_dockerfile_repair_react"))
 
     if not skips.get("install_guide"):
         out.append(Component("stage4.install_guide", "INSTALL.md", "primary", INSTALL_GUIDE,
@@ -218,7 +221,9 @@ def active_tools(flags: dict) -> list[Tool]:
             consumers.add("l1_react")
         if flags.get("validation"):
             consumers.add("l3_validation")
-    if not skips.get("repair"):
+    # The repair ReAct tools (think/hadolint, snippet, repo tools) exist only when
+    # the ReAct repair agent is active; the baseline single-shot repair uses none.
+    if not skips.get("repair") and flags.get("react_repair"):
         consumers.add("repair")
         if flags.get("snippet_tools"):
             consumers.add("repair_snippet")

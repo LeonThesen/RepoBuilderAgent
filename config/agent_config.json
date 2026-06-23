@@ -29,6 +29,7 @@
     "one_shot_direct": false
   },
   "repair": {
+    "react": true,
     "stateful_repair": true,
     "stateful_repair_tree": true,
     "history_window": 4,

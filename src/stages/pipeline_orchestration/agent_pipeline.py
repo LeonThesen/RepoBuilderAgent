@@ -121,6 +121,20 @@ stateful_group.add_argument(
     help="Disable stateful Dockerfile repair prompts.",
 )
 parser.set_defaults(stateful_repair=False)
+react_repair_group = parser.add_mutually_exclusive_group()
+react_repair_group.add_argument(
+    "--react-repair",
+    dest="react_repair",
+    action="store_true",
+    help="Use the L3 ReAct repair agent (think/hadolint/finalize tools, multi-step loop).",
+)
+react_repair_group.add_argument(
+    "--no-react-repair",
+    dest="react_repair",
+    action="store_false",
+    help="Use the baseline single-shot repair (current Dockerfile + build log -> one LLM call).",
+)
+parser.set_defaults(react_repair=True)
 parser.add_argument(
     "--stateful-history-window",
     type=int,
@@ -742,6 +756,9 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
         if not isinstance(repair_cfg, dict):
             raise ValueError("agent_config.repair must be an object")
 
+        if "react" in repair_cfg:
+            args.react_repair = _expect_bool(repair_cfg["react"], key="repair.react")
+            applied.setdefault("repair", {})["react"] = args.react_repair
         if "stateful_repair" in repair_cfg:
             args.stateful_repair = _expect_bool(repair_cfg["stateful_repair"], key="repair.stateful_repair")
             applied.setdefault("repair", {})["stateful_repair"] = args.stateful_repair
@@ -910,6 +927,7 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
         "--max-attempts", str(args.max_attempts),
         "--max-log-chars", str(args.max_log_chars),
         "--max-input-tokens", str(args.max_input_tokens),
+        "--react-repair" if args.react_repair else "--no-react-repair",
     ])
     if args.skip_hadolint:
         command.append("--skip-hadolint")
@@ -1088,6 +1106,7 @@ def build_architecture_flags(phase_skips: dict) -> dict:
         "scratchpads": bool(args.arch_scratchpads_enabled),
         "snippet_tools": bool(args.snippet_tools),
         "repair_repo_tools": bool(args.repair_repo_tools),
+        "react_repair": bool(args.react_repair),
         "stateful_repair": bool(args.stateful_repair),
         "stateful_repair_tree": bool(args.stateful_repair_tree),
     }
@@ -1553,6 +1572,10 @@ def main() -> int:
     args.arch_scratchpads_enabled = bool(base_variant_policy.get("scratchpads_enabled", True))
     if "snippet_tools_enabled" in base_variant_policy:
         args.snippet_tools = bool(base_variant_policy["snippet_tools_enabled"])
+    # Repair is the baseline single-shot loop unless a variant explicitly opts into
+    # the ReAct repair agent (repair-phase variants + full_system). agent_config can
+    # still override this below.
+    args.react_repair = bool(base_variant_policy.get("react_repair_enabled", False))
 
     agent_config_path = _resolve_agent_config_path(workspace_root)
     agent_config_applied: dict = {}

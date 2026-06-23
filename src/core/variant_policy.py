@@ -78,6 +78,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "ab_stateful_tree_off": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
         "classification_required": True,
         "repair_enabled": True,
@@ -92,6 +93,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "ab_stateful_tree_on": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
         "classification_required": True,
         "repair_enabled": True,
@@ -106,6 +108,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "ab_prev_attempt_ctx_on": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
         "classification_required": True,
         "repair_enabled": True,
@@ -120,6 +123,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "ab_prev_attempt_ctx_off": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
         "classification_required": True,
         "repair_enabled": True,
@@ -134,6 +138,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "full_system": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
         "classification_required": True,
         "repair_enabled": True,
@@ -145,6 +150,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "ab_snippet_tools_baseline": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "staged_pipeline",
         "classification_required": True,
         "repair_enabled": True,
@@ -157,6 +163,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "ab_snippet_tools_on": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
         "classification_required": True,
         "repair_enabled": True,
@@ -169,6 +176,7 @@ VARIANT_POLICY_TABLE: dict[str, dict] = {
     },
     "ab_snippet_tools_off": {
         "phase2_anchor": False,
+        "react_repair_enabled": True,
         "repo_context_source": "iterative_exploration_synthesis_validation_scratchpads",
         "classification_required": True,
         "repair_enabled": True,
@@ -238,6 +246,9 @@ FALLBACK_VARIANT_POLICY: dict = {
     "validation_enabled": False,
     "scratchpads_enabled": False,
     "retrieval_strategy": "one_shot_fingerprint",
+    # Baseline repair is the single-shot loop (current Dockerfile + build log only);
+    # the ReAct repair agent is a gated component enabled only by specific variants.
+    "react_repair_enabled": False,
 }
 
 

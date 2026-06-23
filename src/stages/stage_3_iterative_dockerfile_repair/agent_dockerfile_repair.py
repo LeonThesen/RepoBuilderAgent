@@ -42,6 +42,7 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        chat_completion_with_retries,
         clamp_summary_in_prompt,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
@@ -89,6 +90,7 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         inject_ca_cert_into_dockerfile,
+        chat_completion_with_retries,
         clamp_summary_in_prompt,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
@@ -232,6 +234,25 @@ parser.add_argument(
 )
 parser.add_argument("--force", action="store_true", help="Re-run repair even if a successful report.yaml already exists")
 parser.add_argument(
+    "--react-repair",
+    dest="react_repair",
+    action="store_true",
+    help="Use the L3 ReAct repair agent (think/hadolint/finalize tools, multi-step loop).",
+)
+parser.add_argument(
+    "--no-react-repair",
+    dest="react_repair",
+    action="store_false",
+    help="Use the baseline single-shot repair (current Dockerfile + build log -> one LLM call).",
+)
+parser.set_defaults(react_repair=True)
+parser.add_argument(
+    "--llm-retry-backoff-seconds",
+    type=float,
+    default=float(TIMEOUTS["llm_retry_backoff_seconds"]),
+    help="Base backoff seconds between LLM retries (used by the single-shot repair call).",
+)
+parser.add_argument(
     "--max-input-tokens",
     type=int,
     default=DEFAULT_MAX_INPUT_TOKENS,
@@ -257,6 +278,11 @@ client = AsyncOpenAI(
 
 with open(prompt_path("PROMPT_DOCKERFILE_REPAIR.md"), "r", encoding="utf-8") as prompt_file:
     PROMPT_TEMPLATE = apply_prompt_profile(prompt_file.read(), PROMPT_PROFILE, "repair")
+
+# Baseline single-shot repair prompt (current Dockerfile + build log only), used
+# when the ReAct repair agent is disabled (the flat_baseline repair mechanism).
+with open(prompt_path("PROMPT_DOCKERFILE_REPAIR_SIMPLE.md"), "r", encoding="utf-8") as prompt_file:
+    SIMPLE_PROMPT_TEMPLATE = apply_prompt_profile(prompt_file.read(), PROMPT_PROFILE, "repair")
 
 with open(prompt_path("PROMPT_BUILD_VERIFICATION.md"), "r", encoding="utf-8") as prompt_file:
     VERIFY_PROMPT_TEMPLATE = prompt_file.read()
@@ -932,6 +958,31 @@ async def request_repair(
     repo_path: "Path | None" = None,
     report_dir: "Path | None" = None,
 ) -> str:
+    # Baseline repair: a single LLM call over just the current Dockerfile and the
+    # build log. This is the flat_baseline mechanism; the ReAct agent below is a
+    # gated architecture component.
+    if not args.react_repair:
+        simple_prompt = (
+            SIMPLE_PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
+            .replace("{{ATTEMPT_NUMBER}}", str(attempt_number))
+            .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
+            .replace("{{BUILD_LOG}}", trim_log(build_log))
+        )
+        response = await chat_completion_with_retries(
+            client=client,
+            model=args.model,
+            temperature=EFFECTIVE_TEMPERATURE,
+            messages=[{"role": "user", "content": simple_prompt}],
+            repo_url=repo_url,
+            phase="repair",
+            metrics=llm_metrics,
+            timeout_seconds=args.repair_timeout,
+            max_retries=args.llm_max_retries,
+            retry_backoff_seconds=args.llm_retry_backoff_seconds,
+        )
+        raw = response.choices[0].message.content or ""
+        return extract_dockerfile(raw.strip())
+
     base_template = get_base_template(
         classification,
         Path(__file__).resolve().parents[3] / "templates",
