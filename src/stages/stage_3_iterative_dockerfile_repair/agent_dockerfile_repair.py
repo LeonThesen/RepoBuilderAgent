@@ -1495,7 +1495,12 @@ async def repair_repository(
                 write_text(dockerfile_path, original_dockerfile_content)
 
                 write_text(build_log_path, build_log)
-                write_text(dockerfile_snapshot_path, current_dockerfile)
+                # Snapshot what actually built (post root-wrapping injection), not the
+                # pre-injection source: build-time mutations like ensure_root_for_sensitive_runs
+                # can change structure/line numbers, and the build log references the injected
+                # file's line numbers. Strip the multi-kilobyte CA-cert block so the snapshot
+                # stays readable while still reflecting the real built Dockerfile.
+                write_text(dockerfile_snapshot_path, strip_ca_cert_from_dockerfile(dockerfile_for_build))
 
                 report["attempts"].append(
                     {

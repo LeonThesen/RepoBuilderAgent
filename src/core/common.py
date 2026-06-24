@@ -287,35 +287,53 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
     - Rust/cargo CA configuration
     """
     def ensure_root_for_sensitive_runs(content: str) -> str:
-        """Ensure privileged RUN commands execute as root, then restore prior user."""
+        """Ensure privileged RUN commands execute as root, then restore prior user.
+
+        Operates on logical Dockerfile instructions, not physical lines: a RUN that
+        spans multiple physical lines via trailing-backslash continuations is treated
+        as a single block, so the USER root / USER <prev> guards are wrapped around the
+        WHOLE block. Wrapping a single physical line would splice a USER directive into
+        the middle of a `\\` continuation and orphan the rest as bogus instructions
+        (e.g. `pip install ...` -> "unknown instruction: pip").
+        """
         lines_local = content.split("\n")
         rewritten: list[str] = []
         current_user = "root"
 
-        for raw_line in lines_local:
-            stripped = raw_line.strip()
+        i = 0
+        while i < len(lines_local):
+            # Gather one logical instruction: the current physical line plus any that
+            # follow it under a trailing-backslash continuation.
+            block = [lines_local[i]]
+            while block[-1].rstrip().endswith("\\") and i + 1 < len(lines_local):
+                i += 1
+                block.append(lines_local[i])
+            i += 1
+
+            stripped = block[0].strip()
             upper = stripped.upper()
 
             if upper.startswith("USER "):
                 parts = stripped.split(None, 1)
                 if len(parts) == 2 and parts[1].strip():
                     current_user = parts[1].strip()
-                rewritten.append(raw_line)
+                rewritten.extend(block)
                 continue
 
+            block_upper = "\n".join(block).upper()
             is_run = upper.startswith("RUN ")
-            is_chown_run = is_run and "CHOWN" in upper
+            is_chown_run = is_run and "CHOWN" in block_upper
             uses_root_scoped_path = is_run and any(
-                p in upper for p in ("/ROOT/", "/USR/BIN/", "/USR/LOCAL/BIN/", "/BIN/", "/SBIN/", "/USR/SBIN/", "/OPT/")
+                p in block_upper for p in ("/ROOT/", "/USR/BIN/", "/USR/LOCAL/BIN/", "/BIN/", "/SBIN/", "/USR/SBIN/", "/OPT/")
             )
             needs_root = is_chown_run or uses_root_scoped_path
 
             if needs_root and current_user not in {"root", "0"}:
                 rewritten.append("USER root")
-                rewritten.append(raw_line)
+                rewritten.extend(block)
                 rewritten.append(f"USER {current_user}")
             else:
-                rewritten.append(raw_line)
+                rewritten.extend(block)
 
         return "\n".join(rewritten)
 
