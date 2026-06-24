@@ -57,7 +57,10 @@ def extract_base_image(dockerfile_content: str) -> str:
 
 
 def extract_dockerfile(raw: str) -> str:
-    match = re.search(r"```(?:dockerfile)?\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+    # Accept any fence language tag (```dockerfile, ```bash, bare ```), not just
+    # "dockerfile" — a mis-tagged fence otherwise leaks its opening ``` line into the
+    # written Dockerfile and buildkit rejects it ("can't find = in #").
+    match = re.search(r"```[a-zA-Z]*\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     content = match.group(1) if match else raw
     return _strip_trailing_noise(content).strip() + "\n"
 

@@ -23,6 +23,7 @@ try:
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
     from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template, extract_base_image
+    from RepoBuilderAgent.src.core.llm_yaml import extract_command_from_reply
     from RepoBuilderAgent.src.core.file_io import write_text
     from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from RepoBuilderAgent.src.stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
@@ -74,6 +75,7 @@ except ImportError:
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.agent_runtime import RepairRuntime
     from core.dockerfile_utils import extract_dockerfile, get_base_template, extract_base_image
+    from core.llm_yaml import extract_command_from_reply
     from core.file_io import write_text
     from core.repo_cleanup import delete_files_build_context, get_files_to_delete
     from stages.stage_3_iterative_dockerfile_repair.l3_react_loop import (
@@ -1166,11 +1168,25 @@ async def _safe_request_repair(repo_url: str, attempt: int, repair_coro):
         return None
 
 
+# Keys the model may wrap its single command in; mirrors the ReAct verify path so
+# both derivation routes survive a ```yaml-fenced reply (otherwise the fence leaks
+# verbatim into the verify command -> "Syntax error: EOF in backquote substitution").
+_VERIFY_COMMAND_KEYS = [
+    "verification_command",
+    "verify_command",
+    "repaired_verification_command",
+    "refreshed_verification_command",
+    "command",
+]
+
+
 async def _simple_verify_command_call(
     repo_url: str, system_prompt: str, prompt: str, llm_metrics: dict, phase: str
 ) -> str:
     """Baseline verify-command derivation: a single LLM call (no ReAct agent).
-    The prompts instruct the model to return exactly one shell command."""
+    The prompts instruct the model to return exactly one shell command, but models
+    routinely answer in a ```yaml fenced block; extract the command field instead of
+    trusting the raw reply."""
     response = await chat_completion_with_retries(
         client=client,
         model=args.model,
@@ -1187,7 +1203,9 @@ async def _simple_verify_command_call(
         retry_backoff_seconds=args.llm_retry_backoff_seconds,
         max_tokens=args.repair_max_output_tokens,
     )
-    return (response.choices[0].message.content or "").strip()
+    return extract_command_from_reply(
+        response.choices[0].message.content or "", _VERIFY_COMMAND_KEYS
+    )
 
 
 async def request_verification_command_repair(

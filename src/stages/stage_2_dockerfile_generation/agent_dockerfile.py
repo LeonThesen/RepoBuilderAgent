@@ -49,6 +49,7 @@ try:
         validate_dockerfile_syntax,
     )
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint
+    from RepoBuilderAgent.src.core.llm_yaml import extract_command_from_reply
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
@@ -89,6 +90,7 @@ except ImportError:
         validate_dockerfile_syntax,
     )
     from retrieval.repo_fingerprint import fingerprint
+    from core.llm_yaml import extract_command_from_reply
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
     OPENAI_BASE_URL = getattr(_config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -499,7 +501,13 @@ async def generate_dockerfile(
                 max_retries=args.llm_max_retries,
                 retry_backoff_seconds=args.llm_retry_backoff_seconds,
             )
-            verify_command = verify_response.choices[0].message.content.strip().strip("`")
+            # Models routinely answer in a ```yaml fenced block (verification_command: ...)
+            # despite the "one command" instruction; extract the field so the fenced reply
+            # never reaches the shell verbatim (would fail with a backquote EOF syntax error).
+            verify_command = extract_command_from_reply(
+                verify_response.choices[0].message.content or "",
+                ["verification_command", "verify_command", "command"],
+            )
             if verify_response.usage:
                 log_info(f"[TOKENS] {json.dumps({'phase': 'dockerfile-verify-cmd', 'repo': repo_url, 'prompt_tokens': verify_response.usage.prompt_tokens, 'completion_tokens': verify_response.usage.completion_tokens, 'total_tokens': verify_response.usage.total_tokens})}")
             verify_command_path = output_path.with_suffix(".verify-command")
