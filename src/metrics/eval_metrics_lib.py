@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -71,6 +72,66 @@ def _get_field_value(doc: dict, field: str):
             val = entry
         return val
     return entry
+
+
+def _pred_steps(steps):
+    """Agent build_steps/verification are lists of {step, command} dicts. Pull the
+    command text (the comparable part) — falling back to the step label, then raw
+    strings. GT stores these as flat command-string lists, so this lines the two up."""
+    if not isinstance(steps, list):
+        return steps
+    out: list[str] = []
+    for s in steps:
+        if isinstance(s, dict):
+            out.append(str(s.get("command") or s.get("step") or "").strip())
+        elif isinstance(s, str):
+            out.append(s.strip())
+    return [s for s in out if s]
+
+
+def _pred_system_packages(doc: dict) -> list[str]:
+    """Agent-predicted system packages from the flat classification schema. The agent
+    lists these under `dependencies.{build,runtime,system}` (and occasionally a flat
+    `system_dependencies`), NOT under GT's `categories.system_dependencies.value`."""
+    names: list[str] = []
+    deps = doc.get("dependencies")
+    if isinstance(deps, dict):
+        for key in ("build", "runtime", "system"):
+            for item in deps.get(key) or []:
+                if isinstance(item, dict):
+                    names.append(str(item.get("name", "")).strip().lower())
+                elif isinstance(item, str):
+                    names.append(item.strip().lower())
+    sd = doc.get("system_dependencies")
+    if isinstance(sd, list):
+        for item in sd:
+            if isinstance(item, dict):
+                names.append(str(item.get("name", "")).strip().lower())
+            elif isinstance(item, str):
+                names.append(item.strip().lower())
+    return [n for n in names if n]
+
+
+def _get_pred_field_value(doc: dict, field: str):
+    """Extract a GT field from the AGENT'S flat classification schema, which differs
+    from the GT's `categories.<field>.value` shape and drifts across repos. Maps each
+    GT field name to the agent's actual key(s), tolerating absence. If a prediction
+    happens to carry a GT-style `categories` dict, defer to _get_field_value."""
+    if not isinstance(doc, dict):
+        return None
+    cats = doc.get("categories")
+    if isinstance(cats, dict) and field in cats:
+        return _get_field_value(doc, field)
+    if field == "build_tool":
+        return doc.get("build_systems") or doc.get("build_tool")
+    if field == "programming_language":
+        return doc.get("programming_language") or doc.get("languages") or doc.get("language")
+    if field in ("system_dependencies", "packages"):
+        return _pred_system_packages(doc)
+    if field in ("build_steps", "verification"):
+        return _pred_steps(doc.get(field))
+    # installation_strategy / runtime_environment / os_compatibility: direct key or absent.
+    return doc.get(field)
 
 
 def _normalise_list(value) -> set[str]:
@@ -370,7 +431,7 @@ def compare_with_ground_truth(
 
     for field, mode in _COMPARABLE_FIELDS:
         gt_val = _get_field_value(ground_truth, field)
-        pred_val = _get_field_value(prediction, field)
+        pred_val = _get_pred_field_value(prediction, field)
 
         if mode == "set":
             gt_set = _normalise_list(gt_val)
@@ -452,11 +513,36 @@ def compare_with_ground_truth(
     }
 
 
+# Ordered most-specific → most-generic; classify_failure returns the first hit. Build-layer
+# modes (apt, toolchain, compiler, linker, deps) precede the broad docker-layer ones so a
+# real cause like "Unable to locate package" isn't masked by an incidental "Permission denied"
+# elsewhere in the log. Each label names an ACTIONABLE failure class for repair triage.
 FAILURE_PATTERNS = [
-    ("wrong_base_image",    [re.compile(r"FROM .* not found|manifest for .* not found|pull access denied", re.I)]),
-    ("permission_error",    [re.compile(r"Permission denied|EACCES|cannot open.*permission denied", re.I)]),
-    ("dockerfile_syntax",   [re.compile(r"dockerfile parse error|unknown instruction|syntax error", re.I)]),
-    ("verification_failed", [re.compile(r"verify.*failed|verification.*exit.*code [^0]", re.I)]),
+    # Docker / image layer
+    ("wrong_base_image",     [re.compile(r"FROM .* not found|manifest for .* not found|pull access denied", re.I)]),
+    ("dockerfile_syntax",    [re.compile(r"dockerfile parse error|unknown instruction|syntax error", re.I)]),
+    # apt / package availability (the #1 forky failure: pinned/dropped packages)
+    ("apt_package_missing",  [re.compile(r"Unable to locate package|has no installation candidate|Couldn't find any package", re.I)]),
+    ("apt_repo_error",       [re.compile(r"Failed to fetch|apt-get update.*exit code|Could not get lock|GPG error|NO_PUBKEY", re.I)]),
+    # network / TLS (CA bootstrap, proxy, DNS)
+    ("network_tls",          [re.compile(r"SSL certificate problem|server certificate verification failed|unable to get local issuer|self.signed certificate|Could not resolve host|Temporary failure in name resolution|Connection timed out|failed: timeout", re.I)]),
+    # source completeness (submodules not checked out)
+    ("missing_submodule",    [re.compile(r"Missing the .* submodule|git submodule update --init|submodule .* (?:not initialized|is not registered)", re.I)]),
+    # toolchain misconfiguration
+    ("java_home_invalid",    [re.compile(r"JAVA_HOME is set to an invalid directory|JAVA_HOME is not defined", re.I)]),
+    ("command_not_found",    [re.compile(r"\bcommand not found\b|: \d+: [^:]+: not found", re.I)]),
+    ("pkg_config_missing",   [re.compile(r"No package '[^']+' found|required by crate .* was not found|pkg-config.*not found", re.I)]),
+    # dependency resolution (maven/gradle/npm/cargo registry)
+    ("dependency_resolution",[re.compile(r"Could not resolve dependencies|Could not find artifact|Could not determine the dependencies|npm ERR!|ERESOLVE|version conflict|could not download", re.I)]),
+    # build-system configuration (meson/cmake/configure/autotools)
+    ("build_config_error",   [re.compile(r"meson\.build:\d+:\d+: ERROR:|CMake Error|configure: error:|Module \"[^\"]+\" does not exist|No CMAKE_.*could be found", re.I)]),
+    # compile / link / build-tool failures
+    ("compiler_error",       [re.compile(r"fatal error: .*: No such file or directory|all warnings being treated as errors|undefined reference to|cc1plus: |error: could not compile|error\[E\d+\]", re.I)]),
+    ("make_error",           [re.compile(r"make(\[\d+\])?: \*\*\*|recipe for target .* failed|ninja: build stopped|Error [12]\b", re.I)]),
+    # environment
+    ("disk_space",           [re.compile(r"No space left on device", re.I)]),
+    ("permission_error",     [re.compile(r"Permission denied|EACCES|cannot open.*permission denied", re.I)]),
+    ("verification_failed",  [re.compile(r"verify.*failed|verification.*exit.*code [^0]", re.I)]),
 ]
 
 
@@ -694,40 +780,55 @@ def compute_repo_metrics(
 
     dockerfile_metrics = analyze_dockerfile(workspace_root, repo_url, dockerfiles_dir)
 
+    # Ground-truth / retrieval / package scoring all parse the agent's free-form
+    # classification YAML, whose schema can drift (e.g. `categories` emitted as a list
+    # instead of a dict). A parse crash here must NOT take down build/repair metrics —
+    # those are computed from report.yaml and are the run's source of truth. Each scoring
+    # block degrades to None on failure and logs, so a drifted repo loses only its
+    # research scores, not its build_success.
+
     # Ground truth comparison (only if dataset_dir provided)
     gt_comparison: Optional[dict] = None
     if dataset_dir is not None:
         if ground_truth_index is None:
             ground_truth_index = build_ground_truth_index(dataset_dir)
-        gt_comparison = compare_with_ground_truth(
-            workspace_root=workspace_root,
-            repo_url=repo_url,
-            dataset_dir=dataset_dir,
-            ground_truth_index=ground_truth_index,
-            results_dir=results_dir,
-            dockerfiles_dir=dockerfiles_dir,
-        )
+        try:
+            gt_comparison = compare_with_ground_truth(
+                workspace_root=workspace_root,
+                repo_url=repo_url,
+                dataset_dir=dataset_dir,
+                ground_truth_index=ground_truth_index,
+                results_dir=results_dir,
+                dockerfiles_dir=dockerfiles_dir,
+            )
+        except Exception as exc:
+            print(f"[metrics] WARN ground-truth scoring failed for {repo_url}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
     # Retrieval quality: L1 selected files vs curated gold set (only when both exist).
     retrieval_quality = None
     package_quality = None
     if dataset_dir is not None:
-        gt_doc = load_gt_for_repo(dataset_dir, repo_url)
-        gold = get_gt_install_relevant_files(gt_doc)
-        predicted = read_selected_files(workspace_root, repo_url, summaries_dir)
-        strategy = read_retrieval_strategy(workspace_root, repo_url, summaries_dir)
-        # one_shot_fingerprint deliberately selects no files (it feeds the full repo
-        # fingerprint as context), so per-file precision/recall is N/A — scoring its empty
-        # selection as 0 would unfairly sink it against strategies that do select.
-        if strategy == "one_shot_fingerprint":
-            retrieval_quality = None
-        elif gold and predicted is not None:
-            retrieval_quality = compute_retrieval_quality(predicted, gold)
-        # Package classification: predicted system packages vs GT packages (any manager).
-        gold_pkgs = get_gt_packages(gt_doc)
-        pred_pkgs = read_predicted_packages(workspace_root, repo_url, results_dir)
-        if gold_pkgs and pred_pkgs is not None:
-            package_quality = compute_package_quality(pred_pkgs, gold_pkgs)
+        try:
+            gt_doc = load_gt_for_repo(dataset_dir, repo_url)
+            gold = get_gt_install_relevant_files(gt_doc)
+            predicted = read_selected_files(workspace_root, repo_url, summaries_dir)
+            strategy = read_retrieval_strategy(workspace_root, repo_url, summaries_dir)
+            # one_shot_fingerprint deliberately selects no files (it feeds the full repo
+            # fingerprint as context), so per-file precision/recall is N/A — scoring its empty
+            # selection as 0 would unfairly sink it against strategies that do select.
+            if strategy == "one_shot_fingerprint":
+                retrieval_quality = None
+            elif gold and predicted is not None:
+                retrieval_quality = compute_retrieval_quality(predicted, gold)
+            # Package classification: predicted system packages vs GT packages (any manager).
+            gold_pkgs = get_gt_packages(gt_doc)
+            pred_pkgs = read_predicted_packages(workspace_root, repo_url, results_dir)
+            if gold_pkgs and pred_pkgs is not None:
+                package_quality = compute_package_quality(pred_pkgs, gold_pkgs)
+        except Exception as exc:
+            print(f"[metrics] WARN retrieval/package scoring failed for {repo_url}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
     return {
         "tokens": {
@@ -857,7 +958,8 @@ def get_gt_packages(gt_doc: Optional[dict]) -> list[str]:
     lower-cased, since that is the classification target."""
     if not isinstance(gt_doc, dict):
         return []
-    val = gt_doc.get("categories", {}).get("packages", {}).get("value")
+    cats = gt_doc.get("categories")
+    val = (cats.get("packages") or {}).get("value") if isinstance(cats, dict) else None
     names: list[str] = []
     if isinstance(val, list):
         for entry in val:
@@ -890,19 +992,25 @@ def read_predicted_packages(workspace_root: Path, repo_url: str, results_dir: st
         return None
     if not isinstance(doc, dict):
         return None
-    sysdeps = doc.get("categories", {}).get("system_dependencies", {}).get("value")
-    names: list[str] = []
-    if isinstance(sysdeps, list):
-        for item in sysdeps:
-            if isinstance(item, dict):
-                name = str(item.get("name", "")).strip().lower()
-            elif isinstance(item, str):
-                name = item.strip().lower()
-            else:
-                name = ""
-            if name:
-                names.append(name)
-    return names
+    # Prefer a GT-style categories.system_dependencies.value if the agent emitted one;
+    # otherwise read the flat schema (dependencies.{build,runtime,system}).
+    cats = doc.get("categories")
+    if isinstance(cats, dict):
+        sysdeps = (cats.get("system_dependencies") or {}).get("value")
+        names: list[str] = []
+        if isinstance(sysdeps, list):
+            for item in sysdeps:
+                if isinstance(item, dict):
+                    name = str(item.get("name", "")).strip().lower()
+                elif isinstance(item, str):
+                    name = item.strip().lower()
+                else:
+                    name = ""
+                if name:
+                    names.append(name)
+        if names:
+            return names
+    return _pred_system_packages(doc)
 
 
 def compute_package_quality(predicted: list[str], gold: list[str]) -> Optional[dict]:

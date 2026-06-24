@@ -1566,7 +1566,17 @@ async def repair_repository(
                                 f"plausible={binary_metrics.get('binary_size_plausible')}, "
                                 f"hash_match={binary_metrics.get('binary_hash_match')}"
                             )
-                        report["artifact_listing"] = await gather_artifact_listing(image_tag, hard_workdir)
+                        # The artifact listing (xxh64sum of every file under the workdir) can be
+                        # hundreds of MB on large repos (e.g. linux). Spill it to a sidecar file
+                        # and keep only a path ref in report.yaml so the report stays small/parseable;
+                        # eval.py loads the sidecar to run the combined-hash hard verify.
+                        listing = await gather_artifact_listing(image_tag, hard_workdir)
+                        if listing:
+                            listing_path = report_dir / "artifact-listing.json"
+                            write_text(listing_path, json.dumps(listing))
+                            report["artifact_listing"] = {"path": str(listing_path)}
+                        else:
+                            report["artifact_listing"] = None
                     verify_log_path = report_dir / f"attempt-{attempt}.verify.log"
                     log_info(
                         f"Running build verification for {repo_url} using command: {verify_command_to_use}"
