@@ -22,7 +22,7 @@ try:
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
-    from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template, extract_base_image
+    from RepoBuilderAgent.src.core.dockerfile_utils import ensure_base_template, extract_dockerfile, get_base_template, extract_base_image
     from RepoBuilderAgent.src.core.llm_yaml import extract_command_from_reply
     from RepoBuilderAgent.src.core.file_io import write_text
     from RepoBuilderAgent.src.core.repo_cleanup import delete_files_build_context, get_files_to_delete
@@ -74,7 +74,7 @@ except ImportError:
     from metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.agent_runtime import RepairRuntime
-    from core.dockerfile_utils import extract_dockerfile, get_base_template, extract_base_image
+    from core.dockerfile_utils import ensure_base_template, extract_dockerfile, get_base_template, extract_base_image
     from core.llm_yaml import extract_command_from_reply
     from core.file_io import write_text
     from core.repo_cleanup import delete_files_build_context, get_files_to_delete
@@ -992,6 +992,17 @@ async def request_repair(
     dockerfile_content = strip_ca_cert_from_dockerfile(dockerfile_content)
     build_log = sanitize_build_log_for_prompt(build_log)
 
+    # The contract for both repair mechanisms is "return the COMPLETE Dockerfile, base
+    # template preserved verbatim". A model that returns only the AGENT_BUILD_STEPS body
+    # (dropping the base → no FROM) is self-healed before the repaired file is written,
+    # so a malformed repair can never overwrite a valid Dockerfile with a baseless one.
+    base_template = get_base_template(
+        classification,
+        Path(__file__).resolve().parents[3] / "templates",
+        log_warn=log_warn,
+        log_error=log_error,
+    )
+
     # Baseline repair: a single LLM call over just the current Dockerfile and the
     # build log. This is the flat_baseline mechanism; the ReAct agent below is a
     # gated architecture component.
@@ -1016,14 +1027,8 @@ async def request_repair(
             max_tokens=args.repair_max_output_tokens,
         )
         raw = response.choices[0].message.content or ""
-        return extract_dockerfile(raw.strip())
+        return ensure_base_template(extract_dockerfile(raw.strip()), base_template, log_warn=log_warn)
 
-    base_template = get_base_template(
-        classification,
-        Path(__file__).resolve().parents[3] / "templates",
-        log_warn=log_warn,
-        log_error=log_error,
-    )
     prompt = (
         PROMPT_TEMPLATE.replace("{{REPO_URL}}", repo_url)
         .replace("{{ATTEMPT_NUMBER}}", str(attempt_number))
@@ -1139,7 +1144,7 @@ async def request_repair(
             "repo_tools_enabled": bool(repo_tools),
         }
     )
-    return repaired
+    return ensure_base_template(repaired, base_template, log_warn=log_warn)
 
 
 # Transient LLM/transport failures that should burn a single repair attempt and let

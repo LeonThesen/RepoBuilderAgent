@@ -105,7 +105,10 @@ def ensure_base_template(
     gen_end = dockerfile_content.find(BUILD_END_MARKER)
     base_start = base_template.find(BUILD_START_MARKER)
     base_end = base_template.find(BUILD_END_MARKER)
-    if min(gen_start, gen_end, base_start, base_end) < 0 or not base_template.strip():
+    # The base template must have both markers to define the splice slot; the model
+    # output only needs a START marker — if it truncated before the END marker, treat
+    # everything from START to end-of-output as the region and re-append END.
+    if gen_start < 0 or base_start < 0 or base_end < 0 or not base_template.strip():
         if log_warn:
             log_warn(
                 "Generated Dockerfile has no FROM and cannot be healed (markers or "
@@ -114,7 +117,10 @@ def ensure_base_template(
         return dockerfile_content
 
     # The model's region, markers inclusive, dropped into the base template's slot.
-    region = dockerfile_content[gen_start : gen_end + len(BUILD_END_MARKER)]
+    if gen_end < 0:
+        region = dockerfile_content[gen_start:].rstrip() + "\n" + BUILD_END_MARKER
+    else:
+        region = dockerfile_content[gen_start : gen_end + len(BUILD_END_MARKER)]
     healed = base_template[:base_start] + region + base_template[base_end + len(BUILD_END_MARKER) :]
     if log_warn:
         log_warn(
