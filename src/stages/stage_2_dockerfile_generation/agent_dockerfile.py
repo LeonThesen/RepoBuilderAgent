@@ -13,7 +13,7 @@ from tqdm import tqdm
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.core.dockerfile_utils import extract_dockerfile, get_base_template
+    from RepoBuilderAgent.src.core.dockerfile_utils import ensure_base_template, extract_dockerfile, get_base_template
     from RepoBuilderAgent.src.core.timeout_config import load_timeout_defaults
     from RepoBuilderAgent.src.core.prompt_profiles import (
         apply_prompt_profile,
@@ -54,7 +54,7 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
-    from core.dockerfile_utils import extract_dockerfile, get_base_template
+    from core.dockerfile_utils import ensure_base_template, extract_dockerfile, get_base_template
     from core.timeout_config import load_timeout_defaults
     from core.prompt_profiles import (
         apply_prompt_profile,
@@ -415,6 +415,12 @@ async def generate_dockerfile(
                 )
                 raw = response.choices[0].message.content.strip()
                 dockerfile_content = extract_dockerfile(raw)
+                # Self-heal a model that returned only the AGENT_BUILD_STEPS body and
+                # dropped the base template (no FROM → "no build stage in current
+                # context"). Re-splice the region into the base before lint/write.
+                dockerfile_content = ensure_base_template(
+                    dockerfile_content, base_template, log_warn=log_warn
+                )
                 if response.usage:
                     log_info(f"[TOKENS] {json.dumps({'phase': 'dockerfile', 'repo': repo_url, 'prompt_tokens': response.usage.prompt_tokens, 'completion_tokens': response.usage.completion_tokens, 'total_tokens': response.usage.total_tokens})}")
 

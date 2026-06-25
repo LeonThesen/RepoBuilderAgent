@@ -65,6 +65,65 @@ def extract_dockerfile(raw: str) -> str:
     return _strip_trailing_noise(content).strip() + "\n"
 
 
+def has_from_instruction(dockerfile_content: str) -> bool:
+    """True if the Dockerfile has at least one ``FROM`` instruction (a real build
+    stage). A Dockerfile without one fails to build with "no build stage in current
+    context" — the symptom when a model emits only the AGENT_BUILD_STEPS body and
+    drops the base template verbatim it was told to keep."""
+    return any(
+        line.strip().upper().startswith("FROM ")
+        for line in dockerfile_content.splitlines()
+    )
+
+
+def ensure_base_template(
+    dockerfile_content: str,
+    base_template: str,
+    *,
+    log_warn: Callable[[str], None] | None = None,
+) -> str:
+    """Self-heal a generated Dockerfile that lost its base stage.
+
+    The generation contract is "reproduce the base template verbatim, fill only the
+    AGENT_BUILD_STEPS region". When a model instead returns just the region (no
+    ``FROM``), the build dies with "no build stage in current context". If the
+    output still carries the two markers we can reconstruct a valid file: splice the
+    model's build-steps region into the base template, preserving everything else.
+
+    Returns the content unchanged when it already has a ``FROM`` (the normal path),
+    and returns it unchanged (un-healable) when no markers are present to splice.
+    """
+    try:
+        from RepoBuilderAgent.src.core.build_spec import BUILD_START_MARKER, BUILD_END_MARKER
+    except ImportError:
+        from core.build_spec import BUILD_START_MARKER, BUILD_END_MARKER
+
+    if has_from_instruction(dockerfile_content):
+        return dockerfile_content
+
+    gen_start = dockerfile_content.find(BUILD_START_MARKER)
+    gen_end = dockerfile_content.find(BUILD_END_MARKER)
+    base_start = base_template.find(BUILD_START_MARKER)
+    base_end = base_template.find(BUILD_END_MARKER)
+    if min(gen_start, gen_end, base_start, base_end) < 0 or not base_template.strip():
+        if log_warn:
+            log_warn(
+                "Generated Dockerfile has no FROM and cannot be healed (markers or "
+                "base template missing); leaving as-is — the build will surface the error."
+            )
+        return dockerfile_content
+
+    # The model's region, markers inclusive, dropped into the base template's slot.
+    region = dockerfile_content[gen_start : gen_end + len(BUILD_END_MARKER)]
+    healed = base_template[:base_start] + region + base_template[base_end + len(BUILD_END_MARKER) :]
+    if log_warn:
+        log_warn(
+            "Generated Dockerfile dropped the base template (no FROM); re-spliced the "
+            "AGENT_BUILD_STEPS region into the base template to restore a valid build stage."
+        )
+    return healed.strip() + "\n"
+
+
 def get_base_template(
     classification: dict,
     templates_dir: Path,
