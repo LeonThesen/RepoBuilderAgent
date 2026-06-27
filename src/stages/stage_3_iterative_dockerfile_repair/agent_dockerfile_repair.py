@@ -1070,21 +1070,25 @@ async def request_repair(
         prompt, summary, args.max_input_tokens, model=args.model, phase=f"repair attempt {attempt_number}"
     )
 
-    repo_tools = None
+    repo_tools = []
     apt_tool_added = False
+    # apt_search is ENVIRONMENT access (what packages the base distro actually ships),
+    # not repo inspection — so it is always available, independent of --repair-repo-tools
+    # (which gates repo *file* access for the AB-26/27 study). Without it, L3 is blind to
+    # the distro and blindly guesses versions on `Unable to locate package` (e.g. forky
+    # dropped openjdk-17-jdk; the answer is default-jdk). Tied to the Dockerfile's own FROM
+    # so the query matches the base the build uses.
+    base_image = extract_base_image(dockerfile_content)
+    if base_image:
+        repo_tools.append(build_apt_search_tool(args.container_cli, base_image))
+        apt_tool_added = True
     if args.repair_repo_tools and repo_path is not None:
-        repo_tools = [
+        repo_tools.extend([
             build_read_file_tool(repo_path),
             build_list_tree_tool(repo_path),
             build_search_pattern_tool(repo_path),
-        ]
-        # Let repair query the actual base image's apt repos to resolve
-        # `Unable to locate package` (e.g. forky dropped openjdk-17-jdk). Tied to
-        # the Dockerfile's own FROM so the query matches the base the build uses.
-        base_image = extract_base_image(dockerfile_content)
-        if base_image:
-            repo_tools.append(build_apt_search_tool(args.container_cli, base_image))
-            apt_tool_added = True
+        ])
+    repo_tools = repo_tools or None
 
     repaired, trace_steps, l3_trace = await run_l3_dockerfile_repair_react(
         repo_url=repo_url,
@@ -1103,10 +1107,10 @@ async def request_repair(
         tools_available = ["think", "run_hadolint_on_snippet"]
         if args.snippet_tools:
             tools_available.append("get_dockerfile_snippet")
-        if repo_tools:
-            tools_available.extend(["read_file", "list_tree", "search_pattern"])
         if apt_tool_added:
             tools_available.append("apt_search")
+        if args.repair_repo_tools and repo_path is not None:
+            tools_available.extend(["read_file", "list_tree", "search_pattern"])
         tool_calls_made = [
             tc.get("name")
             for event in l3_trace

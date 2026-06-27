@@ -275,6 +275,27 @@ CA_BLOCK_BEGIN_MARKER = "# >>> manualrepos-ca-bootstrap (auto-injected at build 
 CA_BLOCK_END_MARKER = "# <<< manualrepos-ca-bootstrap <<<"
 
 
+def normalize_run_shell_builtins(content: str) -> str:
+    """Rewrite command-position `source ` -> `. ` inside RUN instructions.
+
+    `source` is a bash builtin; Docker's default shell is /bin/sh (dash), where
+    `source file` fails with `source: not found` (exit 127). This repeatedly broke
+    builds that activate a venv or cargo env (`RUN source $HOME/.cargo/env`,
+    `RUN ... && source venv/bin/activate`). The POSIX equivalent `. file` works in
+    every shell, so normalize it regardless of which shell the build uses.
+
+    Only `source` at a command boundary (line start, after RUN / && / || / ; / | / `(`)
+    and followed by whitespace is rewritten, so substrings like `resource` or paths
+    containing the word are left untouched.
+    """
+    return re.sub(
+        r"(?P<b>(?:^|RUN |&&|\|\||;|\||\()\s*)source(?=\s)",
+        r"\g<b>.",
+        content,
+        flags=re.MULTILINE,
+    )
+
+
 def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | None = None) -> str:
     """
     Inject CA certificate setup into the Dockerfile if MANUALREPOS_CA_CERT_B64 is present.
@@ -336,6 +357,10 @@ def inject_ca_cert_into_dockerfile(dockerfile_content: str, ca_cert_b64: str | N
                 rewritten.extend(block)
 
         return "\n".join(rewritten)
+
+    # Normalize bash-only `source` to POSIX `.` before any other processing so it
+    # applies to every built Dockerfile (generation + each repair attempt).
+    dockerfile_content = normalize_run_shell_builtins(dockerfile_content)
 
     if not ca_cert_b64:
         ca_cert_b64 = os.getenv("MANUALREPOS_CA_CERT_B64")
