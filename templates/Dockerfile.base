@@ -50,10 +50,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # environment: build commands run as this user; use `sudo` for system package installs
 # (`sudo apt-get install ...`) or privileged steps (`sudo make install`). The repo
 # directory is owned by the user so the build can write artifacts into it.
+#
+# env_keep: sudo's default env_reset strips the corporate-CA trust env vars
+# (NODE_*, *_CA_*, SSL_CERT_*) that the auto-injected CA bootstrap exports. Without
+# this, `sudo npm install -g ...` / `sudo pip install ...` / `sudo cargo ...` run with
+# default-strict TLS behind the corporate intercepting proxy and fail with
+# "self-signed certificate in certificate chain". Preserving these vars across sudo
+# makes privileged installs trust the same CA as the non-root user. Generic to any
+# repo that installs packages via sudo; harmless otherwise.
 RUN useradd -m -s /bin/bash manualrepos \
     && mkdir -p /home/manualrepos/repo \
     && chown manualrepos:manualrepos /home/manualrepos/repo \
-    && echo 'manualrepos ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/manualrepos \
+    && printf '%s\n' \
+        'manualrepos ALL=(ALL) NOPASSWD:ALL' \
+        'Defaults env_keep += "SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED CARGO_HTTP_CAINFO JAVA_TOOL_OPTIONS GRADLE_OPTS MAVEN_OPTS"' \
+        > /etc/sudoers.d/manualrepos \
     && chmod 0440 /etc/sudoers.d/manualrepos
 USER manualrepos
 WORKDIR /home/manualrepos/repo
