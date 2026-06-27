@@ -19,6 +19,7 @@ try:
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
+        length_mode_for,
     )
     from RepoBuilderAgent.src.core.common import (
         build_async_http_client,
@@ -53,6 +54,7 @@ except ImportError:
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
+        length_mode_for,
     )
     from core.common import (
         build_async_http_client,
@@ -122,7 +124,7 @@ parser.add_argument("--dockerfiles-dir", default="dockerfiles", help="Directory 
 parser.add_argument("--output-dir", default="install-guides", help="Directory where generated INSTALL.md files will be written")
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
-set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
+set_prompt_length_mode(length_mode_for(PROMPT_PROFILE, "install-guide"))
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 

@@ -1,5 +1,9 @@
 default_profile: baseline_structured
-pstar_profile: baseline_structured
+# P* frozen after Phase 1 (2026-06-27): AB-05X won — concise gen/repair/install (AB-03's
+# 0.60 build mechanism) + detailed/few-shot classification (recovers GT 0.014→0.559).
+# build_success 0.60 (ties AB-03, top of noise band, reproduced twice) at ~5% more tokens.
+# See docs/phase1-pstar-search.md. Phase 2+ resolve "P*" to this profile.
+pstar_profile: phase1_concise_detailed_classify_fewshot
 
 profiles:
   # ── Active default / P* candidate ───────────────────────────────────────────
@@ -22,13 +26,16 @@ profiles:
   # stages automatically in every phase (classify + install stay deterministic at 0.0),
   # so no per-config freeze is needed. Defaults below = the anchor, so an unedited AB-05V
   # reproduces AB-00.
+  # AB-05V2: reduced combo. First combined attempt (concise+0.3+expert) REGRESSED to
+  # 0.533 build_success — below anchor (0.567) and every single arm. Expert role added
+  # cost + dropped verify_sim when stacked. Dropped expert here; testing concise+temp0.3.
   pstar_candidate:
-    few_shot_count: 0
-    prompt_length_mode: detailed
+    few_shot_count: 0            # AB-05 (2-shot) gave no build gain + binary_size_plausible=0.0 → keep 0
+    prompt_length_mode: concise  # AB-03 won build_success (0.60) and cheapest tokens
     reasoning_instruction: false
     output_format_mode: strict
-    temperature: 0.0
-    role_framing: neutral
+    temperature: 0.3             # AB-01 (0.3) ≥ anchor build_succ, +build_ok/verify_sim; AB-02 (0.7) regressed
+    role_framing: neutral        # expert dropped: no build gain + regressed in combined run
 
   # ── Phase 1 — OFAT prompt ablation ──────────────────────────────────────────
   # Anchor (AB-00). Every Phase 1 run differs from this by exactly one variable so
@@ -72,6 +79,53 @@ profiles:
   phase1_length_only:
     few_shot_count: 0
     prompt_length_mode: concise
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  # ── Mixed-style P* candidate ─────────────────────────────────────────────────
+  # Phase-1 finding: few-shot (AB-05) 4×'d classification GT quality (0.137→0.566)
+  # but did NOT convert to builds; concise (AB-03) won build_success (0.60) — but the
+  # win is a confound: concise gen produced dumber dockerfiles that failed in trivially
+  # repairable apt_* ways (12/21 fails), inflating repair salvage (0.333 vs 0.133),
+  # not because concise REPAIR is better. This profile splits the knobs to capture both
+  # legitimately: few-shot ONLY on classification (where it helped), concise ONLY on
+  # repair (the isolating test — does concise repair salvage HARD detailed-gen failures?).
+  # Both knobs are now per-phase maps (scalar still = all phases); keys match the phase
+  # strings in apply_prompt_profile()/length_mode_for(). detailed gen should restore
+  # first-attempt success (~0.43) and classify GT (~0.14); the open question is salvage.
+  phase1_fewshot_classify_concise_repair:
+    few_shot_count:
+      classify-step1-selection: 2
+      classify-step2: 2
+      default: 0
+    prompt_length_mode:
+      repair: concise
+      default: detailed
+    reasoning_instruction: false
+    output_format_mode: strict
+    temperature: 0.0
+    role_framing: neutral
+
+  # ── Concise-everywhere + classify fix (AB-05X) ───────────────────────────────
+  # AB-05W (detailed gen + concise repair) FALSIFIED the "detailed gen is better"
+  # instinct: it scored 0.50 build_success (worst), because detailed gen throws away
+  # AB-03's real advantage — concise gen's "dumber" dockerfiles fail in cheap, repairable
+  # ways (the 0.60 win lives there). Concise repair on HARD failures only salvaged 0.20
+  # vs AB-03's 0.333 (confound confirmed). So this keeps concise EVERYWHERE (preserve the
+  # 0.60 mechanism) and only un-compresses classification + adds few-shot there, to fix
+  # AB-03's classify-GT collapse (0.014) without touching gen/repair. Open question:
+  # does build_success hold at ~0.60 with classification restored, or does cleaner
+  # classification perturb gen downward (as it did in AB-05W)?
+  phase1_concise_detailed_classify_fewshot:
+    few_shot_count:
+      classify-step1-selection: 2
+      classify-step2: 2
+      default: 0
+    prompt_length_mode:
+      classify: detailed
+      default: concise
     reasoning_instruction: false
     output_format_mode: strict
     temperature: 0.0

@@ -45,6 +45,7 @@ try:
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
+        length_mode_for,
     )
     from RepoBuilderAgent.src.retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms, clear_walk_cache
     from RepoBuilderAgent.src.core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
@@ -81,6 +82,7 @@ except ImportError:
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
+        length_mode_for,
     )
     from retrieval.repo_fingerprint import fingerprint, collect_manifest_files, collect_selected_files, collect_retrieval_candidates, learn_new_files, select_files_by_bm25, select_files_by_bm25_budgeted, build_bm25_query_terms, clear_walk_cache
     from core.log_utils import log_info, log_warn, log_error, log_trace, set_dump_prompts_dir, set_trace_enabled, set_tqdm_bar, log_file_delta
@@ -187,7 +189,7 @@ parser.add_argument(
 parser.add_argument(
     "--react-max-steps",
     type=int,
-    default=4,
+    default=6,
     help="Maximum selection iterations for --retrieval-strategy=iterative_react.",
 )
 parser.add_argument(
@@ -242,7 +244,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
-set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
+set_prompt_length_mode(length_mode_for(PROMPT_PROFILE, "classify"))
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 # Shared httpx client: OS trust store for corporate CAs + bounded timeout.

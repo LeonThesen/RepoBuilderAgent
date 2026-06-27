@@ -45,6 +45,41 @@ def _to_float(value: Any, fallback: float) -> float:
         return fallback
 
 
+def _normalize_phase_factor(value: Any, fallback: Any, coerce) -> Any:
+    """Accept a scalar (one value for every phase) or a per-phase map
+    {phase: value, ..., default: value}. Returns a coerced scalar, or a coerced
+    dict that always carries a 'default'. Keys are the same phase strings passed
+    to apply_prompt_profile() / length_mode_for() (e.g. "repair", "dockerfile",
+    "classify", "classify-step2")."""
+    if isinstance(value, dict):
+        out = {str(k): coerce(v, fallback) for k, v in value.items()}
+        if "default" not in out:
+            out["default"] = coerce(fallback, fallback)
+        return out
+    return coerce(value if value is not None else fallback, fallback)
+
+
+def _resolve_phase_factor(factor: Any, phase: str, fallback: Any) -> Any:
+    """Pick the value for `phase` from a scalar or per-phase map produced by
+    _normalize_phase_factor()."""
+    if isinstance(factor, dict):
+        if phase in factor:
+            return factor[phase]
+        if "default" in factor:
+            return factor["default"]
+        return fallback
+    return factor
+
+
+def length_mode_for(profile: dict, phase: str) -> str:
+    """Resolve the prompt verbosity ("concise"/"detailed") for a given stage
+    phase. Each stage calls this with its own phase before reading prompts so a
+    profile can mix verbosity per stage (e.g. concise repair, detailed rest)."""
+    factors = profile.get("factors", {}) if isinstance(profile, dict) else {}
+    mode = _resolve_phase_factor(factors.get("prompt_length_mode"), phase, DEFAULT_FACTORS["prompt_length_mode"])
+    return "concise" if str(mode).strip().lower() == "concise" else "detailed"
+
+
 def _load_profiles_config() -> dict:
     path = _config_path()
     if not path.exists():
@@ -69,8 +104,16 @@ def resolve_prompt_profile(profile_name: str | None) -> dict:
 
     raw_profile = profiles.get(resolved_name, {}) if isinstance(profiles.get(resolved_name), dict) else {}
     factors = dict(DEFAULT_FACTORS)
-    factors["few_shot_count"] = max(0, _to_int(raw_profile.get("few_shot_count"), int(DEFAULT_FACTORS["few_shot_count"])))
-    factors["prompt_length_mode"] = str(raw_profile.get("prompt_length_mode") or DEFAULT_FACTORS["prompt_length_mode"])
+    factors["few_shot_count"] = _normalize_phase_factor(
+        raw_profile.get("few_shot_count"),
+        int(DEFAULT_FACTORS["few_shot_count"]),
+        lambda v, f: max(0, _to_int(v, f)),
+    )
+    factors["prompt_length_mode"] = _normalize_phase_factor(
+        raw_profile.get("prompt_length_mode"),
+        DEFAULT_FACTORS["prompt_length_mode"],
+        lambda v, f: str(v or f),
+    )
     factors["reasoning_instruction"] = _to_bool(raw_profile.get("reasoning_instruction"), bool(DEFAULT_FACTORS["reasoning_instruction"]))
     factors["output_format_mode"] = str(raw_profile.get("output_format_mode") or DEFAULT_FACTORS["output_format_mode"])
     factors["temperature"] = _to_float(raw_profile.get("temperature"), float(DEFAULT_FACTORS["temperature"]))
@@ -174,7 +217,7 @@ def _load_file_examples(filename: str) -> list[str]:
 
 def _few_shot_block(profile: dict, phase: str) -> str:
     factors = profile.get("factors", {}) if isinstance(profile, dict) else {}
-    count = max(0, _to_int(factors.get("few_shot_count"), 0))
+    count = max(0, _to_int(_resolve_phase_factor(factors.get("few_shot_count"), phase, 0), 0))
     if count <= 0:
         return ""
 

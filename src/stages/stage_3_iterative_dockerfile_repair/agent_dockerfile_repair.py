@@ -36,6 +36,7 @@ try:
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
+        length_mode_for,
     )
     from RepoBuilderAgent.src.core.common import (
         ensure_repo_checkout,
@@ -88,6 +89,7 @@ except ImportError:
         prompt_profile_metadata,
         resolve_prompt_profile,
         resolve_prompt_temperature,
+        length_mode_for,
     )
     from core.common import (
         ensure_repo_checkout,
@@ -272,7 +274,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 PROMPT_PROFILE = resolve_prompt_profile(args.prompt_profile)
-set_prompt_length_mode(PROMPT_PROFILE["factors"]["prompt_length_mode"])
+set_prompt_length_mode(length_mode_for(PROMPT_PROFILE, "repair"))
 EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROFILE)
 
 
