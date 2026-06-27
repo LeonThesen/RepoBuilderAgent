@@ -1,19 +1,13 @@
 # Dataset Analysis Report
 
 ## Results Analysis
-- Processed result files: 1/2
-- Schema/error files: 1
+- Processed result files: 0/2
+- Schema/error files: 2
 - YAML parse errors: 0
 
 ### Top Programming Languages
-- Rust: 1
-- C: 1
-- Shell: 1
-- JavaScript: 1
 
 ### Top Build Tools
-- cargo: 1
-- clang: 1
 
 ## Token Analysis
 - Processed metric files: 1/1
@@ -25,14 +19,14 @@ Savings are computed as baseline - full two-step pipeline total; negative values
 
 | Repo | One-Shot Baseline | Step 1 | Step 2 | Full Two-Prompt Pipeline | Savings vs Baseline | Savings % |
 |---|---:|---:|---:|---:|---:|---:|
-| cyclang | 7,581 | 0 | 7,581 | 7,581 | 0 | 0.000% |
+| cyclang | 6,151 | 641 | 2,952 | 3,593 | 2,558 | 41.587% |
 
 ### Prompt Comparison
-- One-shot baseline full prompt tokens: 7,581
-- Step 1 LLM pre-filter prompt tokens: 0
-- Final classification prompt tokens after LLM pre-filtering: 7,581
-- Full sequential two-prompt pipeline tokens: 7,581
-- Aggregate savings: final_prompt_vs_baseline=0, two_prompt_pipeline_vs_baseline=0
+- One-shot baseline full prompt tokens: 6,151
+- Step 1 LLM pre-filter prompt tokens: 641
+- Final classification prompt tokens after LLM pre-filtering: 2,952
+- Full sequential two-prompt pipeline tokens: 3,593
+- Aggregate savings: final_prompt_vs_baseline=3,199, two_prompt_pipeline_vs_baseline=2,558
 - Token formula: two-step total = step1 pre-filter prompt + step2 final classification prompt.
 
 ### Pipeline Flow
@@ -48,5 +42,11 @@ Savings are computed as baseline - full two-step pipeline total; negative values
 - YAML/schema errors: 0
 
 ### Top File Names
+- Cargo.toml: 5
+- Makefile: 1
+- install.sh: 1
 
 ### Top File Extensions
+- .toml: 5
+- <no_ext>: 1
+- .sh: 1

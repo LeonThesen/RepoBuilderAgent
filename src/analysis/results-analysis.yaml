@@ -1,28 +1,10 @@
 total_result_files: 2
-processed_result_files: 1
-schema_or_error_result_files: 1
+processed_result_files: 0
+schema_or_error_result_files: 2
 yaml_parse_errors: 0
-top_programming_languages:
-- name: Rust
-  count: 1
-- name: C
-  count: 1
-- name: Shell
-  count: 1
-- name: JavaScript
-  count: 1
-top_build_tools:
-- name: cargo
-  count: 1
-- name: clang
-  count: 1
-top_runtime_environments:
-- name: native
-  count: 1
-top_os_compatibility:
-- name: Linux
-  count: 1
-- name: macOS
-  count: 1
+top_programming_languages: []
+top_build_tools: []
+top_runtime_environments: []
+top_os_compatibility: []
 avg_confidence_by_category: {}
 parse_error_files: []

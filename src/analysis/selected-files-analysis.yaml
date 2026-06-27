@@ -1,6 +1,18 @@
 total_selected_files_docs: 1
 processed_selected_files_docs: 1
 yaml_or_schema_errors: 0
-top_file_names: []
-top_file_extensions: []
+top_file_names:
+- name: Cargo.toml
+  count: 5
+- name: Makefile
+  count: 1
+- name: install.sh
+  count: 1
+top_file_extensions:
+- name: .toml
+  count: 5
+- name: <no_ext>
+  count: 1
+- name: .sh
+  count: 1
 parse_error_files: []

@@ -125,7 +125,7 @@
                 <h1>Dataset Analysis Dashboard</h1>
                 <p class="sub">Generated from results, token metrics, and selected-files summaries.</p>
             </div>
-            <div class="sub">Files processed: 1/2</div>
+            <div class="sub">Files processed: 0/2</div>
         </div>
 
         <section class="grid" style="margin-top: 16px;">
@@ -152,6 +152,12 @@
                     <thead><tr><th>File Name</th><th>Count</th></tr></thead>
                     <tbody>
                         
+                        <tr><td>Cargo.toml</td><td>5</td></tr>
+                        
+                        <tr><td>Makefile</td><td>1</td></tr>
+                        
+                        <tr><td>install.sh</td><td>1</td></tr>
+                        
                     </tbody>
                 </table>
             </article>
@@ -160,6 +166,12 @@
                 <table id="fileExtTable">
                     <thead><tr><th>Extension</th><th>Count</th></tr></thead>
                     <tbody>
+                        
+                        <tr><td>.toml</td><td>5</td></tr>
+                        
+                        <tr><td>&lt;no_ext&gt;</td><td>1</td></tr>
+                        
+                        <tr><td>.sh</td><td>1</td></tr>
                         
                     </tbody>
                 </table>
@@ -203,11 +215,11 @@
         </section>
 
         <section class="cards">
-            <article class="card"><div class="k">One-Shot Baseline Full Prompt</div><div class="v">7,581</div></article>
-            <article class="card"><div class="k">Step 1 LLM Pre-Filter Prompt</div><div class="v">0</div></article>
-            <article class="card"><div class="k">Step 2 Final Prompt After Pre-Filtering</div><div class="v">7,581</div></article>
-            <article class="card"><div class="k">Full Two-Prompt Pipeline</div><div class="v">7,581</div></article>
-            <article class="card"><div class="k">Full Two-Prompt Savings vs Baseline</div><div class="v accent">0</div></article>
+            <article class="card"><div class="k">One-Shot Baseline Full Prompt</div><div class="v">6,151</div></article>
+            <article class="card"><div class="k">Step 1 LLM Pre-Filter Prompt</div><div class="v">641</div></article>
+            <article class="card"><div class="k">Step 2 Final Prompt After Pre-Filtering</div><div class="v">2,952</div></article>
+            <article class="card"><div class="k">Full Two-Prompt Pipeline</div><div class="v">3,593</div></article>
+            <article class="card"><div class="k">Full Two-Prompt Savings vs Baseline</div><div class="v accent">2,558</div></article>
         </section>
 
         <section class="panel" style="margin-top: 14px;">
@@ -223,12 +235,12 @@
                     
                     <tr>
                         <td>cyclang</td>
-                        <td>7,581</td>
-                        <td>0</td>
-                        <td>7,581</td>
-                        <td>7,581</td>
-                        <td>0</td>
-                        <td>0.000%</td>
+                        <td>6,151</td>
+                        <td>641</td>
+                        <td>2,952</td>
+                        <td>3,593</td>
+                        <td>2,558</td>
+                        <td>41.587%</td>
                     </tr>
                     
                 </tbody>
@@ -237,10 +249,10 @@
     </div>
 
     <script>
-        const langLabels = ["Rust", "C", "Shell", "JavaScript"];
-        const langValues = [1, 1, 1, 1];
-        const buildLabels = ["cargo", "clang"];
-        const buildValues = [1, 1];
+        const langLabels = [];
+        const langValues = [];
+        const buildLabels = [];
+        const buildValues = [];
         const confLabels = [];
         const confValues = [];
 
