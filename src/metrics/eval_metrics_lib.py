@@ -945,7 +945,8 @@ def compute_retrieval_quality(predicted: list[str], gold: list[str]) -> Optional
         "f1": f1,
         "predicted_count": len(pred_unique),
         "gold_count": len(gold_set),
-        "matched_gold": len(covered),
+        "matched_gold": len(covered),   # gold files a prediction covers  (TP, recall side)
+        "matched_pred": len(hits),       # predictions that hit some gold   (TP, precision side)
         "missed_gold": sorted(gold_set - covered),
     }
 

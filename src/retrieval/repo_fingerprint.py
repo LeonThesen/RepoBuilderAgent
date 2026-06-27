@@ -26,11 +26,24 @@ except ImportError:
 HIGH_SIGNAL_FILENAMES: frozenset[str] = frozenset({
     "readme.md", "readme.rst", "readme.txt", "install.md", "install.txt",
     "pyproject.toml", "requirements.txt", "package.json", "package-lock.json",
-    "yarn.lock", "pnpm-lock.yaml", "go.mod", "cargo.toml", "dockerfile",
+    "yarn.lock", "pnpm-lock.yaml", "pnpm-workspace.yaml", "go.mod",
+    "cargo.toml", "cargo.lock", "dockerfile",
     "docker-compose.yml", "docker-compose.yaml", "makefile", "cmakelists.txt",
     "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
-    "settings.gradle.kts", "gradlew", "gemfile", "composer.json",
+    "settings.gradle.kts", "gradlew", "gradlew.bat", "gradle.properties",
+    "gemfile", "composer.json",
     "setup.py", "setup.cfg", "pipfile", "pipfile.lock", ".env.example",
+    # meson
+    "meson.build", "meson.options", "meson_options.txt",
+    # autotools
+    "configure.ac", "configure.in", "configure", "makefile.am", "makefile.in",
+    "autogen.sh",
+    # bazel
+    "build.bazel", "module.bazel", "workspace", "workspace.bazel",
+    "workspace.bzlmod", ".bazelrc", ".bazelversion",
+    # nix / toolchain / node version + registry config
+    "flake.nix", "default.nix", "shell.nix", "rust-toolchain.toml",
+    "rust-toolchain", ".nvmrc", ".npmrc", ".tool-versions",
 })
 
 # ---------------------------------------------------------------------------
@@ -266,19 +279,14 @@ def collect_retrieval_candidates(root: Path, max_bytes: int = 4096) -> list[tupl
 
         for filename in sorted(filenames):
             file_path = current_dir / filename
-            try:
-                if file_path.stat().st_size > MAX_FILE_SIZE:
-                    continue
-            except OSError:
-                continue
-
             rel = str(file_path.relative_to(root).as_posix())
             rel_lower = rel.lower()
             basename = file_path.name.lower()
             in_docs_dir = rel_lower.startswith("docs/") or "/docs/" in rel_lower
 
+            is_high_signal = basename in exact_names
             include_candidate = False
-            if basename in exact_names:
+            if is_high_signal:
                 include_candidate = True
             elif rel_lower.startswith(".github/workflows/"):
                 include_candidate = True
@@ -291,6 +299,16 @@ def collect_retrieval_candidates(root: Path, max_bytes: int = 4096) -> list[tupl
                 include_candidate = False
 
             if not include_candidate:
+                continue
+
+            # Skip oversized files — but NOT high-signal manifests (e.g. a 130 KB root
+            # Makefile or meson.build): they are the single most important build inputs
+            # and read_file_safe truncates content to max_bytes anyway, so size is no
+            # reason to drop them from the candidate set.
+            try:
+                if not is_high_signal and file_path.stat().st_size > MAX_FILE_SIZE:
+                    continue
+            except OSError:
                 continue
 
             results.append((rel, read_file_safe(file_path, max_bytes=max_bytes)))
@@ -488,6 +506,21 @@ _BM25_BOOST_HIGH_SIGNAL = 2.0
 _BM25_BOOST_README = 1.0
 _BM25_BOOST_WORKFLOW = 0.25
 _BM25_PATH_TERM_BONUS = 0.5
+# Root build manifests are what matters; a repo's real build file sits at (or near) the
+# root, while same-named files deep in test/example/subproject trees are noise. Without
+# these two priors BM25 ties a root Cargo.toml with tokio-util/Cargo.toml and lets the
+# repo-name path-term bonus float nested members above the root — tanking both precision
+# (test/fixture hits) and recall (the root manifest never makes top-k).
+_BM25_DEPTH_PENALTY = 0.35     # per path separator; shallower wins (kept < the path-term
+                               # bonus so a path-only match still scores, just lower)
+_BM25_NOISE_DIR_PENALTY = 4.0  # any path segment that is a test/example/etc. dir
+# Directory names that signal a file is NOT a top-level build input even when its
+# basename looks high-signal (e.g. tests/.../CMakeLists.txt, fixtures, vendored samples).
+NOISE_PATH_SEGMENTS = {
+    "test", "tests", "testing", "fixture", "fixtures", "example", "examples",
+    "sample", "samples", "fuzz", "fuzzing", "bench", "benches", "benchmark",
+    "benchmarks", "contrib", "demo", "demos", "template", "templates",
+}
 
 
 def _normalize_query_terms(query_terms: list[str]) -> list[str]:
@@ -517,6 +550,10 @@ def _high_signal_fallback_order(candidates: list[tuple[str, str]]) -> list[tuple
             tier = 2
         else:
             tier = 3
+        # Files under test/example/subproject trees are demoted below their tier so a
+        # root manifest is always preferred over a same-named file deep in noise dirs.
+        if any(seg in NOISE_PATH_SEGMENTS for seg in rel_lower.split("/")[:-1]):
+            tier += 4
         return (tier, rel.count("/"), rel)
 
     return sorted(candidates, key=rank_key)
@@ -573,6 +610,13 @@ def _bm25_rank(candidates: list[tuple[str, str]], query_terms: list[str]) -> lis
             score += _BM25_BOOST_README
         if rel_lower.startswith(".github/workflows/"):
             score += _BM25_BOOST_WORKFLOW
+
+        # Root-preference priors: penalize depth (so the root manifest beats nested
+        # same-named files) and noise directories (test/example/subproject trees).
+        path_segments = rel_lower.split("/")
+        score -= _BM25_DEPTH_PENALTY * (len(path_segments) - 1)
+        if any(seg in NOISE_PATH_SEGMENTS for seg in path_segments[:-1]):
+            score -= _BM25_NOISE_DIR_PENALTY
 
         if score > 0:
             ranked.append((score, rel))
