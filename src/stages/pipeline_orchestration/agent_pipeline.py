@@ -19,7 +19,7 @@ try:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from RepoBuilderAgent.src.core.variant_policy import resolve_variant_policy
+    from RepoBuilderAgent.src.core.variant_policy import resolve_variant_policy, variant_intrinsic_skips
     from RepoBuilderAgent.src.core import architecture_manifest as arch_manifest
 except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
@@ -34,7 +34,7 @@ except ImportError:
         resolve_prompt_profile,
         resolve_prompt_temperature,
     )
-    from core.variant_policy import resolve_variant_policy
+    from core.variant_policy import resolve_variant_policy, variant_intrinsic_skips
     from core import architecture_manifest as arch_manifest
 
     OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", "")
@@ -228,7 +228,7 @@ parser.add_argument(
 parser.add_argument(
     "--react-max-steps",
     type=int,
-    default=4,
+    default=6,
     help="Maximum retrieval iterations passed to classify for iterative_react strategy.",
 )
 parser.add_argument(
@@ -1438,12 +1438,13 @@ def resolve_phase_skips() -> dict[str, bool]:
     # gates the classify phase; repair_enabled gates iterative repair. Both are True for every
     # variant except the simplest arch (one_shot_direct).
     policy = resolve_variant_policy(args.variant)
+    intrinsic = variant_intrinsic_skips(args.variant)
     skips = {
-        "classify": args.skip_classify or not policy.get("classification_required", True),
+        "classify": args.skip_classify or intrinsic["classify"],
         "dockerfile": args.skip_dockerfile,
-        "validation_gate": args.skip_validation_gate,
+        "validation_gate": args.skip_validation_gate or intrinsic["validation_gate"],
         "repair": args.skip_repair,
-        "install_guide": args.skip_install_guide,
+        "install_guide": args.skip_install_guide or intrinsic["install_guide"],
     }
     if not policy.get("repair_enabled", True):
         # Simplest arch: the Dockerfile is still built and verified once (the build happens
@@ -1451,10 +1452,6 @@ def resolve_phase_skips() -> dict[str, bool]:
         # max_attempts=1. This reuses the full tiered soft/mid/hard verify machinery while
         # keeping the variant "one-shot".
         args.max_attempts = 1
-    if args.variant == "one_shot_direct":
-        # No policy keys represent these; they are intrinsic to the static one-shot variant.
-        skips["validation_gate"] = True
-        skips["install_guide"] = True
     return skips
 
 

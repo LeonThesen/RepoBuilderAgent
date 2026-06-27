@@ -251,3 +251,24 @@ FALLBACK_VARIANT_POLICY: dict = {
 def resolve_variant_policy(variant: str) -> dict:
     """Return the policy for ``variant`` (a fresh copy), or the fallback policy."""
     return dict(VARIANT_POLICY_TABLE.get(variant, FALLBACK_VARIANT_POLICY))
+
+
+def variant_intrinsic_skips(variant: str) -> dict:
+    """Phases a variant SKIPS by its own nature, independent of any CLI ``--skip-*`` flag.
+
+    Single source of truth shared by:
+      - agent_pipeline.determine_phase_skips — gates the pipeline's execution path.
+      - eval.py status accounting — so a stage a variant legitimately omits is recorded
+        as "skipped", never penalised as "missing" (which would mislabel an otherwise
+        successful run, e.g. one_shot_direct, as PARTIAL).
+
+    classify follows the policy's ``classification_required``; one_shot_direct additionally
+    omits the post-generation validation gate and the install guide (intrinsic to the
+    static one-shot variant, with no policy key of their own).
+    """
+    policy = resolve_variant_policy(variant)
+    return {
+        "classify": not policy.get("classification_required", True),
+        "validation_gate": variant == "one_shot_direct",
+        "install_guide": variant == "one_shot_direct",
+    }
