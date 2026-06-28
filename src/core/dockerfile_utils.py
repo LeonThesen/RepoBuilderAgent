@@ -44,6 +44,36 @@ def _strip_trailing_noise(content: str) -> str:
     return "\n".join(lines[: last_valid + 1])
 
 
+def _strip_leading_prose(content: str) -> str:
+    """Drop leading lines that are not part of the Dockerfile.
+
+    When a repair/generation model answers WITHOUT a code fence it sometimes prefixes
+    a natural-language preamble ("Sorry, ...", "The Dockerfile has been repaired by ...")
+    or a stray ``environment:`` line before the actual Dockerfile. With no fence to
+    delimit it, that prose becomes line 1 and buildkit dies with
+    ``unknown instruction: "Sorry,"``. Anchor on the first real Dockerfile directive and
+    drop everything above it, keeping the contiguous comment/blank header lines that sit
+    directly on top of that directive (the base template's own comment block). Returns the
+    content unchanged when no directive is found (a no-FROM blob is healed elsewhere).
+    """
+    lines = content.split("\n")
+    first_directive = -1
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        if stripped.split(None, 1)[0].upper() in _DOCKERFILE_DIRECTIVES:
+            first_directive = idx
+            break
+        # a non-blank, non-comment, non-directive line above the first directive is prose
+    if first_directive < 0:
+        return content
+    start = first_directive
+    while start > 0 and (lines[start - 1].strip() == "" or lines[start - 1].lstrip().startswith("#")):
+        start -= 1
+    return "\n".join(lines[start:])
+
+
 def extract_base_image(dockerfile_content: str) -> str:
     """Return the image ref from the first ``FROM`` instruction (dropping any
     ``AS <stage>`` alias and ``--platform=`` flag), or ``""`` if none is found.
@@ -62,6 +92,10 @@ def extract_dockerfile(raw: str) -> str:
     # written Dockerfile and buildkit rejects it ("can't find = in #").
     match = re.search(r"```[a-zA-Z]*\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     content = match.group(1) if match else raw
+    # Strip a natural-language preamble the model emitted before the Dockerfile when it
+    # answered without a fence ("Sorry, ...", "The Dockerfile has been repaired ...") — left
+    # in, the first prose word becomes an `unknown instruction` parse error.
+    content = _strip_leading_prose(content)
     return _strip_trailing_noise(content).strip() + "\n"
 
 
