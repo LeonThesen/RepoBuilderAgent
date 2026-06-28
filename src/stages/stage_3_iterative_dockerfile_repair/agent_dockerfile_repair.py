@@ -404,6 +404,10 @@ def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool)
         # requested openjdk-21, and the build rejects 25. Distinct from a missing package:
         # the fix is JAVA_HOME, not another apt install.
         ("jdk_version_mismatch", ["not in the allowed range", "unsupported class file major version", "requires java", "invalid target release", "no compiler is provided"], "high"),
+        # Python build front-end (meson/cython) is older than the project requires: the
+        # distro ships a stale meson/cython and the build rejects it. The base now ships an
+        # activated venv, so the fix is `pip install -U` the build tool there — NOT apt.
+        ("python_build_tool_stale", ["module \"features\" does not exist", "requires cython", "cython >=", "requires meson", "meson >=", "a newer version of meson", "newer meson"], "high"),
         ("shell_missing", ["no usable shell found", "unable to find executable file", "exec: \"/bin/sh\": stat /bin/sh: no such file or directory"], "high"),
         ("missing_command", ["command not found", "not found in $path", "executable file not found"], "high"),
         ("permission_error", ["permission denied", "operation not permitted", "eacces"], "high"),
@@ -1132,6 +1136,15 @@ async def request_repair(
                 " prepend `$JAVA_HOME/bin` to PATH (or `sudo update-alternatives --set java`/"
                 "`javac`), choosing the installed version that satisfies the build's required"
                 " range.\n"
+            )
+        if _has_category(failure_hints, "python_build_tool_stale"):
+            prompt += (
+                "\nTargeted remediation hint (stale Python build tool, not a missing package):"
+                " the distro's meson/cython is older than the project requires. The base image"
+                " ships an activated virtualenv on PATH, so upgrade the build front-end in it"
+                " BEFORE building — e.g. `RUN pip install -U meson meson-python cython ninja`"
+                " (or the specific minimum the log names) — rather than apt-installing meson or"
+                " editing project source.\n"
             )
         apt_candidates = find_apt_candidates(failure_hints)
         if apt_candidates:
