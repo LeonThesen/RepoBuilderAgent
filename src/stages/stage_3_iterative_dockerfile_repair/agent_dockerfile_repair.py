@@ -413,7 +413,7 @@ def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool)
         ("permission_error", ["permission denied", "operation not permitted", "eacces"], "high"),
         ("network_tls", ["certificate verify failed", "x509", "pkix", "unable to get local issuer certificate", "self-signed certificate"], "medium"),
         ("network_resolution", ["could not resolve host", "temporary failure resolving", "connection timed out"], "medium"),
-        ("missing_dependency", ["unable to locate package", "no package", "not installed", "could not find", "fatal error:"], "medium"),
+        ("missing_dependency", ["unable to locate package", "no package", "not installed", "could not find", "fatal error:", "system library", "not found in the pkg-config", "required by crate"], "medium"),
     ]
 
     for category, keywords, confidence in category_rules:
@@ -494,18 +494,66 @@ def _has_category(failure_hints: dict | None, category: str) -> bool:
     )
 
 
-def find_apt_candidates(failure_hints: dict | None) -> dict:
-    """Locate an `apt_candidates` mapping in a failure-hints payload, whether the payload is
-    a single phase dict or the nested {"build": {...}, "verify": {...}} form used at the
-    repair call site."""
+# A build/configure/pkg-config step that needs a system library reports it many ways; the
+# apt package that provides the headers is almost always lib<name>-dev. Capture the library
+# name so we can search the base for the matching -dev package.
+_MISSING_SYSTEM_LIB_RES = [
+    re.compile(r"system library [`'\"]?([\w.+-]+)[`'\"]?[^\n]*?not found", re.IGNORECASE),
+    re.compile(r"could not find (?:native )?(?:static |shared )?library [`'\"]?([\w.+-]+)", re.IGNORECASE),
+    re.compile(r"no package '([\w.+-]+)' found", re.IGNORECASE),
+    re.compile(r"package '?([\w.+-]+)'? was not found in the pkg-config", re.IGNORECASE),
+]
+
+
+def _parse_missing_system_libs(log: str) -> list[str]:
+    """Pull system-library names from pkg-config / cargo / configure 'not found' errors
+    (e.g. webkit2gtk-4.1, Polly, libpsl). These are NOT apt package names — the fix is the
+    matching -dev package, which the base-apt search surfaces."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for rx in _MISSING_SYSTEM_LIB_RES:
+        for match in rx.finditer(log or ""):
+            lib = match.group(1).strip().strip("'\".,()")
+            if lib and lib.lower() not in seen:
+                seen.add(lib.lower())
+                out.append(lib)
+    return out[:5]
+
+
+def resolve_missing_system_libs(log: str, container_cli: str, base_image: str) -> dict:
+    """For each missing system library in the log, search the base apt repos for the family
+    keyword and return {lib: candidate_listing} so the repair prompt can name the real
+    lib<...>-dev package instead of leaving the agent to guess. Eager + deterministic, same
+    rationale as resolve_unavailable_apt_packages."""
+    resolved: dict[str, str] = {}
+    for lib in _parse_missing_system_libs(log):
+        keyword = _apt_search_keyword(lib).lower()
+        resolved[lib] = apt_search_packages(container_cli, base_image, keyword)
+    return resolved
+
+
+def _find_candidate_map(failure_hints: dict | None, key: str) -> dict:
+    """Locate a candidate mapping stored under `key` in a failure-hints payload, whether the
+    payload is a single phase dict or the nested {"build": {...}, "verify": {...}} form used
+    at the repair call site."""
     if not isinstance(failure_hints, dict):
         return {}
-    if isinstance(failure_hints.get("apt_candidates"), dict):
-        return failure_hints["apt_candidates"]
+    if isinstance(failure_hints.get(key), dict):
+        return failure_hints[key]
     for value in failure_hints.values():
-        if isinstance(value, dict) and isinstance(value.get("apt_candidates"), dict):
-            return value["apt_candidates"]
+        if isinstance(value, dict) and isinstance(value.get(key), dict):
+            return value[key]
     return {}
+
+
+def find_apt_candidates(failure_hints: dict | None) -> dict:
+    """Unavailable apt-package candidates (Unable-to-locate-package resolution)."""
+    return _find_candidate_map(failure_hints, "apt_candidates")
+
+
+def find_dev_lib_candidates(failure_hints: dict | None) -> dict:
+    """Missing system-library -> base-apt candidates (pkg-config/cargo 'not found')."""
+    return _find_candidate_map(failure_hints, "dev_lib_candidates")
 
 
 def _fingerprint_text(content: str) -> str:
@@ -1159,6 +1207,20 @@ async def request_repair(
                 " meta-package like `default-jdk` over a pinned `openjdk-N-jdk`):\n"
                 f"{listing}\n"
             )
+        dev_lib_candidates = find_dev_lib_candidates(failure_hints)
+        if dev_lib_candidates:
+            dev_listing = "\n".join(
+                f"- system library `{lib}` is missing — install the matching dev package."
+                f" Base apt candidates:\n{candidates}"
+                for lib, candidates in dev_lib_candidates.items()
+            )
+            prompt += (
+                "\nDETERMINISTIC DEV-LIBRARY RESOLUTION (a build/pkg-config/cargo step needs a"
+                " system library; the base apt repos were queried). Install the matching"
+                " development package — typically `lib<name>-dev` — from the candidates below"
+                " (NOT the bare library name, which is not an apt package):\n"
+                f"{dev_listing}\n"
+            )
     if args.stateful_repair and repair_history:
         prompt += (
             "\n\nStateful repair mode is enabled."
@@ -1649,18 +1711,25 @@ async def repair_repository(
                 )
 
                 build_failure_hints = extract_failure_hints(build_log, "build", exit_code, timed_out=False)
-                # Eagerly resolve `Unable to locate package` names against the real base
-                # apt repos and attach the candidates, so the repair prompt carries the
-                # answer instead of relying on the LLM to invoke apt_search itself (which it
-                # under-used). Flows into the prompt via render_failure_hints_for_prompt.
-                if build_failure_hints.get("category") == "missing_dependency":
-                    repair_base_image = extract_base_image(current_dockerfile)
-                    if repair_base_image:
-                        apt_candidates = resolve_unavailable_apt_packages(
-                            build_log, args.container_cli, repair_base_image
-                        )
-                        if apt_candidates:
-                            build_failure_hints["apt_candidates"] = apt_candidates
+                # Eagerly resolve missing packages/libraries against the real base apt repos
+                # and attach the candidates, so the repair prompt carries the answer instead
+                # of relying on the LLM to invoke apt_search itself (which it under-used). Each
+                # resolver self-gates on whether its parser finds anything in the log, so this
+                # runs regardless of the (coarser) failure category. Flows into the prompt via
+                # render_failure_hints_for_prompt + the directives in request_repair.
+                repair_base_image = extract_base_image(current_dockerfile)
+                if repair_base_image:
+                    apt_candidates = resolve_unavailable_apt_packages(
+                        build_log, args.container_cli, repair_base_image
+                    )
+                    if apt_candidates:
+                        build_failure_hints["apt_candidates"] = apt_candidates
+                    # pkg-config/cargo "system library X not found" -> matching -dev pkg
+                    dev_lib_candidates = resolve_missing_system_libs(
+                        build_log, args.container_cli, repair_base_image
+                    )
+                    if dev_lib_candidates:
+                        build_failure_hints["dev_lib_candidates"] = dev_lib_candidates
                 report["attempts"][-1]["failure_hints_build"] = build_failure_hints
                 upsert_shared_repository_state(
                     repo_name,
