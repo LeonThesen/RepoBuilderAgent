@@ -14,7 +14,9 @@ The base template already includes:
 Your task is to:
   1. Edit ONLY the two placeholder regions below; leave every other line unchanged. Never add,
      move, or remove a `USER` directive, and never modify the CA bootstrap, user setup, or
-     `COPY . .` (it already copies the repo — do NOT git clone or wget it).
+     `COPY . .` (it already copies the repo — do NOT git clone or wget it). Git submodules are
+     already vendored into the context; `.git` is NOT present, so any `git`/`git submodule`
+     command in a build step fails with "not a git repository" — never add one.
   2. Between the `# AGENT_BUILD_STEPS_BEGIN` and `# AGENT_BUILD_STEPS_END` marker lines: put ALL
      dependency/toolchain installs AND build commands. **Every step MUST be a Docker `RUN`
      instruction — each line starts with `RUN` (use `&&` and `\` for multi-command/multi-line

@@ -18,7 +18,7 @@ from tqdm import tqdm
 try:
     from RepoBuilderAgent.src.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
     from RepoBuilderAgent.src.core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
-    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool, build_apt_search_tool
+    from RepoBuilderAgent.src.agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool, build_apt_search_tool, apt_search_packages
     from RepoBuilderAgent.src.metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from RepoBuilderAgent.src.core.chat_model_factory import make_prebuilt_chat_model_factory
     from RepoBuilderAgent.src.core.agent_runtime import RepairRuntime
@@ -71,7 +71,7 @@ except ImportError:
     # Fallback for direct script execution from RepoBuilderAgent/src
     import core.config as _config
     from core.log_utils import log_error, log_info, log_trace, log_warn, set_dump_prompts_dir, set_tqdm_bar, set_trace_enabled
-    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool, build_apt_search_tool
+    from agent_tools.react_loop_tools import build_hadolint_snippet_tool, build_get_dockerfile_snippet_tool, build_think_tool, build_read_file_tool, build_list_tree_tool, build_search_pattern_tool, build_apt_search_tool, apt_search_packages
     from metrics.eval_metrics_lib import load_gt_for_repo, get_gt_verify_commands, get_gt_key_artifact
     from core.chat_model_factory import make_prebuilt_chat_model_factory
     from core.agent_runtime import RepairRuntime
@@ -432,6 +432,56 @@ def render_failure_hints_for_prompt(failure_hints: dict | None) -> str:
     if not failure_hints:
         return ""
     return json.dumps(failure_hints, indent=2, sort_keys=True)
+
+
+_UNAVAILABLE_PKG_RE = re.compile(r"unable to locate package\s+(\S+)", re.IGNORECASE)
+
+
+def _parse_unavailable_packages(log: str) -> list[str]:
+    """Pull the package names apt reported as `Unable to locate package <pkg>` from a build
+    log. These are almost always version-pinned names dropped from forky (e.g.
+    openjdk-17-jdk, llvm-15) that the agent copied from project docs."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _UNAVAILABLE_PKG_RE.finditer(log or ""):
+        pkg = match.group(1).strip().strip("'\".,()")
+        if pkg and pkg not in seen:
+            seen.add(pkg)
+            out.append(pkg)
+    return out[:5]
+
+
+def _apt_search_keyword(pkg: str) -> str:
+    """Reduce a version-pinned package name to the family keyword an apt-cache search will
+    match: openjdk-17-jdk -> openjdk, llvm-15 -> llvm, python3.11 -> python. The exact
+    pinned name returns nothing; the family stem surfaces the candidates that do exist."""
+    stem = re.sub(r"[-.]?\d.*$", "", pkg).strip("-.")
+    return stem or pkg
+
+
+def resolve_unavailable_apt_packages(log: str, container_cli: str, base_image: str) -> dict:
+    """For each `Unable to locate package` in the log, query the base image's apt repos and
+    return {unavailable_name: candidate_listing}. This runs the lookup EAGERLY and
+    deterministically: the repair LLM under-invoked the apt_search tool on its own, so the
+    answer is computed here and handed to it rather than left to its discretion."""
+    resolved: dict[str, str] = {}
+    for pkg in _parse_unavailable_packages(log):
+        resolved[pkg] = apt_search_packages(container_cli, base_image, _apt_search_keyword(pkg))
+    return resolved
+
+
+def find_apt_candidates(failure_hints: dict | None) -> dict:
+    """Locate an `apt_candidates` mapping in a failure-hints payload, whether the payload is
+    a single phase dict or the nested {"build": {...}, "verify": {...}} form used at the
+    repair call site."""
+    if not isinstance(failure_hints, dict):
+        return {}
+    if isinstance(failure_hints.get("apt_candidates"), dict):
+        return failure_hints["apt_candidates"]
+    for value in failure_hints.values():
+        if isinstance(value, dict) and isinstance(value.get("apt_candidates"), dict):
+            return value["apt_candidates"]
+    return {}
 
 
 def _fingerprint_text(content: str) -> str:
@@ -1052,6 +1102,19 @@ async def request_repair(
                 "\nPrefer adding `python-is-python3` (Debian/Ubuntu) or a safe equivalent symlink in the image,"
                 "\nrather than editing project source or skipping required build steps.\n"
             )
+        apt_candidates = find_apt_candidates(failure_hints)
+        if apt_candidates:
+            listing = "\n".join(
+                f"- `{pkg}` is NOT available on this base. Candidates that exist:\n{candidates}"
+                for pkg, candidates in apt_candidates.items()
+            )
+            prompt += (
+                "\nDETERMINISTIC APT RESOLUTION (already queried against this build's base"
+                " image — do NOT re-guess version-pinned names from project docs). Replace"
+                " each unavailable package below with a real candidate (prefer an unversioned"
+                " meta-package like `default-jdk` over a pinned `openjdk-N-jdk`):\n"
+                f"{listing}\n"
+            )
     if args.stateful_repair and repair_history:
         prompt += (
             "\n\nStateful repair mode is enabled."
@@ -1542,6 +1605,18 @@ async def repair_repository(
                 )
 
                 build_failure_hints = extract_failure_hints(build_log, "build", exit_code, timed_out=False)
+                # Eagerly resolve `Unable to locate package` names against the real base
+                # apt repos and attach the candidates, so the repair prompt carries the
+                # answer instead of relying on the LLM to invoke apt_search itself (which it
+                # under-used). Flows into the prompt via render_failure_hints_for_prompt.
+                if build_failure_hints.get("category") == "missing_dependency":
+                    repair_base_image = extract_base_image(current_dockerfile)
+                    if repair_base_image:
+                        apt_candidates = resolve_unavailable_apt_packages(
+                            build_log, args.container_cli, repair_base_image
+                        )
+                        if apt_candidates:
+                            build_failure_hints["apt_candidates"] = apt_candidates
                 report["attempts"][-1]["failure_hints_build"] = build_failure_hints
                 upsert_shared_repository_state(
                     repo_name,

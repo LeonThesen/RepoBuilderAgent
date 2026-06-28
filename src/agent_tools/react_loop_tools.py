@@ -694,12 +694,61 @@ def _ensure_apt_warm_image(container_cli: str, base_image: str) -> "str | None":
     return warm
 
 
+# Per-(base,term) result cache shared across the tool and the deterministic resolver so
+# the same lookup is never run twice in a repair session.
+_APT_SEARCH_CACHE: "dict[tuple[str, str], str]" = {}
+
+
+def apt_search_packages(container_cli: str, base_image: str, term: str) -> str:
+    """Query `base_image`'s apt repositories for packages matching `term` and return the
+    install candidates (names + versions that actually exist on this base). Shared by the
+    LLM-facing apt_search tool and the deterministic missing-package resolver so both use
+    the same warm-image machinery and cache. Returns '(no matching packages)' on a miss
+    and a short diagnostic string if the query itself fails."""
+    term = (term or "").strip()
+    if not term:
+        return "Provide a package name or keyword to search (e.g. 'openjdk')."
+    key = (base_image, term)
+    if key in _APT_SEARCH_CACHE:
+        return _APT_SEARCH_CACHE[key]
+    quoted = shlex.quote(term)
+    warm = _ensure_apt_warm_image(container_cli, base_image)
+    if warm is not None:
+        run_image = warm
+        shell = (
+            f"apt-cache search --names-only {quoted} | head -n 40; "
+            f"echo '--- policy ---'; apt-cache policy {quoted} 2>/dev/null | head -n 20"
+        )
+    else:
+        # Fallback: warm build failed (e.g. offline) — update in place this call.
+        run_image = base_image
+        shell = (
+            f"apt-get update -qq >/dev/null 2>&1; "
+            f"apt-cache search --names-only {quoted} | head -n 40"
+        )
+    try:
+        result = subprocess.run(
+            [container_cli, "run", "--rm", "--entrypoint", "/bin/sh", run_image, "-c", shell],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        output = (result.stdout or "").strip() or (result.stderr or "").strip() or "(no matching packages)"
+    except subprocess.TimeoutExpired:
+        output = "apt search timed out."
+    except Exception as exc:
+        output = f"apt search unavailable: {type(exc).__name__}: {exc}"
+    output = output[:2000]
+    _APT_SEARCH_CACHE[key] = output
+    return output
+
+
 def build_apt_search_tool(container_cli: str, base_image: str) -> Callable[[str], str]:
     """ReAct tool: query the build base image's apt repositories. Lets the repair agent
     resolve `Unable to locate package` errors by discovering which package actually
     exists on this Debian base (e.g. `default-jdk`/`openjdk-21-jdk` instead of a dropped
     `openjdk-17-jdk`) instead of guessing version-pinned names from project docs."""
-    cache: "dict[str, str]" = {}
 
     @tool
     def apt_search(query: str) -> str:
@@ -707,41 +756,6 @@ def build_apt_search_tool(container_cli: str, base_image: str) -> Callable[[str]
         and show install candidates. Use this to fix `Unable to locate package <pkg>`:
         pass a keyword (e.g. `openjdk`, `clang`, `python3`) to see the package names and
         versions that actually exist on this base, then install one of those."""
-        term = (query or "").strip()
-        if not term:
-            return "Provide a package name or keyword to search (e.g. 'openjdk')."
-        if term in cache:
-            return cache[term]
-        quoted = shlex.quote(term)
-        warm = _ensure_apt_warm_image(container_cli, base_image)
-        if warm is not None:
-            run_image = warm
-            shell = (
-                f"apt-cache search --names-only {quoted} | head -n 40; "
-                f"echo '--- policy ---'; apt-cache policy {quoted} 2>/dev/null | head -n 20"
-            )
-        else:
-            # Fallback: warm build failed (e.g. offline) — update in place this call.
-            run_image = base_image
-            shell = (
-                f"apt-get update -qq >/dev/null 2>&1; "
-                f"apt-cache search --names-only {quoted} | head -n 40"
-            )
-        try:
-            result = subprocess.run(
-                [container_cli, "run", "--rm", "--entrypoint", "/bin/sh", run_image, "-c", shell],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-            output = (result.stdout or "").strip() or (result.stderr or "").strip() or "(no matching packages)"
-        except subprocess.TimeoutExpired:
-            output = "apt search timed out."
-        except Exception as exc:
-            output = f"apt search unavailable: {type(exc).__name__}: {exc}"
-        output = output[:2000]
-        cache[term] = output
-        return output
+        return apt_search_packages(container_cli, base_image, query)
 
     return apt_search

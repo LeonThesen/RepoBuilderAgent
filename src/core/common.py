@@ -1069,8 +1069,11 @@ async def ensure_repo_checkout(repo_url: str, repo_path: Path, skip_reason: str 
     if repo_path.exists():
         return True
     log_info(f"Cloning {repo_url} -> {repo_path}")
+    # --recurse-submodules: vendored-submodule repos (e.g. grpc's third_party/*) otherwise
+    # arrive empty, and the build cannot `git submodule update` inside a container with no
+    # .git. Populate the working tree at clone time so the build context is complete.
     result = await asyncio.to_thread(
-        subprocess.run, ["git", "clone", repo_url, str(repo_path)], check=False
+        subprocess.run, ["git", "clone", "--recurse-submodules", repo_url, str(repo_path)], check=False
     )
     if result.returncode != 0:
         log_warn(f"Failed to clone {repo_url}; {skip_reason}.")
