@@ -399,6 +399,11 @@ def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool)
 
     category_rules: list[tuple[str, list[str], str]] = [
         ("python_missing", ["env: 'python': no such file or directory", "env: ''python'': no such file or directory", "python: not found"], "high"),
+        # Correct JDK is installed but the system default (update-alternatives, newest wins)
+        # points at a too-new JDK — e.g. maven/default-jdk pull java-25 alongside the
+        # requested openjdk-21, and the build rejects 25. Distinct from a missing package:
+        # the fix is JAVA_HOME, not another apt install.
+        ("jdk_version_mismatch", ["not in the allowed range", "unsupported class file major version", "requires java", "invalid target release", "no compiler is provided"], "high"),
         ("shell_missing", ["no usable shell found", "unable to find executable file", "exec: \"/bin/sh\": stat /bin/sh: no such file or directory"], "high"),
         ("missing_command", ["command not found", "not found in $path", "executable file not found"], "high"),
         ("permission_error", ["permission denied", "operation not permitted", "eacces"], "high"),
@@ -468,6 +473,21 @@ def resolve_unavailable_apt_packages(log: str, container_cli: str, base_image: s
     for pkg in _parse_unavailable_packages(log):
         resolved[pkg] = apt_search_packages(container_cli, base_image, _apt_search_keyword(pkg))
     return resolved
+
+
+def _has_category(failure_hints: dict | None, category: str) -> bool:
+    """True if `category` appears in a failure-hints payload, whether flat (a single phase
+    dict with a top-level "category") or nested ({"build": {...}, "verify": {...}}). The
+    repair call sites pass the nested form, so a flat-only `.get("category")` check silently
+    never fires — this handles both."""
+    if not isinstance(failure_hints, dict):
+        return False
+    if failure_hints.get("category") == category:
+        return True
+    return any(
+        isinstance(value, dict) and value.get("category") == category
+        for value in failure_hints.values()
+    )
 
 
 def find_apt_candidates(failure_hints: dict | None) -> dict:
@@ -1096,11 +1116,22 @@ async def request_repair(
             "\nPrefer addressing high-confidence categories first."
             f"\n\nFAILURE_HINTS_JSON:\n{render_failure_hints_for_prompt(failure_hints)}\n"
         )
-        if failure_hints.get("category") == "python_missing":
+        if _has_category(failure_hints, "python_missing"):
             prompt += (
                 "\nTargeted remediation hint: build tooling expects `python` on PATH."
                 "\nPrefer adding `python-is-python3` (Debian/Ubuntu) or a safe equivalent symlink in the image,"
                 "\nrather than editing project source or skipping required build steps.\n"
+            )
+        if _has_category(failure_hints, "jdk_version_mismatch"):
+            prompt += (
+                "\nTargeted remediation hint (JDK selection, not a missing package): the"
+                " required JDK is likely already installed, but the active default points at a"
+                " newer JDK (apt/`default-jdk`/maven pull the newest available, e.g. java-25,"
+                " and update-alternatives auto-selects it). Do NOT reinstall in a loop. Instead"
+                " pin the in-range JDK: `ENV JAVA_HOME=/usr/lib/jvm/java-<N>-openjdk-amd64` and"
+                " prepend `$JAVA_HOME/bin` to PATH (or `sudo update-alternatives --set java`/"
+                "`javac`), choosing the installed version that satisfies the build's required"
+                " range.\n"
             )
         apt_candidates = find_apt_candidates(failure_hints)
         if apt_candidates:
