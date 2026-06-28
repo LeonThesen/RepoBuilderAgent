@@ -412,10 +412,13 @@ def _resolve_workspace_root(src_dir: Path) -> Path:
     return repo_root
 
 
+SENSITIVE_FLAGS = ("--api-key", "--endpoint")
+
+
 def sanitize_command(command: list[str]) -> list[str]:
     sanitized = command.copy()
     for index, part in enumerate(sanitized[:-1]):
-        if part == "--api-key":
+        if part in SENSITIVE_FLAGS:
             sanitized[index + 1] = "***REDACTED***"
     return sanitized
 
@@ -1837,7 +1840,6 @@ def main() -> int:
 
         if not phase_skips["dockerfile"]:
             dockerfile_cmd = build_dockerfile_command(python_executable, dockerfile_script)
-            print(f"Dockerfile cmd: {dockerfile_cmd}")
             summary["phases"].append(
                 run_step(
                     "dockerfile generation",
