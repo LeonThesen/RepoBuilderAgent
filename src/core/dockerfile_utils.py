@@ -96,7 +96,23 @@ def extract_dockerfile(raw: str) -> str:
     # answered without a fence ("Sorry, ...", "The Dockerfile has been repaired ...") — left
     # in, the first prose word becomes an `unknown instruction` parse error.
     content = _strip_leading_prose(content)
+    content = _strip_markdown_noise_lines(content)
     return _strip_trailing_noise(content).strip() + "\n"
+
+
+def _strip_markdown_noise_lines(content: str) -> str:
+    """Drop markdown artifacts that the model interleaves anywhere in a no-fence answer:
+    blockquote lines (a line whose first token is ``>``) and stray code-fence lines
+    (```` ``` ````). Either becomes ``unknown instruction: ">"`` / `` "```" `` at build time
+    (seen interior to the Dockerfile on tauri). Conservative on purpose — only these two
+    never-valid markers are removed, NOT arbitrary non-instruction lines, so RUN bodies and
+    continuations are untouched. A ``>`` only ever appears mid-line in a real step
+    (``cat >file``), never as the first token, so this cannot eat a legitimate line."""
+    kept = [
+        line for line in content.split("\n")
+        if not (line.lstrip().startswith(">") or line.strip().startswith("```"))
+    ]
+    return "\n".join(kept)
 
 
 def has_from_instruction(dockerfile_content: str) -> bool:

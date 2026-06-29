@@ -1189,20 +1189,28 @@ async def request_repair(
                 "\nTargeted remediation hint (JDK selection, not a missing package): the"
                 " required JDK is likely already installed, but the active default points at a"
                 " newer JDK (apt/`default-jdk`/maven pull the newest available, e.g. java-25,"
-                " and update-alternatives auto-selects it). Do NOT reinstall in a loop. Instead"
-                " pin the in-range JDK: `ENV JAVA_HOME=/usr/lib/jvm/java-<N>-openjdk-amd64` and"
-                " prepend `$JAVA_HOME/bin` to PATH (or `sudo update-alternatives --set java`/"
-                "`javac`), choosing the installed version that satisfies the build's required"
-                " range.\n"
+                " and update-alternatives auto-selects it). Do NOT reinstall in a loop. Pin the"
+                " in-range JDK: `ENV JAVA_HOME=/usr/lib/jvm/java-<N>-openjdk-amd64` and prepend"
+                " `$JAVA_HOME/bin` to PATH. IMPORTANT: maven/gradle toolchain detection scans"
+                " /usr/lib/jvm and may still pick the newest JDK even with JAVA_HOME set — so"
+                " ALSO make the in-range JDK the only selectable one: either"
+                " `sudo update-alternatives --set java /usr/lib/jvm/java-<N>-openjdk-amd64/bin/java`"
+                " (and `javac`), or `sudo apt-get purge -y` the out-of-range JDK package."
+                " Choose <N> as the installed version satisfying the build's required range.\n"
             )
         if _has_category(failure_hints, "python_build_tool_stale"):
             prompt += (
                 "\nTargeted remediation hint (stale Python build tool, not a missing package):"
                 " the distro's meson/cython is older than the project requires. The base image"
                 " ships an activated virtualenv on PATH, so upgrade the build front-end in it"
-                " BEFORE building — e.g. `RUN pip install -U meson meson-python cython ninja`"
-                " (or the specific minimum the log names) — rather than apt-installing meson or"
-                " editing project source.\n"
+                " BEFORE building — `RUN pip install -U meson meson-python cython ninja` (keep"
+                " ALL of these; cython is required for meson's cython compiler check). Then build"
+                " with build isolation OFF so pip uses the venv's upgraded tools instead of"
+                " re-fetching the stale pinned versions into an isolated env:"
+                " `RUN pip install --no-build-isolation .` (isolation re-installs the project's"
+                " pinned build-requires and reintroduces the stale meson/cython — the usual cause"
+                " of `metadata-generation-failed` after an upgrade). Do not apt-install meson or"
+                " edit project source.\n"
             )
         apt_candidates = find_apt_candidates(failure_hints)
         if apt_candidates:
