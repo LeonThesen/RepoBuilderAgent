@@ -520,6 +520,17 @@ def _parse_missing_system_libs(log: str) -> list[str]:
     return out[:5]
 
 
+def _lib_search_keyword(lib: str) -> str:
+    """Search keyword for a system-library name. Unlike _apt_search_keyword (which strips at
+    the FIRST digit — right for openjdk-17-jdk -> openjdk), library names carry the version
+    as a TRAILING token and embed digits mid-name, so only the trailing version is dropped:
+    webkit2gtk-4.1 -> webkit2gtk (hits libwebkit2gtk-4.1-dev precisely, not every webkit*),
+    gtk+-3.0 -> gtk+, Polly -> polly. Stripping mid-name digits would over-broaden the
+    search and let the agent pick the wrong sibling package."""
+    stem = re.sub(r"[-.]?\d[\d.]*$", "", lib).strip("-.")
+    return (stem or lib).lower()
+
+
 def resolve_missing_system_libs(log: str, container_cli: str, base_image: str) -> dict:
     """For each missing system library in the log, search the base apt repos for the family
     keyword and return {lib: candidate_listing} so the repair prompt can name the real
@@ -527,8 +538,7 @@ def resolve_missing_system_libs(log: str, container_cli: str, base_image: str) -
     rationale as resolve_unavailable_apt_packages."""
     resolved: dict[str, str] = {}
     for lib in _parse_missing_system_libs(log):
-        keyword = _apt_search_keyword(lib).lower()
-        resolved[lib] = apt_search_packages(container_cli, base_image, keyword)
+        resolved[lib] = apt_search_packages(container_cli, base_image, _lib_search_keyword(lib))
     return resolved
 
 
