@@ -101,17 +101,31 @@ def extract_dockerfile(raw: str) -> str:
 
 
 def _strip_markdown_noise_lines(content: str) -> str:
-    """Drop markdown artifacts that the model interleaves anywhere in a no-fence answer:
-    blockquote lines (a line whose first token is ``>``) and stray code-fence lines
-    (```` ``` ````). Either becomes ``unknown instruction: ">"`` / `` "```" `` at build time
-    (seen interior to the Dockerfile on tauri). Conservative on purpose — only these two
-    never-valid markers are removed, NOT arbitrary non-instruction lines, so RUN bodies and
-    continuations are untouched. A ``>`` only ever appears mid-line in a real step
-    (``cat >file``), never as the first token, so this cannot eat a legitimate line."""
-    kept = [
-        line for line in content.split("\n")
-        if not (line.lstrip().startswith(">") or line.strip().startswith("```"))
-    ]
+    """Drop markdown artifacts the model interleaves in a no-fence answer: stray code-fence
+    lines (```` ``` ````) and markdown blockquote lines (first token ``>``). Either becomes
+    ``unknown instruction`` at build time (seen interior to the Dockerfile on tauri).
+
+    A ``>`` line is dropped ONLY when it is not inside a shell line-continuation: a real
+    Dockerfile redirect can legitimately sit on its own continuation line, e.g. the base
+    template's
+        'Defaults env_keep += "..."' \\
+        > /etc/sudoers.d/manualrepos \\
+    so a ``>`` line is kept when the previous retained non-blank line ends with ``\\``.
+    Stripping those (an earlier bug) deleted the redirect and broke the base layer for every
+    repo. Code fences are never valid and always dropped."""
+    kept: list[str] = []
+    prev_continues = False  # does the last retained non-blank line end with a backslash?
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            continue
+        if line.lstrip().startswith(">") and not prev_continues:
+            continue
+        kept.append(line)
+        if stripped:
+            prev_continues = stripped.endswith("\\")
+        else:
+            prev_continues = False  # a blank line ends any continuation
     return "\n".join(kept)
 
 
