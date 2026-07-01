@@ -568,8 +568,8 @@ def build_get_dockerfile_snippet_tool() -> Callable:
         Call with action='list_actions' to see all available actions and descriptions.
 
         Common actions (version is optional):
-          install_jdk(version)       — OpenJDK JDK from apt (default: 17)
-          install_jre(version)       — OpenJDK JRE from apt (default: 17)
+          install_jdk                — OpenJDK 21 LTS (base already ships it; do not version-chase)
+          install_jre                — OpenJDK 21 JRE headless (base already ships the JDK)
           install_node(version)      — Node.js via NodeSource (default: 20)
           install_cargo              — Rust + Cargo via rustup
           install_go(version)        — Go from go.dev tarball (default: 1.22)

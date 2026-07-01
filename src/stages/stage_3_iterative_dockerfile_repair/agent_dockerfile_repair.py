@@ -1186,17 +1186,16 @@ async def request_repair(
             )
         if _has_category(failure_hints, "jdk_version_mismatch"):
             prompt += (
-                "\nTargeted remediation hint (JDK selection, not a missing package): the"
-                " required JDK is likely already installed, but the active default points at a"
-                " newer JDK (apt/`default-jdk`/maven pull the newest available, e.g. java-25,"
-                " and update-alternatives auto-selects it). Do NOT reinstall in a loop. Pin the"
-                " in-range JDK: `ENV JAVA_HOME=/usr/lib/jvm/java-<N>-openjdk-amd64` and prepend"
-                " `$JAVA_HOME/bin` to PATH. IMPORTANT: maven/gradle toolchain detection scans"
-                " /usr/lib/jvm and may still pick the newest JDK even with JAVA_HOME set — so"
-                " ALSO make the in-range JDK the only selectable one: either"
-                " `sudo update-alternatives --set java /usr/lib/jvm/java-<N>-openjdk-amd64/bin/java`"
-                " (and `javac`), or `sudo apt-get purge -y` the out-of-range JDK package."
-                " Choose <N> as the installed version satisfying the build's required range.\n"
+                "\nTargeted remediation hint (JDK selection, not a missing package): the base"
+                " image ships OpenJDK 21 (LTS) as the JDK, on PATH with JAVA_HOME set — this is"
+                " the in-range version, so do NOT install or reinstall a JDK. If a too-new JDK"
+                " (e.g. java-25) is now active, it is because an earlier step installed one"
+                " (`default-jdk` pulls the newest) — REMOVE that step and rely on the"
+                " pre-installed JDK 21. If maven/gradle toolchain detection still scans"
+                " /usr/lib/jvm and picks a newer JDK, force selection of 21: point Gradle at it"
+                " (`-Porg.gradle.java.installations.paths=$JAVA_HOME`), or"
+                " `sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java`"
+                " (and `javac`), or `sudo apt-get purge -y` the extra out-of-range JDK package.\n"
             )
         if _has_category(failure_hints, "python_build_tool_stale"):
             prompt += (
@@ -1221,8 +1220,9 @@ async def request_repair(
             prompt += (
                 "\nDETERMINISTIC APT RESOLUTION (already queried against this build's base"
                 " image — do NOT re-guess version-pinned names from project docs). Replace"
-                " each unavailable package below with a real candidate (prefer an unversioned"
-                " meta-package like `default-jdk` over a pinned `openjdk-N-jdk`):\n"
+                " each unavailable package below with a real candidate. For a JDK, the base"
+                " already ships OpenJDK 21 — drop the JDK install entirely rather than"
+                " substituting `default-jdk` (which pulls a too-new java-25):\n"
                 f"{listing}\n"
             )
         dev_lib_candidates = find_dev_lib_candidates(failure_hints)

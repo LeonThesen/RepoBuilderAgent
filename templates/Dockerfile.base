@@ -81,6 +81,21 @@ RUN python3 -m venv /opt/venv \
     && chown -R manualrepos:manualrepos /opt/venv
 ENV VIRTUAL_ENV="/opt/venv"
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Pre-provision OpenJDK 21 (current LTS) on PATH. This works around a forky-specific
+# vice for JVM builds: the base's apt repos have DROPPED older versioned packages
+# (openjdk-11/17-jdk fail with "Unable to locate package"), while the `default-jdk`
+# meta-package now resolves to the newest JDK (java-25), which Gradle/Maven builds
+# that pin a toolchain `languageVersion` in a bounded range (e.g. [17,22)) REJECT as
+# too new. openjdk-21-jdk is the one apt package that is both still present AND an
+# in-range LTS, so shipping it in the base means JVM builds neither guess a dropped
+# version nor land on a too-new default. JAVA_HOME is set so tools/Gradle resolve it
+# without hardcoding a version-specific path. Inert for non-Java repos (only disk).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-21-jdk \
+    && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME="/usr/lib/jvm/java-21-openjdk-amd64"
+ENV PATH="$JAVA_HOME/bin:$PATH"
 USER manualrepos
 WORKDIR /home/manualrepos/repo
 

@@ -35,16 +35,28 @@ def install_apt(packages: str = "") -> str:
     return _apt(pkgs)
 
 
-def install_jdk(version: str = "21") -> str:
-    """Install OpenJDK Development Kit from apt. Common versions: 11, 17, 21, 25."""
-    v = (version or "21").strip()
-    return _apt(f"openjdk-{v}-jdk")
+def install_jdk(version: str = "") -> str:
+    """Install OpenJDK 21 (current LTS) from apt.
+
+    NOTE: the base image ALREADY ships OpenJDK 21 on PATH with JAVA_HOME set, so a
+    JVM build normally needs NO JDK install at all — use this only if the base JDK
+    was somehow removed. The `version` arg is intentionally ignored: this Debian
+    base has dropped older version-pinned names (`openjdk-11-jdk`,
+    `openjdk-17-jdk` — `Unable to locate package`), and `default-jdk` resolves to
+    the newest JDK (java-25) that toolchain-pinned Gradle/Maven builds reject as
+    too new. openjdk-21-jdk is the in-range LTS that is still available — do not
+    chase a repo's declared JDK version.
+    """
+    return _apt("openjdk-21-jdk")
 
 
-def install_jre(version: str = "21") -> str:
-    """Install OpenJDK Runtime Environment from apt (smaller than full JDK)."""
-    v = (version or "21").strip()
-    return _apt(f"openjdk-{v}-jre-headless")
+def install_jre(version: str = "") -> str:
+    """Install OpenJDK 21 JRE from apt (headless; smaller than the full JDK).
+
+    The base image already ships OpenJDK 21; see install_jdk. The `version` arg is
+    ignored for the same forky-availability reason.
+    """
+    return _apt("openjdk-21-jre-headless")
 
 
 def install_node(version: str = "20") -> str:
@@ -208,8 +220,8 @@ def list_actions(version: str = "") -> str:
     """Return all available snippet action names and their descriptions."""
     lines = [
         "install_apt(packages)      — Install arbitrary apt packages (pass space-separated list as the arg)",
-        "install_jdk(version)       — OpenJDK JDK from apt (default: 21; options: 11, 17, 21, 25)",
-        "install_jre(version)       — OpenJDK JRE from apt (default: 21; smaller than full JDK)",
+        "install_jdk               — OpenJDK 21 LTS (base already ships it; version arg ignored — do not version-chase)",
+        "install_jre               — OpenJDK 21 JRE headless (base already ships the JDK; smaller than full JDK)",
         "install_node(version)      — Node.js via NodeSource (default: 20; options: 18, 20, 22)",
         "install_pnpm               — pnpm package manager via corepack (requires Node)",
         "install_cargo              — Rust + Cargo via apt (rustup alternative in docstring)",
