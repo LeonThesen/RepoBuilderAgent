@@ -2052,23 +2052,26 @@ async def repair_repository(
                         repo_url, repo_name, current_dockerfile, repaired_dockerfile,
                         dockerfile_path, report_dir, attempt,
                     )
-                    if args.stateful_repair:
-                        append_stateful_repair_history(
-                            repair_history,
-                            attempt=attempt,
-                            trigger="verification_repair_insufficient",
-                            prior_dockerfile=prior_dockerfile,
-                            repaired_dockerfile=repaired_dockerfile,
-                            should_stop=stop,
-                            failure_hints={
-                                "build": build_failure_hints,
-                                "verify": verify_failure_hints,
-                                "verify_retry": retry_failure_hints,
-                            },
-                            build_exit_code=exit_code,
-                            verify_exit_code=verify_exit_code,
-                            verify_retry_exit_code=retry_exit_code,
-                        )
+                    # Track history UNCONDITIONALLY: the always-on diagnose-then-act
+                    # strategy ledger needs it. The stateful-repair PROMPT rendering
+                    # (history text + decision tree) stays gated on args.stateful_repair,
+                    # so the stateful ablation semantics are unchanged.
+                    append_stateful_repair_history(
+                        repair_history,
+                        attempt=attempt,
+                        trigger="verification_repair_insufficient",
+                        prior_dockerfile=prior_dockerfile,
+                        repaired_dockerfile=repaired_dockerfile,
+                        should_stop=stop,
+                        failure_hints={
+                            "build": build_failure_hints,
+                            "verify": verify_failure_hints,
+                            "verify_retry": retry_failure_hints,
+                        },
+                        build_exit_code=exit_code,
+                        verify_exit_code=verify_exit_code,
+                        verify_retry_exit_code=retry_exit_code,
+                    )
                     if stop:
                         break
                     refreshed_verify_command = normalize_verify_command(
@@ -2122,17 +2125,17 @@ async def repair_repository(
                     repo_url, repo_name, current_dockerfile, repaired_dockerfile,
                     dockerfile_path, report_dir, attempt,
                 )
-                if args.stateful_repair:
-                    append_stateful_repair_history(
-                        repair_history,
-                        attempt=attempt,
-                        trigger="build_failure",
-                        prior_dockerfile=prior_dockerfile,
-                        repaired_dockerfile=repaired_dockerfile,
-                        should_stop=stop,
-                        failure_hints={"build": build_failure_hints},
-                        build_exit_code=exit_code,
-                    )
+                # Unconditional history for the diagnose-then-act ledger (see note above).
+                append_stateful_repair_history(
+                    repair_history,
+                    attempt=attempt,
+                    trigger="build_failure",
+                    prior_dockerfile=prior_dockerfile,
+                    repaired_dockerfile=repaired_dockerfile,
+                    should_stop=stop,
+                    failure_hints={"build": build_failure_hints},
+                    build_exit_code=exit_code,
+                )
                 if stop:
                     break
                 refreshed_verify_command = normalize_verify_command(
