@@ -656,6 +656,60 @@ def _extract_failure_categories(payload) -> list[str]:
     return deduped
 
 
+def _prior_attempt_categories(repair_history: list[dict] | None) -> list[tuple[int, str, bool]]:
+    """Per-attempt (attempt_number, failure_category, changed_dockerfile) from history,
+    oldest→newest. Used to build the strategy ledger so the repair loop can tell whether
+    the current failure is a REPEAT of a class already tried (F1: version-chasing /
+    retrying variations of a doomed approach)."""
+    out: list[tuple[int, str, bool]] = []
+    for entry in repair_history or []:
+        if not isinstance(entry, dict):
+            continue
+        cats = _extract_failure_categories(entry.get("failure_hints"))
+        category = cats[0] if cats else "unknown"
+        changed = bool(entry.get("repair_result", {}).get("changed_dockerfile"))
+        out.append((int(entry.get("attempt", 0)), category, changed))
+    return out
+
+
+def render_strategy_ledger(repair_history: list[dict] | None, failure_hints: dict | None) -> str:
+    """Force diagnose-then-act. Renders (a) a ledger of the failure classes already tried
+    and (b) a hard directive when the CURRENT failure repeats the immediately-prior class —
+    forbidding a same-class variant retry and requiring a strategy-class escalation. Returns
+    "" when there is no prior attempt (nothing to diagnose against yet). Pure/offline-testable."""
+    prior = _prior_attempt_categories(repair_history)
+    if not prior:
+        return ""
+
+    current_cats = _extract_failure_categories(failure_hints)
+    current = current_cats[0] if current_cats else "unknown"
+    last_attempt, last_category, last_changed = prior[-1]
+
+    lines = ["\nSTRATEGY LEDGER (failure classes already attempted, oldest→newest):"]
+    for attempt_no, category, changed in prior:
+        edit = "edited Dockerfile" if changed else "no Dockerfile change"
+        lines.append(f"- attempt {attempt_no}: class `{category}` ({edit}) — still failing")
+    lines.append(f"- current failure class: `{current}`")
+
+    repeat = current != "unknown" and current == last_category
+    if repeat:
+        lines.append(
+            f"\nREPEAT DETECTED: class `{current}` was already attempted and still fails. A"
+            " same-class variant retry is NOT allowed (e.g. another package version, another"
+            " flag toggle, re-pinning a version). You MUST escalate to a DIFFERENT strategy"
+            " class — change the dependency source, the build invocation, or the environment"
+            " assumption, not a parameter of the failed approach."
+        )
+
+    lines.append(
+        "\nDIAGNOSE-THEN-ACT: before writing the Dockerfile, state your diagnosis in a think"
+        " step — (1) the failure class, (2) the root cause in one line, (3) why the previous"
+        " attempt's fix did not resolve it, (4) the strategy you will now apply and how it"
+        " differs from every class in the ledger above. Only then output the Dockerfile."
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _get_or_create_tree_child(node: dict, key: str) -> dict:
     for child in node["children"]:
         if child.get("key") == key:
@@ -1172,6 +1226,12 @@ async def request_repair(
         .replace("{{DOCKERFILE_CONTENT}}", dockerfile_content)
         .replace("{{BUILD_LOG}}", trim_log(build_log))
     )
+    # Diagnose-then-act: the strategy ledger forces the model to reason about the failure
+    # class BEFORE editing and forbids retrying a class that already failed (F1). Injected
+    # ahead of the raw hints so the "escalate, don't repeat" directive frames them.
+    strategy_ledger = render_strategy_ledger(repair_history, failure_hints)
+    if strategy_ledger:
+        prompt += "\n" + strategy_ledger
     if failure_hints:
         prompt += (
             "\n\nUse these normalized failure hints as primary guidance for your fix."
