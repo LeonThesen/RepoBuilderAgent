@@ -466,6 +466,42 @@ def detect_build_gaming(dockerfile_text: str) -> list[str]:
     return findings
 
 
+_DOCKERFILE_INSTRUCTIONS = {
+    "FROM", "RUN", "CMD", "LABEL", "MAINTAINER", "EXPOSE", "ENV", "ADD", "COPY",
+    "ENTRYPOINT", "VOLUME", "USER", "WORKDIR", "ARG", "ONBUILD", "STOPSIGNAL",
+    "HEALTHCHECK", "SHELL",
+}
+
+
+def validate_dockerfile_structure(text: str) -> list[str]:
+    """Return structural problems in a Dockerfile (F5 pre-build gate). Catches the
+    regression we observed — a repair producing a `dockerfile parse error on line 1`
+    (prose/markdown leaked in, or FROM dropped). Joins line-continuations so a wrapped
+    RUN body is not mis-read as an instruction. Empty list = well-formed. Pure/offline."""
+    if not text or not text.strip():
+        return ["empty Dockerfile"]
+    problems: list[str] = []
+    has_from = False
+    continued = False  # previous logical line ended with a backslash
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.strip()
+        if continued:
+            # This physical line is the continuation of a prior instruction's body.
+            continued = raw.rstrip().endswith("\\")
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        token = stripped.split(None, 1)[0].upper()
+        if token not in _DOCKERFILE_INSTRUCTIONS:
+            problems.append(f"line {lineno} is not a valid Dockerfile instruction: {stripped[:60]!r}")
+        elif token == "FROM":
+            has_from = True
+        continued = raw.rstrip().endswith("\\")
+    if not has_from:
+        problems.append("no FROM instruction")
+    return problems
+
+
 def detect_verify_gaming(verify_command: str) -> list[str]:
     """Return descriptions of a trivially-passing verify command (F2 on the verify side:
     `true`, `echo ok`, force `exit 0`, tacked-on `|| true`). A verify that does not run the
@@ -1073,6 +1109,18 @@ def _apply_repair(
     if repaired.strip() == current.strip():
         log_warn(f"Repair model returned an unchanged Dockerfile for {repo_url}; stopping retries.")
         return current, True
+    # F5 minimal-diff / regression guard: never overwrite a well-formed Dockerfile with a
+    # malformed one. A repair that introduces a structural break (e.g. prose leaking in ->
+    # "parse error on line 1", or a dropped FROM) is a strict regression; reject it, keep the
+    # current Dockerfile, and let the next attempt try again rather than building garbage.
+    repaired_problems = validate_dockerfile_structure(repaired)
+    if repaired_problems and not validate_dockerfile_structure(current):
+        log_warn(
+            f"Rejected a malformed repair for {repo_url} (would regress a well-formed "
+            f"Dockerfile): {'; '.join(repaired_problems[:3])}. Keeping the current Dockerfile."
+        )
+        write_text(report_dir / f"attempt-{attempt}.rejected-malformed.Dockerfile", repaired)
+        return current, False
     write_text(dockerfile_path, repaired)
     write_text(report_dir / f"attempt-{attempt}.repaired.Dockerfile", repaired)
     log_trace(f"Updated Dockerfile for {repo_name} after attempt {attempt}")
