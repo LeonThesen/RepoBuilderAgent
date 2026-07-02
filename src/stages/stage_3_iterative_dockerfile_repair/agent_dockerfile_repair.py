@@ -495,6 +495,132 @@ def detect_verify_gaming(verify_command: str) -> list[str]:
     return findings
 
 
+# Fixed taxonomy the LLM diagnosis must choose from, so its category flows into the same
+# strategy ledger / targeted-hint machinery as the regex classifier. Superset of the regex
+# categories plus the two the regex misses most (build_config_error, verify_command_wrong).
+DIAGNOSIS_CATEGORIES = [
+    "missing_dependency", "missing_command", "jdk_version_mismatch", "python_missing",
+    "python_build_tool_stale", "shell_missing", "permission_error", "network_tls",
+    "network_resolution", "submodule_missing", "build_config_error",
+    "wrong_build_invocation", "verify_command_wrong", "timeout", "other",
+]
+
+DIAGNOSIS_SYSTEM_PROMPT = (
+    "You are a build-failure triage expert. Given a failing Docker build (or verify) log, "
+    "classify the ROOT cause into exactly one category and explain it in one line. Do not "
+    "propose a full fix; name the failure class and the single underlying cause. Distinguish "
+    "a BUILD failure (the artifact did not compile/install) from a VERIFY failure (the build "
+    "succeeded but the check command is wrong, e.g. wrong binary name/path -> "
+    "verify_command_wrong). Reply with ONLY a JSON object."
+)
+
+
+def build_diagnosis_prompt(log: str, phase: str, exit_code: int, dockerfile_text: str = "", max_log_chars: int = 4000) -> str:
+    """Pure prompt builder for LLM failure diagnosis. Offline-testable."""
+    tail = (log or "").strip()[-max_log_chars:]
+    categories = ", ".join(DIAGNOSIS_CATEGORIES)
+    return (
+        f"Phase: {phase}\nExit code: {exit_code}\n\n"
+        f"Allowed categories (choose exactly one): {categories}\n\n"
+        "Dockerfile being built:\n-----\n"
+        f"{dockerfile_text.strip() or '(not provided)'}\n-----\n\n"
+        "Tail of the failing log:\n-----\n"
+        f"{tail or '(empty)'}\n-----\n\n"
+        'Reply with ONLY: {"category": "<one of the allowed>", "root_cause": '
+        '"<one sentence>", "confidence": <0..1>}'
+    )
+
+
+def _safe_json_object(text: str) -> dict | None:
+    """Tolerantly extract the first JSON object from a model response (strips code fences).
+    Returns None on any failure. Mirrors mid_verify.parse_mid_verdict's extraction."""
+    raw = (text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    candidate = fenced.group(1) if fenced else raw
+    match = re.search(r"\{.*\}", candidate, re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def parse_diagnosis(raw: str) -> dict | None:
+    """Parse the diagnosis JSON. Returns None (inconclusive) on any failure or an
+    out-of-taxonomy category, so a bad judge response never overrides the regex hint.
+    Pure/offline-testable."""
+    obj = _safe_json_object(raw)
+    if not isinstance(obj, dict):
+        return None
+    category = obj.get("category")
+    if not isinstance(category, str) or category not in DIAGNOSIS_CATEGORIES:
+        return None
+    root_cause = obj.get("root_cause")
+    conf = obj.get("confidence")
+    return {
+        "category": category,
+        "root_cause": root_cause if isinstance(root_cause, str) else "",
+        "confidence": float(conf) if isinstance(conf, (int, float)) else None,
+    }
+
+
+async def refine_failure_hints_with_llm(
+    hints: dict,
+    *,
+    log: str,
+    dockerfile_content: str,
+    llm_metrics: dict,
+    repo_url: str,
+) -> dict:
+    """Upgrade a regex `unknown`/low-confidence classification with an LLM diagnosis so the
+    strategy ledger and targeted hints get a real failure class (closes the regex blind spot
+    that left cyclang-style exit-127 failures as `unknown`). Gated to the ReAct repair path
+    and only invoked when the regex is uninformative, to bound cost. On any LLM/parse
+    failure it returns the original hints unchanged — the regex result is never lost."""
+    if not args.react_repair:
+        return hints
+    if not isinstance(hints, dict):
+        return hints
+    if hints.get("category") not in (None, "", "unknown"):
+        return hints  # regex already produced a confident class; don't pay for an LLM call.
+    try:
+        response = await chat_completion_with_retries(
+            client=client,
+            model=args.model,
+            temperature=EFFECTIVE_TEMPERATURE,
+            messages=[
+                {"role": "system", "content": DIAGNOSIS_SYSTEM_PROMPT},
+                {"role": "user", "content": build_diagnosis_prompt(
+                    log, hints.get("phase", "build"), hints.get("exit_code", 0), dockerfile_content,
+                )},
+            ],
+            repo_url=repo_url,
+            phase="diagnose",
+            metrics=llm_metrics,
+            timeout_seconds=args.repair_timeout,
+            max_retries=args.llm_max_retries,
+            retry_backoff_seconds=args.llm_retry_backoff_seconds,
+            max_tokens=300,
+        )
+        raw = response.choices[0].message.content or ""
+    except Exception as exc:  # noqa: BLE001 — diagnosis is best-effort; never fail the repair
+        log_warn(f"[diagnose {repo_url}] LLM diagnosis failed, keeping regex hint: {exc}")
+        return hints
+    diagnosis = parse_diagnosis(raw)
+    if not diagnosis:
+        return hints
+    refined = dict(hints)
+    refined["category"] = diagnosis["category"]
+    refined["confidence"] = "llm"
+    if diagnosis.get("root_cause"):
+        refined["root_cause"] = diagnosis["root_cause"]
+    refined["diagnosed_by"] = "llm"
+    log_info(f"[diagnose {repo_url}] llm refined `unknown` -> `{diagnosis['category']}`")
+    return refined
+
+
 def render_failure_hints_for_prompt(failure_hints: dict | None) -> str:
     if not failure_hints:
         return ""
@@ -1866,6 +1992,16 @@ async def repair_repository(
                 )
 
                 build_failure_hints = extract_failure_hints(build_log, "build", exit_code, timed_out=False)
+                # LLM-driven diagnosis upgrades a regex `unknown` into a real class (feeds the
+                # strategy ledger + targeted hints); no-op when the regex is already confident
+                # or on the baseline path. Falls back to the regex hint on any failure.
+                build_failure_hints = await refine_failure_hints_with_llm(
+                    build_failure_hints,
+                    log=build_log,
+                    dockerfile_content=current_dockerfile,
+                    llm_metrics=llm_metrics,
+                    repo_url=repo_url,
+                )
                 # Eagerly resolve missing packages/libraries against the real base apt repos
                 # and attach the candidates, so the repair prompt carries the answer instead
                 # of relying on the LLM to invoke apt_search itself (which it under-used). Each
@@ -1950,6 +2086,16 @@ async def repair_repository(
                         "log": str(verify_log_path),
                     }
                     verify_failure_hints = extract_failure_hints(verify_log, "verify", verify_exit_code, verify_timed_out)
+                    # LLM diagnosis can classify a verify-only failure (build ok, wrong check)
+                    # as verify_command_wrong — the signal the loop needs to fix the command,
+                    # not the build (F6).
+                    verify_failure_hints = await refine_failure_hints_with_llm(
+                        verify_failure_hints,
+                        log=verify_log,
+                        dockerfile_content=current_dockerfile,
+                        llm_metrics=llm_metrics,
+                        repo_url=repo_url,
+                    )
                     report["attempts"][-1]["failure_hints_verify"] = verify_failure_hints
                     upsert_shared_repository_state(
                         repo_name,
