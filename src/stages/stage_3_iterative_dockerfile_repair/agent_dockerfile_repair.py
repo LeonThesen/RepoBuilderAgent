@@ -856,6 +856,23 @@ def _prior_attempt_categories(repair_history: list[dict] | None) -> list[tuple[i
     return out
 
 
+def render_build_verify_separation(verify_only_failure: bool) -> str:
+    """F6: when the build succeeded and only verification failed, instruct the Dockerfile
+    rewrite to PRESERVE the working build steps and change only the artifact/verify surface.
+    Empty string when it is a build failure. Pure/offline-testable."""
+    if not verify_only_failure:
+        return ""
+    return (
+        "\n\nBUILD/VERIFY SEPARATION — the Docker BUILD ALREADY SUCCEEDED (the image"
+        " built). This is a VERIFY-ONLY failure: the artifact was produced but the"
+        " verification did not pass. PRESERVE the working build steps VERBATIM — do NOT"
+        " rewrite, reorder, or drop them. Change only what makes the built artifact"
+        " reachable/usable by the verification (e.g. PATH, install location, the binary"
+        " name/target the verify command expects, a runtime dependency). Make the"
+        " smallest possible diff to the build steps — ideally none.\n"
+    )
+
+
 def render_strategy_ledger(repair_history: list[dict] | None, failure_hints: dict | None) -> str:
     """Force diagnose-then-act. Renders (a) a ledger of the failure classes already tried
     and (b) a hard directive when the CURRENT failure repeats the immediately-prior class —
@@ -1360,6 +1377,7 @@ async def request_repair(
     architecture_scratchpad_context: str = "",
     repo_path: "Path | None" = None,
     report_dir: "Path | None" = None,
+    verify_only_failure: bool = False,
 ) -> str:
     # De-noise the inputs before they reach the model. The auto-injected corporate-CA
     # bootstrap (a multi-kilobyte base64 blob) is stripped from the Dockerfile — it is
@@ -1419,6 +1437,11 @@ async def request_repair(
     # Diagnose-then-act: the strategy ledger forces the model to reason about the failure
     # class BEFORE editing and forbids retrying a class that already failed (F1). Injected
     # ahead of the raw hints so the "escalate, don't repeat" directive frames them.
+    # Build/verify separation (F6): if the build already succeeded and only verification
+    # failed, the working build steps must be preserved — the problem is the artifact's
+    # usability or the check, not the build. Frame this FIRST so it governs every edit.
+    prompt += render_build_verify_separation(verify_only_failure)
+
     strategy_ledger = render_strategy_ledger(repair_history, failure_hints)
     if strategy_ledger:
         prompt += "\n" + strategy_ledger
@@ -2266,6 +2289,10 @@ async def repair_repository(
                             architecture_scratchpad_context=architecture_scratchpad_context,
                             repo_path=repo_path,
                             report_dir=report_dir,
+                            # Reached only after a SUCCESSFUL build whose verification failed
+                            # and whose verify-command repair was insufficient (F6): tell the
+                            # Dockerfile rewrite to preserve the working build steps.
+                            verify_only_failure=True,
                         ),
                     )
                     if repaired_dockerfile is None:
