@@ -1573,15 +1573,14 @@ async def request_repair(
         if _has_category(failure_hints, "jdk_version_mismatch"):
             prompt += (
                 "\nTargeted remediation hint (JDK selection, not a missing package): the base"
-                " image ships OpenJDK 21 (LTS) as the JDK, on PATH with JAVA_HOME set — this is"
-                " the in-range version, so do NOT install or reinstall a JDK. If a too-new JDK"
-                " (e.g. java-25) is now active, it is because an earlier step installed one"
-                " (`default-jdk` pulls the newest) — REMOVE that step and rely on the"
-                " pre-installed JDK 21. If maven/gradle toolchain detection still scans"
-                " /usr/lib/jvm and picks a newer JDK, force selection of 21: point Gradle at it"
-                " (`-Porg.gradle.java.installations.paths=$JAVA_HOME`), or"
-                " `sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java`"
-                " (and `javac`), or `sudo apt-get purge -y` the extra out-of-range JDK package.\n"
+                " image ships a JDK (the unversioned `default-jdk`) on PATH with JAVA_HOME set."
+                " forky is a rolling repo, so a version-pinned in-range JDK is NOT installable via"
+                " apt (`Unable to locate package`). If the build's Gradle/Maven toolchain rejects"
+                " the pre-installed JDK as too new, do NOT apt-install a versioned JDK. Instead:"
+                " (a) let Gradle's toolchain auto-download fetch the exact JDK (enable toolchain"
+                " download repositories), or (b) disable toolchain enforcement and point the build"
+                " at the installed JDK (`-Porg.gradle.java.installations.paths=$JAVA_HOME`), or"
+                " (c) relax/remove the `languageVersion` pin so the build uses $JAVA_HOME.\n"
             )
         if _has_category(failure_hints, "python_build_tool_stale"):
             prompt += (
@@ -1607,8 +1606,8 @@ async def request_repair(
                 "\nDETERMINISTIC APT RESOLUTION (already queried against this build's base"
                 " image — do NOT re-guess version-pinned names from project docs). Replace"
                 " each unavailable package below with a real candidate. For a JDK, the base"
-                " already ships OpenJDK 21 — drop the JDK install entirely rather than"
-                " substituting `default-jdk` (which pulls a too-new java-25):\n"
+                " already ships the unversioned `default-jdk` — drop the JDK install entirely"
+                " rather than substituting another version-pinned openjdk-N:\n"
                 f"{listing}\n"
             )
         dev_lib_candidates = find_dev_lib_candidates(failure_hints)

@@ -568,8 +568,8 @@ def build_get_dockerfile_snippet_tool() -> Callable:
         Call with action='list_actions' to see all available actions and descriptions.
 
         Common actions (version is optional):
-          install_jdk                — OpenJDK 21 LTS (base already ships it; do not version-chase)
-          install_jre                — OpenJDK 21 JRE headless (base already ships the JDK)
+          install_jdk                — default-jdk unversioned (base already ships it; do not version-chase)
+          install_jre                — default-jre unversioned (base already ships the JDK)
           install_node(version)      — Node.js via NodeSource (default: 20)
           install_cargo              — Rust + Cargo via rustup
           install_go(version)        — Go from go.dev tarball (default: 1.22)
@@ -747,8 +747,8 @@ def apt_search_packages(container_cli: str, base_image: str, term: str) -> str:
 def build_apt_search_tool(container_cli: str, base_image: str) -> Callable[[str], str]:
     """ReAct tool: query the build base image's apt repositories. Lets the repair agent
     resolve `Unable to locate package` errors by discovering which package actually
-    exists on this Debian base (e.g. `default-jdk`/`openjdk-21-jdk` instead of a dropped
-    `openjdk-17-jdk`) instead of guessing version-pinned names from project docs."""
+    exists on this Debian base (e.g. the unversioned `default-jdk` instead of a dropped
+    version-pinned `openjdk-N-jdk`) instead of guessing version-pinned names from project docs."""
 
     @tool
     def apt_search(query: str) -> str:
