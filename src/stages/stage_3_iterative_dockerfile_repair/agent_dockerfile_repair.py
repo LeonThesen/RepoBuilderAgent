@@ -260,6 +260,13 @@ parser.add_argument(
     help="Use the baseline single-shot repair (current Dockerfile + build log -> one LLM call).",
 )
 parser.set_defaults(react_repair=True)
+# Master toggle for the agent-REASONING repair upgrades (F1 strategy ledger, F2 anti-gaming
+# lint, LLM failure diagnosis, F6 build/verify separation, F5 malformed-repair guard). ON by
+# default; --no-repair-reasoning turns them all off for an A/B that isolates their value from
+# the always-on ENVIRONMENT levers (JDK/python3-dev/submodule/gcc-strip), which are NOT gated.
+parser.add_argument("--repair-reasoning", dest="repair_reasoning", action="store_true", help="Enable diagnose-then-act / anti-gaming / LLM-diagnosis / build-verify-separation / minimal-diff repair upgrades (default).")
+parser.add_argument("--no-repair-reasoning", dest="repair_reasoning", action="store_false", help="Disable the repair-reasoning upgrades (A/B control arm); environment levers stay on.")
+parser.set_defaults(repair_reasoning=True)
 parser.add_argument(
     "--llm-retry-backoff-seconds",
     type=float,
@@ -651,7 +658,7 @@ async def refine_failure_hints_with_llm(
     that left cyclang-style exit-127 failures as `unknown`). Gated to the ReAct repair path
     and only invoked when the regex is uninformative, to bound cost. On any LLM/parse
     failure it returns the original hints unchanged — the regex result is never lost."""
-    if not args.react_repair:
+    if not args.react_repair or not args.repair_reasoning:
         return hints
     if not isinstance(hints, dict):
         return hints
@@ -1149,7 +1156,7 @@ def _apply_repair(
     # malformed one. A repair that introduces a structural break (e.g. prose leaking in ->
     # "parse error on line 1", or a dropped FROM) is a strict regression; reject it, keep the
     # current Dockerfile, and let the next attempt try again rather than building garbage.
-    repaired_problems = validate_dockerfile_structure(repaired)
+    repaired_problems = validate_dockerfile_structure(repaired) if args.repair_reasoning else []
     if repaired_problems and not validate_dockerfile_structure(current):
         log_warn(
             f"Rejected a malformed repair for {repo_url} (would regress a well-formed "
@@ -1527,27 +1534,30 @@ async def request_repair(
     # Diagnose-then-act: the strategy ledger forces the model to reason about the failure
     # class BEFORE editing and forbids retrying a class that already failed (F1). Injected
     # ahead of the raw hints so the "escalate, don't repeat" directive frames them.
-    # Build/verify separation (F6): if the build already succeeded and only verification
-    # failed, the working build steps must be preserved — the problem is the artifact's
-    # usability or the check, not the build. Frame this FIRST so it governs every edit.
-    prompt += render_build_verify_separation(verify_only_failure)
+    # The agent-reasoning repair upgrades (F1/F2/F6) are gated together for the A/B; the
+    # environment levers remain unconditional.
+    if args.repair_reasoning:
+        # Build/verify separation (F6): if the build already succeeded and only verification
+        # failed, the working build steps must be preserved — the problem is the artifact's
+        # usability or the check, not the build. Frame this FIRST so it governs every edit.
+        prompt += render_build_verify_separation(verify_only_failure)
 
-    strategy_ledger = render_strategy_ledger(repair_history, failure_hints)
-    if strategy_ledger:
-        prompt += "\n" + strategy_ledger
+        strategy_ledger = render_strategy_ledger(repair_history, failure_hints)
+        if strategy_ledger:
+            prompt += "\n" + strategy_ledger
 
-    # Anti-gaming lint (F2): if the Dockerfile being repaired suppresses build errors
-    # (`|| true`, `; exit 0`, ...), a "successful" build is a masked failure. Call it out
-    # explicitly and forbid carrying it forward — the model tends to keep such shims.
-    gaming = detect_build_gaming(dockerfile_content)
-    if gaming:
-        prompt += (
-            "\nANTI-GAMING: the current Dockerfile suppresses build errors — "
-            + "; ".join(gaming)
-            + ". This makes the build exit 0 without actually succeeding, which is NOT a"
-            " real fix. REMOVE every error-suppression (`|| true`, `|| exit 0`, `; true`,"
-            " trailing `; exit 0`) and make the underlying command actually succeed.\n"
-        )
+        # Anti-gaming lint (F2): if the Dockerfile being repaired suppresses build errors
+        # (`|| true`, `; exit 0`, ...), a "successful" build is a masked failure. Call it out
+        # explicitly and forbid carrying it forward — the model tends to keep such shims.
+        gaming = detect_build_gaming(dockerfile_content)
+        if gaming:
+            prompt += (
+                "\nANTI-GAMING: the current Dockerfile suppresses build errors — "
+                + "; ".join(gaming)
+                + ". This makes the build exit 0 without actually succeeding, which is NOT a"
+                " real fix. REMOVE every error-suppression (`|| true`, `|| exit 0`, `; true`,"
+                " trailing `; exit 0`) and make the underlying command actually succeed.\n"
+            )
     if failure_hints:
         prompt += (
             "\n\nUse these normalized failure hints as primary guidance for your fix."

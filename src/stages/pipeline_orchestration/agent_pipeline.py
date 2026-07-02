@@ -135,6 +135,16 @@ react_repair_group.add_argument(
     help="Use the baseline single-shot repair (current Dockerfile + build log -> one LLM call).",
 )
 parser.set_defaults(react_repair=True)
+repair_reasoning_group = parser.add_mutually_exclusive_group()
+repair_reasoning_group.add_argument(
+    "--repair-reasoning", dest="repair_reasoning", action="store_true",
+    help="Enable agent-reasoning repair upgrades (diagnose-then-act, anti-gaming, LLM diagnosis, build/verify separation, minimal-diff). Default.",
+)
+repair_reasoning_group.add_argument(
+    "--no-repair-reasoning", dest="repair_reasoning", action="store_false",
+    help="Disable the repair-reasoning upgrades (A/B control arm); environment levers stay on.",
+)
+parser.set_defaults(repair_reasoning=True)
 parser.add_argument(
     "--stateful-history-window",
     type=int,
@@ -978,6 +988,7 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
         "--max-log-chars", str(args.max_log_chars),
         "--max-input-tokens", str(args.max_input_tokens),
         "--react-repair" if args.react_repair else "--no-react-repair",
+        "--repair-reasoning" if args.repair_reasoning else "--no-repair-reasoning",
     ])
     if args.skip_hadolint:
         command.append("--skip-hadolint")
