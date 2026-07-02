@@ -473,6 +473,42 @@ _DOCKERFILE_INSTRUCTIONS = {
 }
 
 
+_VERSIONED_TOOLCHAIN_RE = re.compile(r"\b(?:gcc|g\+\+|cpp|clang|clang\+\+)-\d+\b")
+
+
+def strip_versioned_toolchain(dockerfile_text: str) -> tuple[str, list[str]]:
+    """Deterministically remove version-pinned C/C++ compiler packages (`gcc-11`, `g++-11`,
+    `clang-15`, ...) from apt-get install lines. forky drops these versioned packages
+    (`Unable to locate package gcc-11`) and the base already ships `build-essential`
+    (gcc/g++/make), so they are both broken and redundant — the same forky vice as the JDK,
+    but the compiler is already present so we can just drop them. A RUN whose apt install is
+    left with no packages is dropped entirely. Returns (cleaned_text, removed_tokens). Pure."""
+    if not dockerfile_text or not _VERSIONED_TOOLCHAIN_RE.search(dockerfile_text):
+        return dockerfile_text, []
+    removed: list[str] = []
+    out_lines: list[str] = []
+    for line in dockerfile_text.splitlines():
+        if "apt-get install" not in line or not _VERSIONED_TOOLCHAIN_RE.search(line):
+            out_lines.append(line)
+            continue
+        found = _VERSIONED_TOOLCHAIN_RE.findall(line)
+        removed.extend(found)
+        cleaned = _VERSIONED_TOOLCHAIN_RE.sub("", line)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).rstrip()
+        # If the apt-get install now has no package operands, the RUN is a no-op that would
+        # error (`apt-get install` with nothing) — drop the whole line. Heuristic: the part
+        # after "install" (minus flags) has no bare package token left.
+        after = cleaned.split("apt-get install", 1)[1] if "apt-get install" in cleaned else ""
+        after_pkgs = re.sub(r"(^|\s)(-[-\w]+|&&.*|;.*|\|\|.*)", " ", after).strip()
+        if not after_pkgs:
+            # Drop the now-empty install entirely (keep a generic marker; do NOT echo the
+            # stripped token names, so the dropped package never lingers in the Dockerfile).
+            out_lines.append("# [auto] dropped a version-pinned compiler install; build-essential in base provides gcc/g++")
+            continue
+        out_lines.append(cleaned)
+    return "\n".join(out_lines) + ("\n" if dockerfile_text.endswith("\n") else ""), removed
+
+
 def validate_dockerfile_structure(text: str) -> list[str]:
     """Return structural problems in a Dockerfile (F5 pre-build gate). Catches the
     regression we observed — a repair producing a `dockerfile parse error on line 1`
@@ -1121,6 +1157,12 @@ def _apply_repair(
         )
         write_text(report_dir / f"attempt-{attempt}.rejected-malformed.Dockerfile", repaired)
         return current, False
+    # Deterministically strip version-pinned gcc-N/g++-N (dropped from forky; build-essential
+    # in base already provides the compiler) — the agent re-adds them from repo CI despite the
+    # prompt (F4). Same forky vice as the JDK, handled structurally rather than by advice.
+    repaired, removed_toolchain = strip_versioned_toolchain(repaired)
+    if removed_toolchain:
+        log_info(f"[toolchain-strip {repo_name}] removed version-pinned {sorted(set(removed_toolchain))} (build-essential covers it)")
     write_text(dockerfile_path, repaired)
     write_text(report_dir / f"attempt-{attempt}.repaired.Dockerfile", repaired)
     log_trace(f"Updated Dockerfile for {repo_name} after attempt {attempt}")
@@ -1997,6 +2039,13 @@ async def repair_repository(
                 + render_shared_repository_state_for_prompt(shared_repository_state)
             )
             current_dockerfile = dockerfile_path.read_text(encoding="utf-8")
+            # Clean version-pinned gcc-N/g++-N from the initial (stage-2) Dockerfile too, so
+            # the first build is not wasted on a dropped forky package (build-essential in
+            # base provides the compiler).
+            current_dockerfile, _removed_initial = strip_versioned_toolchain(current_dockerfile)
+            if _removed_initial:
+                write_text(dockerfile_path, current_dockerfile)
+                log_info(f"[toolchain-strip {repo_name}] removed version-pinned {sorted(set(_removed_initial))} from initial Dockerfile")
             repair_history: list[dict] = []
             report_dir.mkdir(parents=True, exist_ok=True)
 
