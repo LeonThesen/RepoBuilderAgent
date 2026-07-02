@@ -437,6 +437,64 @@ def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool)
     }
 
 
+_SUPPRESSION_PATTERNS = [
+    ("|| true", "`|| true` masks a failing command"),
+    ("||true", "`||true` masks a failing command"),
+    ("|| exit 0", "`|| exit 0` masks a failing command"),
+    ("|| :", "`|| :` (no-op) masks a failing command"),
+    ("|| echo", "`|| echo ...` swallows a failure into a message"),
+    ("; true", "trailing `; true` forces a zero exit"),
+    ("; exit 0", "trailing `; exit 0` forces a zero exit"),
+]
+
+
+def detect_build_gaming(dockerfile_text: str) -> list[str]:
+    """Return human-readable descriptions of error-suppression / metric-gaming patterns in
+    a generated Dockerfile's RUN steps (F2: agent optimizes for exit-0, not a working
+    build — e.g. `pip install . || true`). Empty list = clean. Pure/offline-testable."""
+    if not dockerfile_text:
+        return []
+    findings: list[str] = []
+    for raw_line in dockerfile_text.splitlines():
+        line = raw_line.strip()
+        if not line.upper().startswith("RUN"):
+            continue
+        lowered = line.lower()
+        for needle, desc in _SUPPRESSION_PATTERNS:
+            if needle in lowered and desc not in findings:
+                findings.append(desc)
+    return findings
+
+
+def detect_verify_gaming(verify_command: str) -> list[str]:
+    """Return descriptions of a trivially-passing verify command (F2 on the verify side:
+    `true`, `echo ok`, force `exit 0`, tacked-on `|| true`). A verify that does not run the
+    built artifact is not a real check. Word-boundary matched to avoid flagging real
+    commands like `construe` or paths with a colon. Pure/offline-testable."""
+    cmd = (verify_command or "").strip()
+    if not cmd:
+        return []
+    normalized = cmd.lower().strip().rstrip(";").strip()
+    findings: list[str] = []
+    # A verify that is *only* a trivial no-op token.
+    if normalized in {"true", ":", "exit 0"}:
+        return ["the verify command is a bare no-op (always passes)"]
+    # An otherwise-real command with a success shim tacked on.
+    for needle, desc in (
+        ("|| true", "the verify command tacks on `|| true` (always passes)"),
+        ("|| exit 0", "the verify command tacks on `|| exit 0` (always passes)"),
+        ("; true", "the verify command tacks on `; true` (always passes)"),
+        ("; exit 0", "the verify command tacks on `; exit 0` (always passes)"),
+    ):
+        if needle in normalized:
+            findings.append(desc)
+    # A verify whose only real token is an echo (does not exercise the artifact).
+    stripped = re.sub(r"^(export [^;]+;\s*)+", "", normalized).strip()
+    if re.match(r"^echo\b", stripped) and "&&" not in stripped and "|" not in stripped:
+        findings.append("the verify command only `echo`s — it does not exercise the artifact")
+    return findings
+
+
 def render_failure_hints_for_prompt(failure_hints: dict | None) -> str:
     if not failure_hints:
         return ""
@@ -792,6 +850,12 @@ def normalize_verify_command(command: str) -> str:
     sanitized_command = command.strip()
     if not sanitized_command:
         return "echo build-ok"
+    # Surface a trivially-passing verify (F2): it will pass regardless of whether the
+    # artifact works, so a green SOFT verify on it is meaningless. MID verify judges this
+    # post-hoc; the warning makes it visible in the run log too.
+    verify_gaming = detect_verify_gaming(sanitized_command)
+    if verify_gaming:
+        log_warn(f"[verify-lint] trivially-passing verify command: {'; '.join(verify_gaming)}")
     return (
         "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
         f"{sanitized_command}"
@@ -1232,6 +1296,19 @@ async def request_repair(
     strategy_ledger = render_strategy_ledger(repair_history, failure_hints)
     if strategy_ledger:
         prompt += "\n" + strategy_ledger
+
+    # Anti-gaming lint (F2): if the Dockerfile being repaired suppresses build errors
+    # (`|| true`, `; exit 0`, ...), a "successful" build is a masked failure. Call it out
+    # explicitly and forbid carrying it forward — the model tends to keep such shims.
+    gaming = detect_build_gaming(dockerfile_content)
+    if gaming:
+        prompt += (
+            "\nANTI-GAMING: the current Dockerfile suppresses build errors — "
+            + "; ".join(gaming)
+            + ". This makes the build exit 0 without actually succeeding, which is NOT a"
+            " real fix. REMOVE every error-suppression (`|| true`, `|| exit 0`, `; true`,"
+            " trailing `; exit 0`) and make the underlying command actually succeed.\n"
+        )
     if failure_hints:
         prompt += (
             "\n\nUse these normalized failure hints as primary guidance for your fix."
