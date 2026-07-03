@@ -103,10 +103,29 @@ _RESPONSES_API_MODELS = {"gpt-5-codex"}
 
 
 def _normalize_responses_output(raw) -> types.SimpleNamespace:
-    """Wrap a responses API result to the same interface as chat.completions."""
+    """Wrap a responses API result to the same interface as chat.completions.
+
+    Also maps the Responses-API usage (input_tokens/output_tokens/total_tokens) onto the
+    chat.completions usage shape (prompt_tokens/completion_tokens/total_tokens) that the
+    stages read as `response.usage.prompt_tokens`. Without this the SimpleNamespace has no
+    `usage` attribute and every gpt-5-codex call crashes with
+    `'types.SimpleNamespace' object has no attribute 'usage'`.
+    """
     text = getattr(raw, "output_text", "") or ""
+    raw_usage = getattr(raw, "usage", None)
+    usage = None
+    if raw_usage is not None:
+        prompt = getattr(raw_usage, "input_tokens", None)
+        completion = getattr(raw_usage, "output_tokens", None)
+        total = getattr(raw_usage, "total_tokens", None)
+        usage = types.SimpleNamespace(
+            prompt_tokens=prompt or 0,
+            completion_tokens=completion or 0,
+            total_tokens=(total if total is not None else (prompt or 0) + (completion or 0)),
+        )
     return types.SimpleNamespace(
-        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))],
+        usage=usage,
     )
 
 
