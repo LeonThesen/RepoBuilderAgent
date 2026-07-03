@@ -4,7 +4,7 @@ Your task is to extend a base Dockerfile template to build the target repository
 
 DO NOT start from scratch. Use the provided base template as the starting point.
 The base template already includes:
-  - Debian forky-slim base image
+  - Ubuntu 24.04 LTS base image (digest-pinned)
   - CA certificate bootstrap (including MANUALREPOS_CA_CERT_B64 decoding)
   - A base toolchain (build-essential, git, curl, pkg-config) and a `COPY . .` of the repo
   - A non-root build user (manualrepos) with passwordless sudo, like a normal dev box: everything
@@ -30,7 +30,7 @@ Your task is to:
          touching a root-owned path fails with `Permission denied`. Apt-list cleanup is optional; if
          you do it, `sudo` it.
        - Build commands: no sudo, e.g. `RUN cargo build --release`, `RUN make`, `RUN npm run build`.
-       - Language toolchains: prefer `RUN sudo apt-get install -y <toolchain>` (e.g. `cargo`/`rustc`).
+       - Language toolchains: use `RUN sudo apt-get install -y <toolchain>` when Ubuntu 24.04 carries a new-enough version; when apt's version is too old for the project (e.g. Rust — apt ships 1.75), use the toolchain's own installer instead.
          If you use a home-dir installer like rustup, run it WITHOUT sudo so it installs into your
          home and stays on PATH — never `sudo` rustup. Set PATH in the same `RUN` (e.g.
          `RUN curl ... | sh -s -- -y && . "$HOME/.cargo/env" && cargo build --release`), since each
@@ -43,9 +43,9 @@ Your task is to:
   3. Fill the runtime CMD/ENTRYPOINT placeholder (after the END marker) if the repo is an
      application (omit for a library).
   4. Follow these additional guidelines:
-     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `sudo apt-get install -y` up front (run `sudo apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim (Debian testing): it keeps only the CURRENT version of each toolchain, so prefer UNVERSIONED / `default-*` meta-packages over version-pinned names — `build-essential`/`gcc`/`g++`/`clang` not `gcc-11`, `python3`/`python3-dev` not `python3.11` (for the JDK see the JVM note below — it is pre-installed, do not add one). Older pinned versions are routinely dropped and fail with `Unable to locate package`. Install `gnupg`+`ca-certificates` before any `gpg`/key step. For Python, the system interpreter is externally-managed (PEP 668), so a bare `pip3 install` fails with `externally-managed-environment`: use a virtualenv.
+     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `sudo apt-get install -y` up front (run `sudo apt-get update` first), rather than adding packages piecemeal. The base is ubuntu:24.04 (LTS): its apt repos are stable, so both unversioned meta-packages (`build-essential`, `python3`/`python3-dev`) and the specific major versions Ubuntu 24.04 ships stay available. Prefer unversioned / `default-*` names for fewer surprises, and pin a version only when the toolchain needs one (for the JDK see the JVM note below — it is pre-installed, do not add one). If a toolchain version is NEWER than Ubuntu 24.04 carries, the default repos will not have it (`Unable to locate package`) — add that tool's own upstream apt repo before installing it. Install `gnupg`+`ca-certificates` before any `gpg`/key step. For Python, the system interpreter is externally-managed (PEP 668), so a bare `pip3 install` fails with `externally-managed-environment`: use a virtualenv.
      - When a step extracts an archive (`.zip`/`.tar.gz`/`.tgz`), install the matching extractor in the apt step first — `unzip` is NOT preinstalled and `unzip: command not found` will fail the build (`tar`/`xz-utils` for tarballs). Prefer the build tool's own wrapper/download over manually unpacking when one exists (e.g. let `./gradlew`/`./mvnw` fetch its distribution rather than unzipping it yourself).
-     - JVM builds: **OpenJDK 21 (LTS) is ALREADY installed in the base image**, on `PATH` with `JAVA_HOME` already set correctly. Do NOT install any JDK/JRE and do NOT set `JAVA_HOME` yourself. Installing one is wrong: forky has dropped older `openjdk-N-jdk` (fails `Unable to locate package`) and `default-jdk` pulls java-25 which toolchain-pinned Gradle/Maven builds reject as too new. The pre-installed JDK 21 compiles older bytecode targets, so do not chase the repo's declared Java version. If a Gradle toolchain pins a `languageVersion` the build can't satisfy, disable toolchain auto-provisioning and point Gradle at the installed JDK (`-Porg.gradle.java.installations.paths=$JAVA_HOME`) rather than installing another JDK.
+     - JVM builds: a **JDK is ALREADY installed in the base image** (the unversioned `default-jdk`), on `PATH` with `JAVA_HOME` already set. Do NOT install any JDK/JRE and do NOT set `JAVA_HOME` yourself. On Ubuntu 24.04 the unversioned `default-jdk` resolves to openjdk-21 (an in-range LTS) and is already provisioned. The pre-installed JDK compiles older bytecode targets, so do not chase the repo's declared Java version. If a Gradle/Maven toolchain pins a `languageVersion` the pre-installed JDK does not match, either let Gradle's toolchain auto-download fetch that JDK, or disable toolchain enforcement and point the build at the installed JDK (`-Porg.gradle.java.installations.paths=$JAVA_HOME`) — do NOT apt-install a version-pinned JDK unless Ubuntu 24.04 carries that major.
      - NEVER suppress errors to force a step to pass: no `|| true`, `|| exit 0`, `|| :`, or trailing `; true`/`; exit 0` on a build/install command. A layer that exits 0 by masking a failure produces a missing or broken artifact — make the command actually succeed instead.
      - Be conservative. Only include commands and dependencies supported by provided evidence.
      - Do not use insecure TLS bypasses (curl -k, strict-ssl=false) unless explicitly required.

@@ -87,10 +87,11 @@ Build and verify this Rust application locally on a Debian-based Linux host.
 
 ## Prerequisites
 
-Install the Rust toolchain:
+Install the Rust toolchain (Ubuntu's apt rustc is 1.75 — too old for modern crates, so use rustup):
 
 ```bash
-sudo apt-get update && sudo apt-get install -y cargo rustc
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 ## Build Steps

@@ -12,14 +12,14 @@ AGENT_BUILD_STEPS region changed).
 </user>
 <assistant>
 # Base Dockerfile projects
-# Includes: Debian, CA bootstrap, git, curl, pkg-config
+# Includes: Ubuntu, CA bootstrap, git, curl, pkg-config
 
-# Pinned by digest so the base layer is frozen: debian:forky-slim is a rolling
-# testing tag that gets re-published, which would silently change the base
+# Pinned by digest so the base layer is frozen: the ubuntu:24.04 tag is
+# re-published on patch updates, which would silently change the base
 # between eval runs and break reproducibility. Re-pin with:
-#   docker pull debian:forky-slim && docker inspect debian:forky-slim --format '{{index .RepoDigests 0}}'
-# (NOTE: the forky apt repos still roll; the digest only freezes the base image.)
-FROM debian:forky-slim@sha256:484c506e686dd6a8e2977a16d2fbab99763486c1c05f93e1dd29e6a26efe6e03
+#   docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}'
+# (Ubuntu 24.04 LTS apt repos are stable; the digest also freezes the base image.)
+FROM ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 # Non-interactive apt so `sudo apt-get install` never blocks on a prompt.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -77,7 +77,7 @@ COPY --chown=manualrepos:manualrepos . .
 # Dependency installs + build commands go here. EACH step is a Docker RUN instruction
 # (every line starts with RUN), running as the non-root user which has passwordless sudo.
 # Edit only between the markers. Example:
-#   RUN sudo apt-get update && sudo apt-get install -y cargo rustc
+#   RUN curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 #   RUN cargo build --release
 # AGENT_BUILD_STEPS_BEGIN
 # Add libssl-dev + pkg-config (the missing openssl/ssl.h) to the single up-front install.
@@ -110,14 +110,14 @@ AGENT_BUILD_STEPS region changed).
 </user>
 <assistant>
 # Base Dockerfile projects
-# Includes: Debian, CA bootstrap, git, curl, pkg-config
+# Includes: Ubuntu, CA bootstrap, git, curl, pkg-config
 
-# Pinned by digest so the base layer is frozen: debian:forky-slim is a rolling
-# testing tag that gets re-published, which would silently change the base
+# Pinned by digest so the base layer is frozen: the ubuntu:24.04 tag is
+# re-published on patch updates, which would silently change the base
 # between eval runs and break reproducibility. Re-pin with:
-#   docker pull debian:forky-slim && docker inspect debian:forky-slim --format '{{index .RepoDigests 0}}'
-# (NOTE: the forky apt repos still roll; the digest only freezes the base image.)
-FROM debian:forky-slim@sha256:484c506e686dd6a8e2977a16d2fbab99763486c1c05f93e1dd29e6a26efe6e03
+#   docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}'
+# (Ubuntu 24.04 LTS apt repos are stable; the digest also freezes the base image.)
+FROM ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 # Non-interactive apt so `sudo apt-get install` never blocks on a prompt.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -175,7 +175,7 @@ COPY --chown=manualrepos:manualrepos . .
 # Dependency installs + build commands go here. EACH step is a Docker RUN instruction
 # (every line starts with RUN), running as the non-root user which has passwordless sudo.
 # Edit only between the markers. Example:
-#   RUN sudo apt-get update && sudo apt-get install -y cargo rustc
+#   RUN curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 #   RUN cargo build --release
 # AGENT_BUILD_STEPS_BEGIN
 # Add venv support, then build/install inside an isolated environment (PEP 668 safe).

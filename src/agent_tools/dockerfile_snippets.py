@@ -40,10 +40,10 @@ def install_jdk(version: str = "") -> str:
 
     NOTE: the base image ALREADY ships `default-jdk` on PATH with JAVA_HOME set, so a
     JVM build normally needs NO JDK install at all — use this only if the base JDK was
-    somehow removed. The `version` arg is intentionally ignored: forky is a ROLLING
-    repo that drops version-pinned names (`openjdk-11/17/21-jdk` all eventually fail
-    with `Unable to locate package`), so only the unversioned `default-jdk` is stable.
-    Do not chase a repo's declared JDK version with a pinned package.
+    somehow removed. The `version` arg is intentionally ignored: on Ubuntu 24.04 the
+    unversioned `default-jdk` resolves to openjdk-21 (an in-range LTS), which satisfies
+    most toolchains. Do not chase a repo's declared JDK version with a pinned package;
+    for a newer JDK than Ubuntu 24.04 ships, let the build's toolchain auto-download fetch it.
     """
     return _apt("default-jdk")
 
@@ -52,7 +52,7 @@ def install_jre(version: str = "") -> str:
     """Install the JRE from apt via the unversioned `default-jre` meta-package.
 
     The base image already ships default-jdk; see install_jdk. The `version` arg is
-    ignored — pinned openjdk-N packages are dropped as forky rolls.
+    ignored — on Ubuntu 24.04 the unversioned `default-jre` resolves to an in-range LTS JRE.
     """
     return _apt("default-jre")
 
@@ -74,15 +74,17 @@ def install_pnpm(version: str = "") -> str:
 
 
 def install_cargo(version: str = "") -> str:
-    """Install Rust + Cargo via apt (lands in /usr/bin, on PATH for the non-root build).
+    """Install current Rust + Cargo via rustup, WITHOUT sudo so it lands in the build
+    user's home and stays on PATH.
 
-    Simplest reliable option on this base. For a newer toolchain, install rustup WITHOUT
-    sudo so it lands in the build user's home and stays on PATH:
-      RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-      ENV PATH=/home/manualrepos/.cargo/bin:$PATH
-    Never `sudo` the rustup installer (it would land in root's home, unreachable here).
+    Ubuntu 24.04's apt `cargo`/`rustc` is 1.75 — too old for modern crates and Cargo.lock
+    v4 (`failed to parse lock file`), so rustup is the reliable choice. Never `sudo` the
+    installer (it would land in root's home, unreachable by the non-root build user).
     """
-    return _apt("cargo rustc")
+    return (
+        "RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal\n"
+        "ENV PATH=/home/manualrepos/.cargo/bin:$PATH"
+    )
 
 
 def install_go(version: str = "1.22") -> str:

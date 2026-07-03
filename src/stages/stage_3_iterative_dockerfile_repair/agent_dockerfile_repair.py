@@ -480,16 +480,22 @@ _DOCKERFILE_INSTRUCTIONS = {
 }
 
 
-_VERSIONED_TOOLCHAIN_RE = re.compile(r"\b(?:gcc|g\+\+|cpp|clang|clang\+\+)-\d+\b")
+# Only gcc/g++/cpp: the base ships build-essential (gcc/g++/make), so a version-pinned
+# `gcc-N`/`g++-N` is redundant and, if the pin names a major Ubuntu 24.04 does not carry,
+# also broken. Clang is deliberately NOT matched: the base ships no clang, and on Ubuntu
+# 24.04 a modern `clang-N` (e.g. clang-21, only available via the upstream apt.llvm.org
+# repo) is the ONLY way to get that compiler — stripping it would delete a required package.
+_VERSIONED_TOOLCHAIN_RE = re.compile(r"\b(?:gcc|g\+\+|cpp)-\d+\b")
 
 
 def strip_versioned_toolchain(dockerfile_text: str) -> tuple[str, list[str]]:
-    """Deterministically remove version-pinned C/C++ compiler packages (`gcc-11`, `g++-11`,
-    `clang-15`, ...) from apt-get install lines. forky drops these versioned packages
-    (`Unable to locate package gcc-11`) and the base already ships `build-essential`
-    (gcc/g++/make), so they are both broken and redundant — the same forky vice as the JDK,
-    but the compiler is already present so we can just drop them. A RUN whose apt install is
-    left with no packages is dropped entirely. Returns (cleaned_text, removed_tokens). Pure."""
+    """Deterministically remove version-pinned gcc/g++/cpp packages (`gcc-11`, `g++-11`, ...)
+    from apt-get install lines. The base already ships `build-essential` (gcc/g++/make), so a
+    pinned `gcc-N`/`g++-N` is redundant, and a major that Ubuntu 24.04 does not carry also
+    fails with `Unable to locate package`. Clang is intentionally excluded (see regex note):
+    it has no base fallback and modern versions come only from the upstream apt repo. A RUN
+    whose apt install is left with no packages is dropped entirely. Returns
+    (cleaned_text, removed_tokens). Pure."""
     if not dockerfile_text or not _VERSIONED_TOOLCHAIN_RE.search(dockerfile_text):
         return dockerfile_text, []
     removed: list[str] = []
@@ -711,8 +717,8 @@ _UNAVAILABLE_PKG_RE = re.compile(r"unable to locate package\s+(\S+)", re.IGNOREC
 
 def _parse_unavailable_packages(log: str) -> list[str]:
     """Pull the package names apt reported as `Unable to locate package <pkg>` from a build
-    log. These are almost always version-pinned names dropped from forky (e.g.
-    openjdk-17-jdk, llvm-15) that the agent copied from project docs."""
+    log. These are almost always version-pinned names Ubuntu 24.04 does not carry (e.g.
+    a too-new openjdk-N or llvm-N) that the agent copied from project docs."""
     seen: set[str] = set()
     out: list[str] = []
     for match in _UNAVAILABLE_PKG_RE.finditer(log or ""):
@@ -1164,9 +1170,10 @@ def _apply_repair(
         )
         write_text(report_dir / f"attempt-{attempt}.rejected-malformed.Dockerfile", repaired)
         return current, False
-    # Deterministically strip version-pinned gcc-N/g++-N (dropped from forky; build-essential
-    # in base already provides the compiler) — the agent re-adds them from repo CI despite the
-    # prompt (F4). Same forky vice as the JDK, handled structurally rather than by advice.
+    # Deterministically strip version-pinned gcc-N/g++-N (redundant — build-essential in base
+    # already provides the compiler; a major Ubuntu 24.04 lacks would also fail to install) —
+    # the agent re-adds them from repo CI despite the prompt (F4). Clang is preserved (no base
+    # fallback; modern clang comes only from the upstream apt repo). Structural, not advice.
     repaired, removed_toolchain = strip_versioned_toolchain(repaired)
     if removed_toolchain:
         log_info(f"[toolchain-strip {repo_name}] removed version-pinned {sorted(set(removed_toolchain))} (build-essential covers it)")
@@ -1573,10 +1580,10 @@ async def request_repair(
         if _has_category(failure_hints, "jdk_version_mismatch"):
             prompt += (
                 "\nTargeted remediation hint (JDK selection, not a missing package): the base"
-                " image ships a JDK (the unversioned `default-jdk`) on PATH with JAVA_HOME set."
-                " forky is a rolling repo, so a version-pinned in-range JDK is NOT installable via"
-                " apt (`Unable to locate package`). If the build's Gradle/Maven toolchain rejects"
-                " the pre-installed JDK as too new, do NOT apt-install a versioned JDK. Instead:"
+                " image ships a JDK (the unversioned `default-jdk`, openjdk-21 on Ubuntu 24.04)"
+                " on PATH with JAVA_HOME set. If the build's Gradle/Maven toolchain rejects the"
+                " pre-installed JDK, prefer NOT apt-installing a versioned JDK (Ubuntu 24.04 may"
+                " not carry the requested major). Instead:"
                 " (a) let Gradle's toolchain auto-download fetch the exact JDK (enable toolchain"
                 " download repositories), or (b) disable toolchain enforcement and point the build"
                 " at the installed JDK (`-Porg.gradle.java.installations.paths=$JAVA_HOME`), or"
@@ -1647,8 +1654,8 @@ async def request_repair(
     # apt_search is ENVIRONMENT access (what packages the base distro actually ships),
     # not repo inspection — so it is always available, independent of --repair-repo-tools
     # (which gates repo *file* access for the AB-26/27 study). Without it, L3 is blind to
-    # the distro and blindly guesses versions on `Unable to locate package` (e.g. forky
-    # dropped openjdk-17-jdk; the answer is default-jdk). Tied to the Dockerfile's own FROM
+    # the distro and blindly guesses versions on `Unable to locate package` (e.g. a repo
+    # asks for a too-new openjdk-N; the answer is default-jdk). Tied to the Dockerfile's own FROM
     # so the query matches the base the build uses.
     base_image = extract_base_image(dockerfile_content)
     if base_image:
@@ -2049,8 +2056,8 @@ async def repair_repository(
             )
             current_dockerfile = dockerfile_path.read_text(encoding="utf-8")
             # Clean version-pinned gcc-N/g++-N from the initial (stage-2) Dockerfile too, so
-            # the first build is not wasted on a dropped forky package (build-essential in
-            # base provides the compiler).
+            # the first build is not wasted on a redundant/absent compiler package
+            # (build-essential in base provides the compiler).
             current_dockerfile, _removed_initial = strip_versioned_toolchain(current_dockerfile)
             if _removed_initial:
                 write_text(dockerfile_path, current_dockerfile)

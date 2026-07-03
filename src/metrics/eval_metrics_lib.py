@@ -521,7 +521,7 @@ FAILURE_PATTERNS = [
     # Docker / image layer
     ("wrong_base_image",     [re.compile(r"FROM .* not found|manifest for .* not found|pull access denied", re.I)]),
     ("dockerfile_syntax",    [re.compile(r"dockerfile parse error|unknown instruction|syntax error", re.I)]),
-    # apt / package availability (the #1 forky failure: pinned/dropped packages)
+    # apt / package availability (a common failure: a version Ubuntu 24.04 does not carry)
     ("apt_package_missing",  [re.compile(r"Unable to locate package|has no installation candidate|Couldn't find any package", re.I)]),
     ("apt_repo_error",       [re.compile(r"Failed to fetch|apt-get update.*exit code|Could not get lock|GPG error|NO_PUBKEY", re.I)]),
     # network / TLS (CA bootstrap, proxy, DNS)

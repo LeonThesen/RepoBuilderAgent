@@ -4,7 +4,7 @@ Your task is to extend a base Dockerfile template to build the target repository
 
 DO NOT start from scratch. Use the provided base template as the starting point.
 The base template already includes:
-  - Debian forky-slim base image
+  - Ubuntu 24.04 LTS base image (digest-pinned)
   - CA certificate bootstrap (including MANUALREPOS_CA_CERT_B64 decoding)
   - A base toolchain (build-essential, git, curl, pkg-config) and a `COPY . .` of the repo
   - A non-root build user (manualrepos) with passwordless sudo, like a normal dev box: everything
@@ -14,7 +14,9 @@ The base template already includes:
 Your task is to:
   1. Edit ONLY the two placeholder regions below; leave every other line unchanged. Never add,
      move, or remove a `USER` directive, and never modify the CA bootstrap, user setup, or
-     `COPY . .` (it already copies the repo — do NOT git clone or wget it).
+     `COPY . .` (it already copies the repo — do NOT git clone or wget it). Git submodules are
+     already vendored into the context; `.git` is NOT present, so any `git`/`git submodule`
+     command in a build step fails with "not a git repository" — never add one.
   2. Between the `# AGENT_BUILD_STEPS_BEGIN` and `# AGENT_BUILD_STEPS_END` marker lines: put ALL
      dependency/toolchain installs AND build commands. **Every step MUST be a Docker `RUN`
      instruction — each line starts with `RUN` (use `&&` and `\` for multi-command/multi-line
@@ -28,7 +30,7 @@ Your task is to:
          touching a root-owned path fails with `Permission denied`. Apt-list cleanup is optional; if
          you do it, `sudo` it.
        - Build commands: no sudo, e.g. `RUN cargo build --release`, `RUN make`, `RUN npm run build`.
-       - Language toolchains: prefer `RUN sudo apt-get install -y <toolchain>` (e.g. `cargo`/`rustc`).
+       - Language toolchains: use `RUN sudo apt-get install -y <toolchain>` when Ubuntu 24.04 carries a new-enough version; when apt's version is too old for the project (e.g. Rust — apt ships 1.75), use the toolchain's own installer instead.
          If you use a home-dir installer like rustup, run it WITHOUT sudo so it installs into your
          home and stays on PATH — never `sudo` rustup. Set PATH in the same `RUN` (e.g.
          `RUN curl ... | sh -s -- -y && . "$HOME/.cargo/env" && cargo build --release`), since each
@@ -41,9 +43,10 @@ Your task is to:
   3. Fill the runtime CMD/ENTRYPOINT placeholder (after the END marker) if the repo is an
      application (omit for a library).
   4. Follow these additional guidelines:
-     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `sudo apt-get install -y` up front (run `sudo apt-get update` first), rather than adding packages piecemeal. The base is debian:forky-slim (Debian testing): it keeps only the CURRENT version of each toolchain, so prefer UNVERSIONED / `default-*` meta-packages over version-pinned names — `default-jdk`/`default-jre` not `openjdk-17-jdk`, `build-essential`/`gcc`/`g++`/`clang` not `gcc-11`, `python3`/`python3-dev` not `python3.11`. Older pinned versions are routinely dropped and fail with `Unable to locate package`. Install `gnupg`+`ca-certificates` before any `gpg`/key step. For Python, the system interpreter is externally-managed (PEP 668), so a bare `pip3 install` fails with `externally-managed-environment`: ALWAYS create and use a virtualenv — `sudo apt-get install -y python3-venv`, then `python3 -m venv venv && . venv/bin/activate` before `pip install` (fall back to `pip install --break-system-packages` only if a venv is truly unworkable).
+     - Install the COMPLETE set of `system_dependencies` from the classification in a SINGLE `sudo apt-get install -y` up front (run `sudo apt-get update` first), rather than adding packages piecemeal. The base is ubuntu:24.04 (LTS): its apt repos are stable, so both unversioned meta-packages (`build-essential`, `python3`/`python3-dev`) and the specific major versions Ubuntu 24.04 ships stay available. Prefer unversioned / `default-*` names for fewer surprises, and pin a version only when the toolchain needs one (for the JDK see the JVM note below — it is pre-installed, do not add one). If a toolchain version is NEWER than Ubuntu 24.04 carries, the default repos will not have it (`Unable to locate package`) — add that tool's own upstream apt repo before installing it. Install `gnupg`+`ca-certificates` before any `gpg`/key step. For Python, the system interpreter is externally-managed (PEP 668), so a bare `pip3 install` fails with `externally-managed-environment`: use a virtualenv.
      - When a step extracts an archive (`.zip`/`.tar.gz`/`.tgz`), install the matching extractor in the apt step first — `unzip` is NOT preinstalled and `unzip: command not found` will fail the build (`tar`/`xz-utils` for tarballs). Prefer the build tool's own wrapper/download over manually unpacking when one exists (e.g. let `./gradlew`/`./mvnw` fetch its distribution rather than unzipping it yourself).
-     - JVM builds: install `default-jdk` and do NOT hardcode `JAVA_HOME` to a guessed path like `/usr/lib/jvm/java-11-openjdk` — that directory name is version-specific and will not exist, failing with `JAVA_HOME is set to an invalid directory`. `default-jdk` already configures `java`/`javac` on `PATH`, so leave `JAVA_HOME` unset, or derive it dynamically (`JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"`).
+     - JVM builds: a **JDK is ALREADY installed in the base image** (the unversioned `default-jdk`), on `PATH` with `JAVA_HOME` already set. Do NOT install any JDK/JRE and do NOT set `JAVA_HOME` yourself. On Ubuntu 24.04 the unversioned `default-jdk` resolves to openjdk-21 (an in-range LTS) and is already provisioned. The pre-installed JDK compiles older bytecode targets, so do not chase the repo's declared Java version. If a Gradle/Maven toolchain pins a `languageVersion` the pre-installed JDK does not match, either let Gradle's toolchain auto-download fetch that JDK, or disable toolchain enforcement and point the build at the installed JDK (`-Porg.gradle.java.installations.paths=$JAVA_HOME`) — do NOT apt-install a version-pinned JDK unless Ubuntu 24.04 carries that major.
+     - NEVER suppress errors to force a step to pass: no `|| true`, `|| exit 0`, `|| :`, or trailing `; true`/`; exit 0` on a build/install command. A layer that exits 0 by masking a failure produces a missing or broken artifact — make the command actually succeed instead.
      - Be conservative. Only include commands and dependencies supported by provided evidence.
      - Do not use insecure TLS bypasses (curl -k, strict-ssl=false) unless explicitly required.
      - Never bake secrets into the image; use comments for unclear values.
@@ -75,14 +78,14 @@ AGENT_BUILD_STEPS region filled (and the CMD placeholder resolved). Every other 
 </user>
 <assistant>
 # Base Dockerfile projects
-# Includes: Debian, CA bootstrap, git, curl, pkg-config
+# Includes: Ubuntu, CA bootstrap, git, curl, pkg-config
 
-# Pinned by digest so the base layer is frozen: debian:forky-slim is a rolling
-# testing tag that gets re-published, which would silently change the base
+# Pinned by digest so the base layer is frozen: the ubuntu:24.04 tag is
+# re-published on patch updates, which would silently change the base
 # between eval runs and break reproducibility. Re-pin with:
-#   docker pull debian:forky-slim && docker inspect debian:forky-slim --format '{{index .RepoDigests 0}}'
-# (NOTE: the forky apt repos still roll; the digest only freezes the base image.)
-FROM debian:forky-slim@sha256:484c506e686dd6a8e2977a16d2fbab99763486c1c05f93e1dd29e6a26efe6e03
+#   docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}'
+# (Ubuntu 24.04 LTS apt repos are stable; the digest also freezes the base image.)
+FROM ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 # Non-interactive apt so `sudo apt-get install` never blocks on a prompt.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -140,7 +143,7 @@ COPY --chown=manualrepos:manualrepos . .
 # Dependency installs + build commands go here. EACH step is a Docker RUN instruction
 # (every line starts with RUN), running as the non-root user which has passwordless sudo.
 # Edit only between the markers. Example:
-#   RUN sudo apt-get update && sudo apt-get install -y cargo rustc
+#   RUN curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 #   RUN cargo build --release
 # AGENT_BUILD_STEPS_BEGIN
 # Install the complete toolchain up front, in one layer.
@@ -168,14 +171,14 @@ AGENT_BUILD_STEPS region filled (and the CMD placeholder resolved). Every other 
 </user>
 <assistant>
 # Base Dockerfile projects
-# Includes: Debian, CA bootstrap, git, curl, pkg-config
+# Includes: Ubuntu, CA bootstrap, git, curl, pkg-config
 
-# Pinned by digest so the base layer is frozen: debian:forky-slim is a rolling
-# testing tag that gets re-published, which would silently change the base
+# Pinned by digest so the base layer is frozen: the ubuntu:24.04 tag is
+# re-published on patch updates, which would silently change the base
 # between eval runs and break reproducibility. Re-pin with:
-#   docker pull debian:forky-slim && docker inspect debian:forky-slim --format '{{index .RepoDigests 0}}'
-# (NOTE: the forky apt repos still roll; the digest only freezes the base image.)
-FROM debian:forky-slim@sha256:484c506e686dd6a8e2977a16d2fbab99763486c1c05f93e1dd29e6a26efe6e03
+#   docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}'
+# (Ubuntu 24.04 LTS apt repos are stable; the digest also freezes the base image.)
+FROM ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 # Non-interactive apt so `sudo apt-get install` never blocks on a prompt.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -233,14 +236,14 @@ COPY --chown=manualrepos:manualrepos . .
 # Dependency installs + build commands go here. EACH step is a Docker RUN instruction
 # (every line starts with RUN), running as the non-root user which has passwordless sudo.
 # Edit only between the markers. Example:
-#   RUN sudo apt-get update && sudo apt-get install -y cargo rustc
+#   RUN curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 #   RUN cargo build --release
 # AGENT_BUILD_STEPS_BEGIN
-# Install the Rust toolchain from Debian apt (no network toolchain installer).
-RUN sudo apt-get update && sudo apt-get install -y \
-    cargo \
-    rustc \
-    && sudo rm -rf /var/lib/apt/lists/*
+# Install current Rust via rustup: Ubuntu 24.04's apt rustc/cargo is 1.75, too old
+# for modern crates and Cargo.lock v4. Run WITHOUT sudo so it lands in the build
+# user's home; put cargo on PATH.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/home/manualrepos/.cargo/bin:$PATH"
 
 # Release build, parallelised across cores.
 RUN cargo build --release -j $(nproc)
