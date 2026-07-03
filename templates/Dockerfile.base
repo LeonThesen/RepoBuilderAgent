@@ -1,12 +1,16 @@
 # Base Dockerfile projects
-# Includes: Debian, CA bootstrap, git, curl, pkg-config, Python venv on PATH
+# Includes: Ubuntu LTS, CA bootstrap, git, curl, pkg-config, Python venv + JDK on PATH
 
-# Pinned by digest so the base layer is frozen: debian:forky-slim is a rolling
-# testing tag that gets re-published, which would silently change the base
-# between eval runs and break reproducibility. Re-pin with:
-#   docker pull debian:forky-slim && docker inspect debian:forky-slim --format '{{index .RepoDigests 0}}'
-# (NOTE: the forky apt repos still roll; the digest only freezes the base image.)
-FROM debian:forky-slim@sha256:484c506e686dd6a8e2977a16d2fbab99763486c1c05f93e1dd29e6a26efe6e03
+# Ubuntu 24.04 LTS, pinned by digest. We MOVED OFF debian:forky-slim: forky is a
+# ROLLING testing repo whose apt package set changes under us — a digest pin freezes the
+# image filesystem but NOT the apt repos, so `apt-get install openjdk-21-jdk` began failing
+# ("Unable to locate package") after forky rolled openjdk 21 -> 25, breaking every build.
+# An LTS release has FROZEN apt repos (security-only), so versioned packages persist and an
+# in-range JDK stays available for years. Bonus: on 24.04 the unversioned `default-jdk`
+# resolves to openjdk-21 (in-range), so JVM toolchain pins are satisfied without churn.
+# Re-pin with:
+#   docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}'
+FROM ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 # Non-interactive apt so `sudo apt-get install` never blocks on a prompt.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -91,18 +95,14 @@ RUN python3 -m venv /opt/venv \
 ENV VIRTUAL_ENV="/opt/venv"
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Pre-provision a JDK on PATH for JVM builds. Use the UNVERSIONED `default-jdk`
-# meta-package, NOT a version-pinned openjdk-N-jdk: forky is a ROLLING testing repo,
-# so any pinned version is eventually DROPPED (we pinned openjdk-21-jdk while it existed
-# and forky later rolled to openjdk-25, breaking the whole base with "Unable to locate
-# package openjdk-21-jdk"). `default-jdk` always resolves to forky's current JDK, so the
-# base never breaks on a roll. JAVA_HOME points at the version-agnostic Debian symlink
-# `/usr/lib/jvm/default-java` (created by default-jdk), so it stays correct across rolls.
-# Trade-off: the current JDK may be newer than a build's pinned Gradle/Maven toolchain
-# wants — that is handled in the L3 repair loop (jdk_version_mismatch hint), not by
-# pinning a version here (which is unmaintainable against a rolling repo). Eclipse Temurin
-# (a stable versioned source) is unreachable from this build environment. Inert for
-# non-Java repos (only disk).
+# Pre-provision a JDK on PATH for JVM builds via the UNVERSIONED `default-jdk`
+# meta-package. On Ubuntu 24.04 LTS default-jdk resolves to openjdk-21 — an in-range LTS
+# that satisfies typical Gradle/Maven toolchain pins — and because the LTS apt repos are
+# frozen it will NOT be dropped from under us (the failure mode that forced us off forky).
+# Unversioned + LTS is belt-and-suspenders: stable today, and if the default ever advances
+# it is still whatever the release ships. JAVA_HOME points at the version-agnostic symlink
+# `/usr/lib/jvm/default-java` (created by default-jdk) so it stays correct regardless of
+# the concrete version. Inert for non-Java repos (only disk).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     default-jdk \
     && rm -rf /var/lib/apt/lists/*
