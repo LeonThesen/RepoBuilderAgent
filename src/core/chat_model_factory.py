@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from langchain_openai import ChatOpenAI
 
+from .common import LLM_SEED
 from .prompt_dump_callback import PromptDumpCallbackHandler
 from .token_usage_callback import TokenUsageCallbackHandler
 
@@ -38,6 +39,11 @@ def make_prebuilt_chat_model_factory(
         }
         if model == "gpt-5-codex":
             kwargs["use_responses_api"] = True
+        else:
+            # Pin the sampling seed for reproducible ReAct completions across runs (the
+            # dominant source of iterative_react run-to-run variance). Best-effort per the
+            # OpenAI spec. Skipped for the codex responses API, which does not take `seed`.
+            kwargs["seed"] = LLM_SEED
         return ChatOpenAI(**kwargs)
 
     return _new_prebuilt_chat_model

@@ -99,6 +99,10 @@ def is_retryable_api_error(error: APIError) -> bool:
     return status_code in {408, 409, 429} or status_code >= 500
 
 
+# Fixed sampling seed for reproducible LLM outputs across runs (see completion_kwargs /
+# chat_model_factory). Any fixed int works; the value is arbitrary, only its stability matters.
+LLM_SEED = 7
+
 _RESPONSES_API_MODELS = {"gpt-5-codex"}
 
 
@@ -187,6 +191,12 @@ async def chat_completion_with_retries(
                     "model": model,
                     "temperature": temperature,
                     "messages": messages,
+                    # Pin the sampling seed so identical prompts return identical completions
+                    # across runs (best-effort per the OpenAI spec; needs a stable
+                    # system_fingerprint for full determinism). Without it, temperature=0 is
+                    # still only best-effort and the iterative_react path drifts run-to-run,
+                    # producing ±2 build-score variance that swamps real ablation deltas.
+                    "seed": LLM_SEED,
                 }
                 if max_tokens is not None:
                     completion_kwargs["max_tokens"] = max_tokens
