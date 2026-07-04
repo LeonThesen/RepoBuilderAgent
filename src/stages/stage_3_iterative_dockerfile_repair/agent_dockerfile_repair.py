@@ -391,6 +391,40 @@ def _extract_evidence_lines(log: str, keywords: list[str], limit: int = 3) -> li
     return evidence
 
 
+# Ubuntu 24.04 apt carries these JDK majors as `openjdk-<N>-jdk`. For a required major in
+# this set the reactive fix is a precise apt install + pointing the build at it; for a major
+# outside it (e.g. 26) apt has nothing, so the fix is Adoptium/Gradle auto-download instead.
+_APT_JDK_MAJORS = frozenset({8, 11, 17, 21})
+
+
+def _extract_required_jdk_major(log: str) -> int | None:
+    """Pull the JDK major a Gradle/Maven build demands from its error text, so the repair
+    hint can name the exact `openjdk-<N>-jdk`. Reactive — only called on a real jdk error, so
+    there are no false positives (unlike reading a version out of a manifest). Handles the
+    Gradle toolchain form (`languageVersion=17`), Maven (`invalid target release: 17`,
+    `release version 17 not supported`), and the class-file form (`major version 61` = JDK 17,
+    major = JDK + 44)."""
+    text = log or ""
+    for rx in (
+        re.compile(r"languageversion\s*=\s*(\d+)", re.IGNORECASE),
+        re.compile(r"(?:invalid|release)\s+target\s+release[:\s]+(\d+)", re.IGNORECASE),
+        re.compile(r"release version (\d+) not supported", re.IGNORECASE),
+        re.compile(r"requires java\s+(?:se\s+)?(\d+)", re.IGNORECASE),
+    ):
+        m = rx.search(text)
+        if m:
+            major = int(m.group(1))
+            return major if 8 <= major <= 30 else None
+    m = re.search(r"class file (?:major )?version (\d+)", text, re.IGNORECASE)
+    if m:
+        major = int(m.group(1)) - 44  # 52->8, 55->11, 61->17, 65->21
+        return major if 8 <= major <= 30 else None
+    return None
+
+
+_MAVEN_REQUIRED_RE = re.compile(r"requires maven version\s+([\d.]+)", re.IGNORECASE)
+
+
 def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool) -> dict:
     lowered = log.lower()
 
@@ -410,7 +444,11 @@ def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool)
         # points at a too-new JDK — e.g. maven/default-jdk pull java-25 alongside the
         # requested openjdk-21, and the build rejects 25. Distinct from a missing package:
         # the fix is JAVA_HOME, not another apt install.
-        ("jdk_version_mismatch", ["not in the allowed range", "unsupported class file major version", "requires java", "invalid target release", "no compiler is provided"], "high"),
+        ("jdk_version_mismatch", ["not in the allowed range", "unsupported class file major version", "requires java", "invalid target release", "no compiler is provided", "cannot find a java installation", "toolchain download repositories have not been configured"], "high"),
+        # A plugin/wrapper demands a newer Maven than apt ships (~3.8). apt has no matching
+        # package; the reactive fix is to download the exact Apache Maven release. Distinct
+        # from a missing package. Placed before missing_dependency so it wins the match.
+        ("maven_version_stale", ["requires maven version", "detected maven version", "prerequisite check \"maven\" failed"], "high"),
         # Python build front-end (meson/cython) is older than the project requires: the
         # distro ships a stale meson/cython and the build rejects it. The base now ships an
         # activated venv, so the fix is `pip install -U` the build tool there — NOT apt.
@@ -425,7 +463,7 @@ def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool)
 
     for category, keywords, confidence in category_rules:
         if any(keyword in lowered for keyword in keywords):
-            return {
+            hint = {
                 "phase": phase,
                 "category": category,
                 "confidence": confidence,
@@ -433,6 +471,17 @@ def extract_failure_hints(log: str, phase: str, exit_code: int, timed_out: bool)
                 "timed_out": timed_out,
                 "evidence": _extract_evidence_lines(log, keywords),
             }
+            # Reactive version extraction: only runs on the matching real error, so no
+            # false positives. Lets the targeted hint name the exact package/release.
+            if category == "jdk_version_mismatch":
+                major = _extract_required_jdk_major(log)
+                if major is not None:
+                    hint["jdk_required_major"] = major
+            elif category == "maven_version_stale":
+                m = _MAVEN_REQUIRED_RE.search(log or "")
+                if m:
+                    hint["maven_required_version"] = m.group(1)
+            return hint
 
     return {
         "phase": phase,
@@ -614,9 +663,9 @@ def detect_verify_gaming(verify_command: str) -> list[str]:
 # strategy ledger / targeted-hint machinery as the regex classifier. Superset of the regex
 # categories plus the two the regex misses most (build_config_error, verify_command_wrong).
 DIAGNOSIS_CATEGORIES = [
-    "missing_dependency", "missing_command", "jdk_version_mismatch", "python_missing",
-    "python_build_tool_stale", "shell_missing", "permission_error", "network_tls",
-    "network_resolution", "submodule_missing", "build_config_error",
+    "missing_dependency", "missing_command", "jdk_version_mismatch", "maven_version_stale",
+    "python_missing", "python_build_tool_stale", "shell_missing", "permission_error",
+    "network_tls", "network_resolution", "submodule_missing", "build_config_error",
     "wrong_build_invocation", "verify_command_wrong", "timeout", "other",
 ]
 
@@ -858,6 +907,29 @@ def _find_candidate_map(failure_hints: dict | None, key: str) -> dict:
 def find_apt_candidates(failure_hints: dict | None) -> dict:
     """Unavailable apt-package candidates (Unable-to-locate-package resolution)."""
     return _find_candidate_map(failure_hints, "apt_candidates")
+
+
+def _find_scalar(failure_hints: dict | None, key: str):
+    """Locate a scalar stored under `key` in a failure-hints payload, flat or nested (the
+    repair call site passes the nested {"build": {...}, "verify": {...}} form)."""
+    if not isinstance(failure_hints, dict):
+        return None
+    if failure_hints.get(key) is not None and not isinstance(failure_hints.get(key), dict):
+        return failure_hints[key]
+    for value in failure_hints.values():
+        if isinstance(value, dict) and value.get(key) is not None:
+            return value[key]
+    return None
+
+
+def find_required_jdk_major(failure_hints: dict | None):
+    """The JDK major a jdk_version_mismatch build demanded, if extracted."""
+    return _find_scalar(failure_hints, "jdk_required_major")
+
+
+def find_required_maven_version(failure_hints: dict | None):
+    """The Maven version a maven_version_stale build required, if extracted."""
+    return _find_scalar(failure_hints, "maven_required_version")
 
 
 def find_dev_lib_candidates(failure_hints: dict | None) -> dict:
@@ -1635,16 +1707,49 @@ async def request_repair(
                 "\nrather than editing project source or skipping required build steps.\n"
             )
         if _has_category(failure_hints, "jdk_version_mismatch"):
+            required_major = find_required_jdk_major(failure_hints)
+            if required_major in _APT_JDK_MAJORS:
+                # The precise, network-free fix: Ubuntu 24.04 apt HAS this major. A Gradle
+                # toolchain match is strict (JDK 21 does NOT satisfy languageVersion=17) and
+                # auto-download needs network the build does not have — so install the exact
+                # JDK and let Gradle auto-detect it under /usr/lib/jvm.
+                prompt += (
+                    f"\nTargeted remediation hint (JDK toolchain — the build needs JDK"
+                    f" {required_major}, which the base's default JDK 21 does NOT satisfy: a"
+                    f" Gradle/Maven toolchain match is exact, and auto-download needs network the"
+                    f" build lacks): Ubuntu 24.04 apt HAS this major — install it directly with"
+                    f" `RUN sudo apt-get update && sudo apt-get install -y openjdk-{required_major}-jdk`."
+                    f" Gradle auto-detects JDKs under /usr/lib/jvm, so once installed the toolchain"
+                    f" resolves with no further flags; if a build still can't find it, point it"
+                    f" explicitly with"
+                    f" `-Porg.gradle.java.installations.paths=/usr/lib/jvm/java-{required_major}-openjdk-amd64`."
+                    f" Do NOT rely on toolchain auto-download (no network) and do NOT force $JAVA_HOME"
+                    f" (that is JDK 21, which the toolchain rejects).\n"
+                )
+            else:
+                # Major apt does not carry (e.g. 26), or none extracted: apt has no package,
+                # so keep the source-compatible fallbacks.
+                need = f" (the build requests JDK {required_major})" if required_major else ""
+                prompt += (
+                    f"\nTargeted remediation hint (JDK selection, not a missing package){need}: the"
+                    " base image ships JDK 21 on PATH with JAVA_HOME set. Ubuntu 24.04 apt does NOT"
+                    " carry the requested major, so do not apt-install a versioned JDK. Instead:"
+                    " (a) add the Adoptium apt repo and install its temurin JDK for that major, or"
+                    " (b) disable toolchain enforcement and point the build at the installed JDK"
+                    " (`-Porg.gradle.java.installations.paths=$JAVA_HOME`), or (c) relax/remove the"
+                    " `languageVersion` pin so the build uses $JAVA_HOME.\n"
+                )
+        if _has_category(failure_hints, "maven_version_stale"):
+            required_maven = find_required_maven_version(failure_hints)
+            need = f" {required_maven}" if required_maven else " newer than apt ships"
             prompt += (
-                "\nTargeted remediation hint (JDK selection, not a missing package): the base"
-                " image ships a JDK (the unversioned `default-jdk`, openjdk-21 on Ubuntu 24.04)"
-                " on PATH with JAVA_HOME set. If the build's Gradle/Maven toolchain rejects the"
-                " pre-installed JDK, prefer NOT apt-installing a versioned JDK (Ubuntu 24.04 may"
-                " not carry the requested major). Instead:"
-                " (a) let Gradle's toolchain auto-download fetch the exact JDK (enable toolchain"
-                " download repositories), or (b) disable toolchain enforcement and point the build"
-                " at the installed JDK (`-Porg.gradle.java.installations.paths=$JAVA_HOME`), or"
-                " (c) relax/remove the `languageVersion` pin so the build uses $JAVA_HOME.\n"
+                f"\nTargeted remediation hint (Maven too old — a plugin requires Maven{need}, but"
+                " Ubuntu 24.04 apt ships ~3.8 and has no newer package): download the exact Apache"
+                " Maven release instead of apt-installing it, e.g."
+                f" `RUN curl -fsSL https://archive.apache.org/dist/maven/maven-3/{required_maven or '<version>'}/binaries/apache-maven-{required_maven or '<version>'}-bin.tar.gz"
+                " | sudo tar xz -C /opt && export PATH=/opt/apache-maven-"
+                f"{required_maven or '<version>'}/bin:$PATH` (then build with that mvn). Do NOT use"
+                " the repo's `./mvnw` if it is the failing one — pin the downloaded Maven on PATH.\n"
             )
         if _has_category(failure_hints, "python_build_tool_stale"):
             prompt += (
