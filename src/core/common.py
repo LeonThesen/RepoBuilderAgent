@@ -784,8 +784,13 @@ def bound_summary(summary: str, budget_tokens: int, model: str = "gpt-4o") -> st
 # crowded out the repository summary (clamp_summary_in_prompt then truncated the summary to
 # a floor), so the model generated Dockerfiles with almost no repo context and full_system
 # regressed below flat_baseline. Keep only the synthesized conclusions.
+#
+# `required_toolchains` is also dropped from the distilled block, but for a different reason:
+# it is re-surfaced as its own dedicated, UNCAPPED block (render_required_toolchains_for_prompt)
+# so the synthesis block's token ceiling can never truncate the provisioning instruction away.
+# Keeping it here too would only duplicate it.
 _SYNTHESIS_TRANSCRIPT_KEYS = frozenset(
-    {"loop_trace", "loop_checkpoint", "review", "subagent_outputs"}
+    {"loop_trace", "loop_checkpoint", "review", "subagent_outputs", "required_toolchains"}
 )
 
 
@@ -796,6 +801,27 @@ def distill_synthesis_for_prompt(artifact):
     if not isinstance(artifact, dict):
         return artifact
     return {k: v for k, v in artifact.items() if k not in _SYNTHESIS_TRANSCRIPT_KEYS}
+
+
+def render_required_toolchains_for_prompt(artifact) -> str:
+    """Surface L2's `required_toolchains` pins as a dedicated, uncapped prompt block.
+
+    These are toolchain versions the repo pins that the base image does not ship by
+    default (e.g. JDK 17, Maven 3.9.6). They are the single highest-leverage line for the
+    generator on the toolchain-mismatch failure class, so they get their own block ahead
+    of the token-capped SYNTHESIS_ARTIFACT block — never truncated. No-op if empty."""
+    if not isinstance(artifact, dict):
+        return ""
+    pins = [str(item).strip() for item in artifact.get("required_toolchains", []) if str(item).strip()]
+    if not pins:
+        return ""
+    body = "\n".join(f"- {pin}" for pin in pins)
+    return (
+        "\n\nREQUIRED_TOOLCHAINS (the repo pins these versions; the base image does NOT ship "
+        "them by default — provision each explicitly, e.g. `sudo apt-get install -y openjdk-17-jdk` "
+        "and point the build at it, add the tool's upstream apt repo, or download the pinned "
+        "release; do not silently build against the base's default version):\n" + body
+    )
 
 
 def bound_text_to_tokens(text: str, budget_tokens: int, model: str = "gpt-4o") -> str:
