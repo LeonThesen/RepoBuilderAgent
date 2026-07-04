@@ -1183,11 +1183,33 @@ def _apply_repair(
     return repaired, False
 
 
+# Docker/maven/npm build output occasionally emits a single line far larger than asyncio's
+# default 64 KiB StreamReader buffer (a base64 blob, a minified bundle, maven's dependency
+# spew), which makes readline() raise "ValueError: Separator is not found, and chunk exceed
+# the limit" and crashes the build/repair reader (observed on gson in MS-02). Give the
+# subprocess a large buffer, and recover from a still-overlong line by draining it.
+_STREAM_BUFFER_LIMIT = 16 * 1024 * 1024  # 16 MiB
+
+
+async def _readline_safe(stream: "asyncio.StreamReader") -> bytes:
+    """readline() that survives a line longer than the buffer limit: on overflow, drain the
+    overlong segment and return a truncated line instead of raising."""
+    try:
+        return await stream.readline()
+    except (asyncio.LimitOverrunError, ValueError):
+        try:
+            chunk = await stream.read(_STREAM_BUFFER_LIMIT)
+        except Exception:
+            chunk = b""
+        return chunk[:65536] + b" ...[overlong line truncated]\n"
+
+
 async def run_build(command: list[str], repo_name: str, attempt: int) -> tuple[int, str]:
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        limit=_STREAM_BUFFER_LIMIT,
     )
 
     output_chunks: list[str] = []
@@ -1195,7 +1217,7 @@ async def run_build(command: list[str], repo_name: str, attempt: int) -> tuple[i
 
     async def _stream_until_exit() -> int:
         while True:
-            line = await process.stdout.readline()
+            line = await _readline_safe(process.stdout)
             if not line:
                 break
             decoded_line = line.decode("utf-8", errors="replace")
@@ -1299,13 +1321,14 @@ async def _run_container_command(command: list[str], repo_name: str, attempt: in
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        limit=_STREAM_BUFFER_LIMIT,
     )
 
     output_chunks: list[str] = []
     assert process.stdout is not None
 
     while True:
-        line = await process.stdout.readline()
+        line = await _readline_safe(process.stdout)
         if not line:
             break
 
