@@ -604,6 +604,10 @@ PROMPT_OVERHEAD_RESERVE_TOKENS = 10000
 # the measured ratio) so the tiktoken-space budget we enforce maps to an
 # endpoint-token count safely under the real cap.
 TOKENIZER_DRIFT_FACTOR = 1.30
+# When clamp trims the repository summary below this many tokens, generation is effectively
+# blind — warn loudly. Guards against a large non-summary payload silently starving the
+# summary (the full_system regression: an un-distilled synthesis transcript ate the budget).
+SUMMARY_STARVATION_FLOOR_TOKENS = 1500
 
 _TREE_HEADER = "## Directory structure"
 _MANIFEST_HEADER = "## Manifest & config files"
@@ -775,6 +779,36 @@ def bound_summary(summary: str, budget_tokens: int, model: str = "gpt-4o") -> st
     return _hard_truncate(shrunk, budget_tokens, model)
 
 
+# Process/transcript fields of an L2 synthesis artifact — NOT conclusions. The react
+# `loop_trace` alone is ~19K tokens; injected raw into the dockerfile-generation prompt it
+# crowded out the repository summary (clamp_summary_in_prompt then truncated the summary to
+# a floor), so the model generated Dockerfiles with almost no repo context and full_system
+# regressed below flat_baseline. Keep only the synthesized conclusions.
+_SYNTHESIS_TRANSCRIPT_KEYS = frozenset(
+    {"loop_trace", "loop_checkpoint", "review", "subagent_outputs"}
+)
+
+
+def distill_synthesis_for_prompt(artifact):
+    """Return the synthesis artifact with its react/subagent transcript dropped, keeping
+    only the synthesized conclusions (build_strategy_hypotheses, dependency_assumptions,
+    risk_notes, abstraction_l2, per_source_confidence, …). Non-dict input is returned as-is."""
+    if not isinstance(artifact, dict):
+        return artifact
+    return {k: v for k, v in artifact.items() if k not in _SYNTHESIS_TRANSCRIPT_KEYS}
+
+
+def bound_text_to_tokens(text: str, budget_tokens: int, model: str = "gpt-4o") -> str:
+    """Hard-cap an arbitrary prompt block to ``budget_tokens`` (keeps the head, marks the
+    cut). Used to bound architecture-context blocks so they can never starve the repository
+    summary, which is the highest-value content for Dockerfile generation."""
+    if budget_tokens <= 0 or not text:
+        return text
+    if count_tokens(text, model) <= budget_tokens:
+        return text
+    return _hard_truncate(text, budget_tokens, model)
+
+
 def clamp_summary_in_prompt(
     prompt: str,
     summary: str,
@@ -800,13 +834,26 @@ def clamp_summary_in_prompt(
     summary_tokens = count_tokens(summary, model)
     budget = effective_cap - (total - summary_tokens)
     bounded = bound_summary(summary, budget, model)
+    bounded_tokens = count_tokens(bounded, model)
     label = f"[token-bound]{(' ' + phase) if phase else ''}"
     log_warn(
         f"{label}: prompt {total} > effective cap {effective_cap} "
         f"(endpoint cap {max_input_tokens} - reserve {PROMPT_OVERHEAD_RESERVE_TOKENS}, "
         f"/{TOKENIZER_DRIFT_FACTOR} tokenizer drift); "
-        f"summary {summary_tokens} -> {count_tokens(bounded, model)} tokens"
+        f"summary {summary_tokens} -> {bounded_tokens} tokens"
     )
+    # The repository summary is the highest-value content for generation. If the non-summary
+    # payload is so large it starves the summary below this floor, the model is generating
+    # nearly blind — surface it loudly rather than shipping a near-empty summary silently
+    # (this is exactly how full_system regressed below baseline: an un-distilled synthesis
+    # transcript ate the budget). Non-fatal: the fix is to shrink the non-summary payload.
+    if bounded_tokens < SUMMARY_STARVATION_FLOOR_TOKENS < summary_tokens:
+        log_warn(
+            f"{label}: repository summary STARVED to {bounded_tokens} tokens "
+            f"(< floor {SUMMARY_STARVATION_FLOOR_TOKENS}); non-summary payload is "
+            f"{total - summary_tokens} tokens — generation is near-blind. Shrink the "
+            f"non-summary prompt content (synthesis/validation/scratchpad)."
+        )
     return prompt.replace(summary, bounded, 1)
 
 
@@ -988,7 +1035,12 @@ def render_validation_findings_for_prompt(validation_artifact: dict | None) -> s
     if not warnings and not checks:
         return ""
 
-    rendered = yaml.dump(validation_artifact, sort_keys=False, allow_unicode=True)
+    # Drop the validation react transcript (loop_trace, …) — like synthesis, only the
+    # findings (warnings/checks/conclusions) matter here; the raw trace just eats budget.
+    distilled = {
+        k: v for k, v in validation_artifact.items() if k not in _SYNTHESIS_TRANSCRIPT_KEYS
+    }
+    rendered = yaml.dump(distilled, sort_keys=False, allow_unicode=True)
     return (
         "\n\nVALIDATION_FINDINGS:\n"
         "Treat warnings as evidence gaps and prefer conservative, reproducible build assumptions when uncertain.\n"

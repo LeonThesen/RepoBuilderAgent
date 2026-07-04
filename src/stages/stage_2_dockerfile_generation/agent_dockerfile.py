@@ -30,6 +30,8 @@ try:
         finalize_llm_metrics,
         init_llm_metrics,
         clamp_summary_in_prompt,
+        distill_synthesis_for_prompt,
+        bound_text_to_tokens,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
         load_shared_repository_state,
@@ -72,6 +74,8 @@ except ImportError:
         finalize_llm_metrics,
         init_llm_metrics,
         clamp_summary_in_prompt,
+        distill_synthesis_for_prompt,
+        bound_text_to_tokens,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
         load_shared_repository_state,
@@ -152,6 +156,11 @@ EFFECTIVE_TEMPERATURE = resolve_prompt_temperature(args.temperature, PROMPT_PROF
 
 # Cap hadolint regeneration so a Dockerfile the model can't lint-fix never loops forever.
 MAX_LINT_ATTEMPTS = 8
+
+# Hard ceiling for the distilled synthesis block in the dockerfile-generation prompt. The
+# distilled conclusions are normally ~0.5K tokens; this ceiling is a backstop so a
+# pathological synthesis can never starve the repository summary (full_system regression).
+SYNTHESIS_ARTIFACT_TOKEN_CEILING = 4000
 
 
 # Shared httpx client: OS trust store for corporate CAs + bounded timeout.
@@ -389,7 +398,15 @@ async def generate_dockerfile(
                 )
                 prompt += render_initial_user_request_for_prompt(shared_repository_state)
                 if synthesis_artifact:
-                    prompt += "\n\nSYNTHESIS_ARTIFACT:\n" + render_yaml(synthesis_artifact)
+                    # Distill to conclusions (drop the ~19K-token react/subagent transcript)
+                    # and hard-cap the block, so synthesis can never crowd out the repository
+                    # summary — the starvation that made full_system regress below baseline.
+                    synthesis_block = "\n\nSYNTHESIS_ARTIFACT:\n" + render_yaml(
+                        distill_synthesis_for_prompt(synthesis_artifact)
+                    )
+                    prompt += bound_text_to_tokens(
+                        synthesis_block, SYNTHESIS_ARTIFACT_TOKEN_CEILING, model=args.model
+                    )
                 prompt += render_validation_findings_for_prompt(validation_artifact)
                 prompt += render_architecture_scratchpad_for_prompt(architecture_scratchpad)
                 prompt += render_shared_repository_state_for_prompt(shared_repository_state)
