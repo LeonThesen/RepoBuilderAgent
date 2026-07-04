@@ -455,6 +455,22 @@ _SUPPRESSION_PATTERNS = [
 ]
 
 
+# Markers that the build actually compiles/installs the CHECKED-OUT source (any language).
+# If a build pip-installs packages by name but shows NONE of these, it is not building the
+# repo — it satisfies an import-style verify from a released wheel instead (observed: airflow
+# `pip install apache-airflow`, which passes `python -c "import airflow"` without ever
+# building the COPY'd source).
+_LOCAL_SOURCE_BUILD_MARKERS = (
+    "pip install .", "pip install -e", "pip install --editable", "pip install ./",
+    "pip install -r",  # requirements from the tree still drives a source-based install
+    "setup.py", "pyproject", "python -m build", "pip wheel .", "maturin",
+    "meson", "ninja", "cmake", "make", "cargo build", "cargo install --path",
+    "gradle", "mvn", "go build", "npm run build", "pnpm run build", "yarn build",
+    "npm install", "pnpm install", "yarn install", "./configure", "autogen", "bazel",
+)
+_PIP_INSTALL_RE = re.compile(r"pip3?\s+install\s", re.IGNORECASE)
+
+
 def detect_build_gaming(dockerfile_text: str) -> list[str]:
     """Return human-readable descriptions of error-suppression / metric-gaming patterns in
     a generated Dockerfile's RUN steps (F2: agent optimizes for exit-0, not a working
@@ -462,6 +478,8 @@ def detect_build_gaming(dockerfile_text: str) -> list[str]:
     if not dockerfile_text:
         return []
     findings: list[str] = []
+    saw_pip_install = False
+    saw_local_source_build = False
     for raw_line in dockerfile_text.splitlines():
         line = raw_line.strip()
         if not line.upper().startswith("RUN"):
@@ -470,6 +488,18 @@ def detect_build_gaming(dockerfile_text: str) -> list[str]:
         for needle, desc in _SUPPRESSION_PATTERNS:
             if needle in lowered and desc not in findings:
                 findings.append(desc)
+        if _PIP_INSTALL_RE.search(lowered):
+            saw_pip_install = True
+        if any(marker in lowered for marker in _LOCAL_SOURCE_BUILD_MARKERS):
+            saw_local_source_build = True
+    # Source-bypass: pip-installs a package but never builds the checked-out tree.
+    if saw_pip_install and not saw_local_source_build:
+        findings.append(
+            "the build installs packages with `pip install <name>` but never builds the "
+            "checked-out source (no `pip install .`/`-e .`, setup.py, build, or compile step) "
+            "— an import-style verify would pass against a released wheel WITHOUT building the "
+            "repo. Build the local source (e.g. `pip install .`), do not install the published package"
+        )
     return findings
 
 
@@ -1582,11 +1612,15 @@ async def request_repair(
         gaming = detect_build_gaming(dockerfile_content)
         if gaming:
             prompt += (
-                "\nANTI-GAMING: the current Dockerfile suppresses build errors — "
+                "\nANTI-GAMING: the current Dockerfile games the build/verify instead of "
+                "genuinely building the repo — "
                 + "; ".join(gaming)
-                + ". This makes the build exit 0 without actually succeeding, which is NOT a"
-                " real fix. REMOVE every error-suppression (`|| true`, `|| exit 0`, `; true`,"
-                " trailing `; exit 0`) and make the underlying command actually succeed.\n"
+                + ". A build that exits 0 by masking a failure, or that passes an import-style "
+                "verify by installing a released package instead of building the checked-out "
+                "source, is NOT a real fix. Remove every error-suppression (`|| true`, "
+                "`|| exit 0`, `; true`, `; exit 0`) AND build the local source (e.g. "
+                "`pip install .`) rather than installing the published package. Make the "
+                "underlying build actually succeed.\n"
             )
     if failure_hints:
         prompt += (
