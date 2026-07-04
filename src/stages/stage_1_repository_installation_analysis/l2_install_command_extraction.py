@@ -58,14 +58,14 @@ except ImportError:
 _GENERATOR_FINALIZE_INSTRUCTION = (
     "You have used all available tool calls. Do NOT call any tool now. Using only the "
     "evidence already gathered above, output your final answer immediately as YAML with "
-    "keys: thought, hypothesis_updates (list), risk_updates (list), toolchain_updates (list), "
-    "selected_files (list), done (true). Output only the YAML."
+    "keys: thought, hypothesis_updates (list), risk_updates (list), selected_files (list), "
+    "done (true). Output only the YAML."
 )
 _REVIEWER_FINALIZE_INSTRUCTION = (
     "You have used all available tool calls. Do NOT call any tool now. Using only the "
     "evidence already gathered above, output your final answer immediately as YAML with "
-    "keys: thought, revised_hypotheses (list), revised_risks (list), revised_toolchains (list), "
-    "critique_notes (list), accepted (bool), done (true). Output only the YAML."
+    "keys: thought, revised_hypotheses (list), revised_risks (list), critique_notes (list), "
+    "accepted (bool), done (true). Output only the YAML."
 )
 
 
@@ -479,12 +479,10 @@ async def run_l2_synthesis_loop(
     generation_payload = extract_agent_payload(generation_result)
     updates = normalize_text_list(generation_payload.get("hypothesis_updates") if isinstance(generation_payload, dict) else [])
     risk_updates = normalize_text_list(generation_payload.get("risk_updates") if isinstance(generation_payload, dict) else [])
-    toolchain_updates = normalize_text_list(generation_payload.get("toolchain_updates") if isinstance(generation_payload, dict) else [])
     done_flag = bool(generation_payload.get("done", False)) if isinstance(generation_payload, dict) else False
 
     generated_hypotheses = list(dict.fromkeys(item.strip() for item in (base_hypotheses + updates) if item and item.strip()))
     generated_risks = list(dict.fromkeys(item.strip() for item in (risk_notes + risk_updates) if item and item.strip()))
-    generated_toolchains = list(dict.fromkeys(item.strip() for item in toolchain_updates if item and item.strip()))
     generator_trace = extract_agent_trace(generation_result)
     if not generation_payload and hit_step_limit(generation_result):
         log_warn(
@@ -522,7 +520,6 @@ async def run_l2_synthesis_loop(
 
     review_hypotheses = generated_hypotheses[:]
     review_risks = generated_risks[:]
-    review_toolchains = generated_toolchains[:]
     critique_notes: list[str] = []
     reviewer_trace: list[dict[str, Any]] = []
     review_accepted = False
@@ -537,7 +534,6 @@ async def run_l2_synthesis_loop(
             .replace("{{ROUND_TOTAL}}", str(max(1, int(synthesis_review_rounds))))
             .replace("{{GENERATOR_HYPOTHESES}}", "\n".join(f"- {item}" for item in review_hypotheses[:30]))
             .replace("{{GENERATOR_RISKS}}", "\n".join(f"- {item}" for item in review_risks[:30]) if review_risks else "- (none)")
-            .replace("{{GENERATOR_TOOLCHAINS}}", "\n".join(f"- {item}" for item in review_toolchains[:20]) if review_toolchains else "- (none)")
             .replace("{{SUBAGENT_SIGNALS}}", str(subagent_outputs[:4]))
             .replace("{{MAX_TOOL_CALLS}}", str(hooked_tool_call_budget(synthesis_recursion_limit)))
             .replace("{{SUMMARY_EVIDENCE}}", summary)
@@ -557,7 +553,6 @@ async def run_l2_synthesis_loop(
         review_payload = extract_agent_payload(review_result)
         revised_hypotheses = normalize_text_list(review_payload.get("revised_hypotheses") if isinstance(review_payload, dict) else [])
         revised_risks = normalize_text_list(review_payload.get("revised_risks") if isinstance(review_payload, dict) else [])
-        revised_toolchains = normalize_text_list(review_payload.get("revised_toolchains") if isinstance(review_payload, dict) else [])
         round_critique_notes = normalize_text_list(review_payload.get("critique_notes") if isinstance(review_payload, dict) else [])
         critique_notes.extend(round_critique_notes)
         review_done_flag = bool(review_payload.get("done", False)) if isinstance(review_payload, dict) else False
@@ -567,8 +562,6 @@ async def run_l2_synthesis_loop(
             review_hypotheses = revised_hypotheses
         if revised_risks:
             review_risks = revised_risks
-        if revised_toolchains:
-            review_toolchains = revised_toolchains
 
         round_trace = extract_agent_trace(review_result)
         for event in round_trace:
@@ -580,7 +573,6 @@ async def run_l2_synthesis_loop(
 
     dedup_hypotheses = list(dict.fromkeys(item.strip() for item in review_hypotheses if item and item.strip()))
     dedup_risks = list(dict.fromkeys(item.strip() for item in review_risks if item and item.strip()))
-    dedup_toolchains = list(dict.fromkeys(item.strip() for item in review_toolchains if item and item.strip()))
     loop_trace: list[dict[str, Any]] = []
     for event in generator_trace:
         if isinstance(event, dict):
@@ -669,7 +661,6 @@ async def run_l2_synthesis_loop(
         "per_source_confidence": per_source_confidence,
         "unknown_markers": unknown_markers,
         "build_strategy_hypotheses": dedup_hypotheses[:40],
-        "required_toolchains": dedup_toolchains[:20],
         "dependency_assumptions": {
             "system_build_tools_required": any(marker in path for marker in ("binding.gyp", "cmake", "makefile") for path in selected_lower),
             "network_install_steps_likely": any(

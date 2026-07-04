@@ -31,7 +31,6 @@ try:
         init_llm_metrics,
         clamp_summary_in_prompt,
         distill_synthesis_for_prompt,
-        render_required_toolchains_for_prompt,
         bound_text_to_tokens,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
@@ -76,7 +75,6 @@ except ImportError:
         init_llm_metrics,
         clamp_summary_in_prompt,
         distill_synthesis_for_prompt,
-        render_required_toolchains_for_prompt,
         bound_text_to_tokens,
         DEFAULT_MAX_INPUT_TOKENS,
         load_architecture_scratchpad,
@@ -399,9 +397,6 @@ async def generate_dockerfile(
                     .replace("{{SUMMARY_CONTENT}}", summary)
                 )
                 prompt += render_initial_user_request_for_prompt(shared_repository_state)
-                # Pinned toolchains the base lacks — dedicated, uncapped block ahead of the
-                # token-bounded synthesis so provisioning instructions are never truncated.
-                prompt += render_required_toolchains_for_prompt(synthesis_artifact)
                 if synthesis_artifact:
                     # Distill to conclusions (drop the ~19K-token react/subagent transcript)
                     # and hard-cap the block, so synthesis can never crowd out the repository
