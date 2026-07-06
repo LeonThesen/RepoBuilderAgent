@@ -171,6 +171,20 @@ stateful_tree_group.add_argument(
     help="Disable decision-tree serialization for stateful repair prompts.",
 )
 parser.set_defaults(stateful_repair_tree=False)
+carry_forward_group = parser.add_mutually_exclusive_group()
+carry_forward_group.add_argument(
+    "--repair-carry-forward",
+    dest="repair_carry_forward",
+    action="store_true",
+    help="(Default) Carry repair state forward: each attempt edits the previous attempt's mutated Dockerfile and sees its fresh error.",
+)
+carry_forward_group.add_argument(
+    "--no-repair-carry-forward",
+    dest="repair_carry_forward",
+    action="store_false",
+    help="Stateless repair ablation: every repair edits the ORIGINAL Dockerfile using the ORIGINAL failing build's log; produced fixes are still built but never chain. Isolates the value of carrying state forward at all.",
+)
+parser.set_defaults(repair_carry_forward=True)
 parser.add_argument(
     "--stateful-tree-max-chars",
     type=int,
@@ -649,6 +663,7 @@ _AGENT_CONFIG_SCHEMA: dict[str, "set[str] | None"] = {
     "repair": {
         "react", "stateful_repair", "stateful_repair_tree", "history_window",
         "history_max_chars", "tree_max_chars", "tree_max_children", "repo_tools",
+        "carry_forward",
     },
     "temperature_overrides": {"classify", "dockerfile", "repair", "install_guide"},
     "snippet_tools": None,
@@ -846,6 +861,9 @@ def _apply_agent_config_overrides(agent_config: dict, phase_skips: dict[str, boo
         if "repo_tools" in repair_cfg:
             args.repair_repo_tools = _expect_bool(repair_cfg["repo_tools"], key="repair.repo_tools")
             applied.setdefault("repair", {})["repo_tools"] = args.repair_repo_tools
+        if "carry_forward" in repair_cfg:
+            args.repair_carry_forward = _expect_bool(repair_cfg["carry_forward"], key="repair.carry_forward")
+            applied.setdefault("repair", {})["carry_forward"] = args.repair_carry_forward
 
     temp_overrides_cfg = agent_config.get("temperature_overrides")
     if temp_overrides_cfg is not None:
@@ -1012,6 +1030,7 @@ def build_repair_command(python_executable: str, script_path: Path) -> list[str]
         "--stateful-tree-max-chars", str(args.stateful_tree_max_chars),
         "--stateful-tree-max-children", str(args.stateful_tree_max_children),
     ])
+    command.append("--repair-carry-forward" if args.repair_carry_forward else "--no-repair-carry-forward")
     command.append("--snippet-tools" if args.snippet_tools else "--no-snippet-tools")
     command.append("--repair-repo-tools" if args.repair_repo_tools else "--no-repair-repo-tools")
     if args.dataset_dir:

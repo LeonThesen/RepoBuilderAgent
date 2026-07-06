@@ -215,6 +215,20 @@ stateful_tree_group.add_argument(
     help="Disable decision-tree serialization for stateful repair prompts.",
 )
 parser.set_defaults(stateful_repair_tree=False)
+carry_forward_group = parser.add_mutually_exclusive_group()
+carry_forward_group.add_argument(
+    "--repair-carry-forward",
+    dest="repair_carry_forward",
+    action="store_true",
+    help="(Default) Carry repair state forward: each attempt edits the previous attempt's mutated Dockerfile and sees the fresh error from it.",
+)
+carry_forward_group.add_argument(
+    "--no-repair-carry-forward",
+    dest="repair_carry_forward",
+    action="store_false",
+    help="Stateless repair ablation: every repair edits the ORIGINAL stage-2 Dockerfile using the ORIGINAL failing build's log; produced fixes are still built, but repairs never chain. Isolates the value of carrying state forward at all (vs how it is represented).",
+)
+parser.set_defaults(repair_carry_forward=True)
 parser.add_argument(
     "--stateful-tree-max-chars",
     type=int,
@@ -2094,6 +2108,7 @@ def _init_repair_report(repo_url: str, dockerfile_path: Path) -> dict:
         "success": False,
         "attempts": [],
         "prompt_profile": prompt_profile_metadata(PROMPT_PROFILE, EFFECTIVE_TEMPERATURE),
+        "carry_forward": args.repair_carry_forward,
         "stateful_repair": {
             "enabled": args.stateful_repair,
             "tree_enabled": args.stateful_repair_tree,
@@ -2225,6 +2240,15 @@ async def repair_repository(
                 write_text(dockerfile_path, current_dockerfile)
                 log_info(f"[toolchain-strip {repo_name}] removed version-pinned {sorted(set(_removed_initial))} from initial Dockerfile")
             repair_history: list[dict] = []
+            # Stateless-repair ablation (--no-repair-carry-forward): freeze the original
+            # stage-2 Dockerfile and the FIRST failing build's log/hints. When carry-forward
+            # is OFF, every build-repair prompt is fed these frozen initial values instead of
+            # the mutated current Dockerfile + fresh error, so repairs never chain onto each
+            # other. Isolates the value of carrying state forward at all (mechanism 1) from how
+            # that state is represented (the stateful-repair history/tree text, mechanism 2).
+            initial_dockerfile = current_dockerfile
+            initial_build_log: str | None = None
+            initial_build_failure_hints: dict | None = None
             report_dir.mkdir(parents=True, exist_ok=True)
 
             for attempt in range(1, args.max_attempts + 1):
@@ -2319,6 +2343,12 @@ async def repair_repository(
                     )
                     if dev_lib_candidates:
                         build_failure_hints["dev_lib_candidates"] = dev_lib_candidates
+                # Capture the first failing build's fully-assembled log + hints for the
+                # stateless-repair ablation (see initial_* init above). Only the first build
+                # failure is frozen; later attempts reuse it when carry-forward is OFF.
+                if not args.repair_carry_forward and exit_code != 0 and initial_build_log is None:
+                    initial_build_log = build_log
+                    initial_build_failure_hints = build_failure_hints
                 report["attempts"][-1]["failure_hints_build"] = build_failure_hints
                 upsert_shared_repository_state(
                     repo_name,
@@ -2625,6 +2655,20 @@ async def repair_repository(
                     break
 
                 log_info(f"Diagnosing failed build for {repo_url} and rewriting Dockerfile...")
+                # Stateless-repair ablation: feed the repair prompt the frozen ORIGINAL
+                # Dockerfile + first failing build's log/hints instead of the mutated current
+                # state, so repairs never chain (fixes are still built, but each is an
+                # independent repair-of-original). Carry-forward ON (default) keeps the
+                # accumulating behaviour. initial_* fall back to current on attempt 1 (before
+                # the first failure is frozen) or if the flag is on.
+                if not args.repair_carry_forward and initial_build_log is not None:
+                    repair_dockerfile_content = initial_dockerfile
+                    repair_build_log = initial_build_log
+                    repair_build_hints = initial_build_failure_hints
+                else:
+                    repair_dockerfile_content = current_dockerfile
+                    repair_build_log = build_log
+                    repair_build_hints = build_failure_hints
                 repaired_dockerfile = await _safe_request_repair(
                     repo_url,
                     attempt,
@@ -2633,9 +2677,9 @@ async def repair_repository(
                         attempt_number=attempt,
                         classification=classification,
                         summary=summary,
-                        dockerfile_content=current_dockerfile,
-                        build_log=build_log,
-                        failure_hints={"build": build_failure_hints},
+                        dockerfile_content=repair_dockerfile_content,
+                        build_log=repair_build_log,
+                        failure_hints={"build": repair_build_hints},
                         llm_metrics=llm_metrics,
                         repair_history=repair_history,
                         architecture_scratchpad_context=architecture_scratchpad_context,
