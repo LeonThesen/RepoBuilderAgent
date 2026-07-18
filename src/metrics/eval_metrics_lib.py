@@ -31,12 +31,19 @@ except ImportError:
 # Each entry: (field_key, comparison_mode)
 #   "set"    – normalise both to lowercase sets, compute Jaccard similarity
 #   "exact"  – case-insensitive exact string equality (score 0 or 1)
+# `system_dependencies` and `build_steps` are deliberately absent:
+#   - system_dependencies: the dataset's GT schema has no such field (it stores package
+#     names under `packages`) — comparing against it always scored 0.0, and the real
+#     package comparison already exists as `packages` ("apt_packages" mode, below).
+#   - build_steps: exact-string-set Jaccard zeroed out near-identical builds that only
+#     differed by a flag or path (e.g. two `cargo build` invocations with different
+#     manifest paths). Replaced by the `build_steps_similarity` LLM judge (mid_verify.py),
+#     which scores build-command equivalence the same way `verify_cmd_similarity` already
+#     does for verify commands.
 _COMPARABLE_FIELDS: list[tuple[str, str]] = [
     ("programming_language", "set"),
     ("build_tool",           "set"),
-    ("system_dependencies",  "set"),
     ("packages",             "apt_packages"),
-    ("build_steps",          "set"),
     ("verification",         "set"),
     ("installation_strategy","exact"),
     ("runtime_environment",  "set"),
@@ -279,6 +286,19 @@ def get_gt_verify_commands(gt_doc: dict) -> list[str]:
     return [c for c in cmds if isinstance(c, str) and c.strip()]
 
 
+def get_gt_build_steps(gt_doc: dict) -> list[str]:
+    """Extract build steps from a GT YAML document as a list of strings."""
+    if not gt_doc:
+        return []
+    v = gt_doc.get("categories", {}).get("build_steps", {})
+    if not v:
+        return []
+    steps = v.get("value", [])
+    if isinstance(steps, str):
+        return [steps] if steps.strip() else []
+    return [s for s in steps if isinstance(s, str) and s.strip()]
+
+
 def get_gt_key_artifact(gt_doc: dict, verify_commands: list[str]) -> Optional[dict]:
     """
     Find the key final artifact for binary size/hash comparison.
@@ -436,13 +456,6 @@ def compare_with_ground_truth(
         if mode == "set":
             gt_set = _normalise_list(gt_val)
             pred_set = _normalise_list(pred_val)
-
-            # Augment prediction with observed Dockerfile facts for relevant fields
-            if field == "system_dependencies" and observed.get("system_packages_installed"):
-                pred_set = pred_set | set(observed["system_packages_installed"])
-            if field == "build_steps" and observed.get("build_run_commands"):
-                # Normalise observed commands into the pred set
-                pred_set = pred_set | _normalise_list(observed["build_run_commands"])
 
             score = _jaccard(gt_set, pred_set)
             field_scores[field] = {
@@ -1084,6 +1097,19 @@ def compute_aggregate_metrics(
         cat = r["metrics"]["repair"]["verify_cmd_similarity"].get("category")
         if cat:
             sim_categories[cat] += 1
+    # Build-steps similarity (replaces the exact-match build_steps Jaccard): rated over
+    # repos with a conclusive score (not None), same shape as verify_cmd_similarity.
+    build_sim_applicable = [
+        r for r in results
+        if isinstance(r.get("metrics", {}).get("repair", {}).get("build_steps_similarity"), dict)
+        and r["metrics"]["repair"]["build_steps_similarity"].get("score") is not None
+    ]
+    build_sim_scores = [r["metrics"]["repair"]["build_steps_similarity"]["score"] for r in build_sim_applicable]
+    build_sim_categories: dict[str, int] = defaultdict(int)
+    for r in build_sim_applicable:
+        cat = r["metrics"]["repair"]["build_steps_similarity"].get("category")
+        if cat:
+            build_sim_categories[cat] += 1
     # binary_size_plausible: only count repos where GT binary info was available (not None)
     binary_plausible_applicable = [r for r in results if r.get("metrics", {}).get("repair", {}).get("binary_size_plausible") is not None]
     binary_plausible_pass = [r for r in binary_plausible_applicable if r["metrics"]["repair"]["binary_size_plausible"] is True]
@@ -1198,6 +1224,9 @@ def compute_aggregate_metrics(
         "verify_cmd_similarity_applicable": len(sim_applicable),
         "verify_cmd_similarity_mean_score": round(sum(sim_scores) / len(sim_scores), 4) if sim_scores else None,
         "verify_cmd_similarity_categories": dict(sim_categories),
+        "build_steps_similarity_applicable": len(build_sim_applicable),
+        "build_steps_similarity_mean_score": round(sum(build_sim_scores) / len(build_sim_scores), 4) if build_sim_scores else None,
+        "build_steps_similarity_categories": dict(build_sim_categories),
         "first_attempt_success_rate": round(len(first_attempt) / total, 4),
         "repair_salvage_rate": round(len(repair_salvaged) / total, 4),
         "verification_pass_rate": round(len(verify_passed) / total, 4),
@@ -1275,13 +1304,19 @@ def _aggregate_gt_scores(results: list[dict]) -> dict:
             "apt_packages": {"available": 0, "mean_recall": None, "mean_precision": None},
         }
 
-    # Per-field means
+    # Per-field means. Mirrors the "only non-empty GT counts" rule compare_with_ground_truth
+    # applies to overall_score (§2.4) — without it, a field the dataset never populates for
+    # ANY repo (a GT-schema mismatch, not a real miss) silently reports a misleading 0.0
+    # mean instead of being absent, and a legitimately-empty-for-this-repo GT (e.g. no extra
+    # apt packages needed) would count as a miss instead of being skipped.
     field_accum: dict[str, list[float]] = defaultdict(list)
     for r in results:
         gt = r.get("metrics", {}).get("ground_truth_comparison")
         if not gt:
             continue
         for field, info in gt.get("field_scores", {}).items():
+            if not info.get("ground_truth"):
+                continue
             # set + apt_packages modes carry "jaccard"; exact carries "score".
             score = info.get("jaccard", info.get("score"))
             if score is not None:

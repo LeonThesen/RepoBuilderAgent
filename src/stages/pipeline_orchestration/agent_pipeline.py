@@ -56,7 +56,7 @@ TIMEOUTS = load_timeout_defaults(
         "repair_timeout": 240,
         "verify_repair_timeout": 180,
         "install_guide_timeout": 240,
-        "verify_timeout": 30,
+        "verify_timeout": 600,
     },
 )
 
